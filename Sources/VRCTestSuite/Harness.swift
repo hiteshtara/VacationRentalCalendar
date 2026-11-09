@@ -103,6 +103,7 @@ public enum TestRegistry {
             + ImportTests.cases
             + ConflictTests.cases
             + ExportTests.cases
+            + PresentationTests.cases
             + SecurityTests.cases
             + RequiredScenarioTests.cases
     }

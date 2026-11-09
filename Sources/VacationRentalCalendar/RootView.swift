@@ -147,11 +147,23 @@ struct RootView: View {
             .padding(10)
             Divider()
 
+            FeedWarningBanner()
+
             switch state.calendarMode {
-            case .month: MonthGridView()
+            case .month: MonthBarsView()
             case .week: WeekStripView()
             case .list: EventListView()
             }
+        }
+        .inspector(isPresented: $state.isDetailPanelPresented) {
+            Group {
+                if let selected = state.selectedEvent {
+                    EventDetailPanel(item: selected)
+                } else {
+                    NoEventSelectedView()
+                }
+            }
+            .inspectorColumnWidth(min: 300, ideal: 350, max: 460)
         }
     }
 
@@ -196,8 +208,16 @@ struct RootView: View {
                 }
                 Spacer()
                 if !state.notificationAvailability.canNotify {
-                    Text(state.notificationAvailability.explanation)
-                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 5) {
+                        Text(state.notificationAvailability.explanation)
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                        if state.notificationAvailability.needsSystemSettings {
+                            Button("Open Settings") { state.openNotificationSettings() }
+                                .buttonStyle(.plain)
+                                .font(.caption2)
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
                 }
                 Text(OutboundSyncGate.isEnabled ? "Outbound ON" : "Outbound off")
                     .font(.caption2.weight(.medium))
@@ -237,6 +257,14 @@ struct RootView: View {
             } label: {
                 Label("Needs review", systemImage: "questionmark.circle")
             }
+        }
+        ToolbarItem(placement: .automatic) {
+            Button {
+                state.isDetailPanelPresented.toggle()
+            } label: {
+                Label("Details", systemImage: "sidebar.trailing")
+            }
+            .help("Show or hide the event details panel")
         }
     }
 }

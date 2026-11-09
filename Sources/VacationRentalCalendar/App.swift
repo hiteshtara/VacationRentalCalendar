@@ -175,8 +175,29 @@ struct SettingsView: View {
             }
 
             Section("Notifications") {
+                LabeledContent("Double bookings") {
+                    Text(state.notificationAvailability.canNotify ? "On" : "Off")
+                        .foregroundStyle(state.notificationAvailability.canNotify ? .green : .orange)
+                }
                 Text(state.notificationAvailability.explanation)
                     .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if state.notificationAvailability.needsSystemSettings {
+                    Button("Open notification settings") {
+                        state.openNotificationSettings()
+                    }
+                } else if !state.notificationAvailability.canNotify
+                            && state.notificationAvailability != .notBundled {
+                    Button("Turn on notifications") {
+                        Task { await state.requestNotificationPermission() }
+                    }
+                }
+                Button("Check again") {
+                    Task { await state.refreshNotificationStatus() }
+                }
+                .buttonStyle(.link)
+                .font(.caption)
             }
 
             Section("Security") {

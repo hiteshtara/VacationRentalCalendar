@@ -19,12 +19,16 @@ final class AppState: ObservableObject {
     @Published var calendarMode: CalendarMode = .month
     @Published var anchorDate: Date = DayMath.utcMidnight(Date())
     @Published var selectedEventKey: String?
+    @Published var isDetailPanelPresented = false
+    /// Keys ticked in the review queue for a batch decision.
+    @Published var reviewSelection: Set<String> = []
 
     // Status
     @Published private(set) var isRefreshing = false
     @Published private(set) var statusMessage = ""
     @Published private(set) var lastError: String?
     @Published private(set) var notificationAvailability: ConflictNotifier.Availability = .notBundled
+    @Published private(set) var hasAskedForNotifications = false
     @Published private(set) var signature: CodeSignatureInfo = .init(kind: .unsigned)
     @Published private(set) var storeFailure: String?
 
@@ -91,12 +95,33 @@ final class AppState: ObservableObject {
     var isReady: Bool { store != nil }
 
     func start() {
-        Task { [weak self] in
-            guard let self else { return }
-            let availability = await self.notifier.requestAuthorization()
-            await MainActor.run { self.notificationAvailability = availability }
-        }
+        Task { [weak self] in await self?.refreshNotificationStatus() }
         scheduleAutoRefresh()
+    }
+
+    /// Reads the current permission without asking for it, so launching the app
+    /// does not re-prompt and a denial can be reported accurately.
+    func refreshNotificationStatus() async {
+        let status = await notifier.currentAvailability()
+        notificationAvailability = status
+        hasAskedForNotifications = status != .notRequested
+        // Ask once, on first launch, rather than silently never asking.
+        if status == .notRequested {
+            let granted = await notifier.requestAuthorization()
+            notificationAvailability = granted
+            hasAskedForNotifications = true
+        }
+    }
+
+    /// Asks again on demand, for the button in Settings.
+    func requestNotificationPermission() async {
+        notificationAvailability = await notifier.requestAuthorization()
+        hasAskedForNotifications = true
+    }
+
+    /// Opens the right pane of System Settings when permission was refused.
+    func openNotificationSettings() {
+        ConflictNotifier.openSystemNotificationSettings()
     }
 
     // MARK: - Reading
@@ -179,6 +204,41 @@ final class AppState: ObservableObject {
         events.first { $0.event.eventKey == key }
     }
 
+    var selectedEvent: ClassifiedEvent? {
+        selectedEventKey.flatMap { event(for: $0) }
+    }
+
+    /// Opens the detail panel on an event. Used by every calendar view, so a
+    /// bar, a row and a review item all behave the same way.
+    func select(eventKey: String) {
+        selectedEventKey = eventKey
+        isDetailPanelPresented = true
+    }
+
+    func clearSelection() {
+        selectedEventKey = nil
+        isDetailPanelPresented = false
+    }
+
+    /// What each feed is and is not telling us — drives the warning shown when
+    /// a platform sends nothing that could identify a booking.
+    var feedDiagnostics: [FeedDiagnostic] {
+        FeedDiagnostics.diagnoseAll(listings: listingsForSelectedProperty, events: visibleEvents)
+    }
+
+    var uninformativeFeeds: [FeedDiagnostic] {
+        feedDiagnostics.filter(\.cannotIdentifyReservations)
+    }
+
+    /// True when this event's own feed gave nothing to identify a booking by.
+    func feedLacksDetail(for item: ClassifiedEvent) -> Bool {
+        !FeedDiagnostics.identifiesReservation(
+            summary: item.event.summary,
+            details: item.event.details,
+            platform: item.event.platform
+        )
+    }
+
     // MARK: - Importing
 
     func refreshAll(autoRefreshOnly: Bool = false) async {
@@ -253,6 +313,52 @@ final class AppState: ObservableObject {
             statusMessage = "Saved: \(kind.displayName)."
         } catch {
             lastError = "Could not save that decision: \(error)"
+        }
+    }
+
+    /// Applies one decision to several events at once. The review queue for a
+    /// feed like Airbnb's is usually several identical-looking blocks, and
+    /// deciding them one at a time is needless work.
+    func classifyBatch(eventKeys: Set<String>, as kind: BlockKind, note: String = "") {
+        guard let store, !eventKeys.isEmpty else { return }
+        var failures = 0
+        for key in eventKeys {
+            do {
+                try store.classifyManually(eventKey: key, kind: kind, note: note)
+            } catch {
+                failures += 1
+            }
+        }
+        reviewSelection.removeAll()
+        reload()
+        statusMessage = failures == 0
+            ? "Classified \(eventKeys.count) event\(eventKeys.count == 1 ? "" : "s") as \(kind.displayName.lowercased())."
+            : "Classified \(eventKeys.count - failures), but \(failures) could not be saved."
+    }
+
+    /// Moves to the next item still needing review, so a decision advances the
+    /// queue instead of leaving the cursor on something already handled.
+    func advanceToNextReviewItem(after key: String) {
+        let queue = reviewQueue
+        guard !queue.isEmpty else {
+            selectedEventKey = nil
+            return
+        }
+        if let index = queue.firstIndex(where: { $0.event.eventKey == key }) {
+            let next = queue.index(after: index)
+            selectedEventKey = (next < queue.endIndex ? queue[next] : queue[0]).event.eventKey
+        } else {
+            selectedEventKey = queue.first?.event.eventKey
+        }
+    }
+
+    /// Other undecided events from the same feed that look the same, so one
+    /// decision can cover the obvious group.
+    func similarPendingEvents(to item: ClassifiedEvent) -> [ClassifiedEvent] {
+        reviewQueue.filter {
+            $0.event.eventKey != item.event.eventKey
+                && $0.event.platform == item.event.platform
+                && $0.event.summary == item.event.summary
         }
     }
 

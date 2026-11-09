@@ -2,6 +2,9 @@ import Foundation
 #if canImport(UserNotifications)
 import UserNotifications
 #endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Posts native notifications for problems the owner needs to know about.
 ///
@@ -13,21 +16,29 @@ import UserNotifications
 public final class ConflictNotifier: @unchecked Sendable {
     public enum Availability: Sendable, Equatable {
         case available
+        /// Permission has never been asked for on this machine.
+        case notRequested
         case notBundled
         case denied
         case unknown(String)
 
         public var canNotify: Bool { self == .available }
 
+        /// Whether System Settings is the only way to change this.
+        public var needsSystemSettings: Bool { self == .denied }
+
         public var explanation: String {
             switch self {
             case .available:
-                return "Notifications are on."
+                return "Double bookings will raise a notification."
+            case .notRequested:
+                return "Notifications have not been set up yet."
             case .notBundled:
-                return "Notifications need the built app. Launch VacationRentalCalendar.app "
-                    + "rather than running from the command line."
+                return "Notifications need the installed app. Open VacationRentalCalendar.app "
+                    + "rather than running it from the command line."
             case .denied:
-                return "Notifications are turned off for this app in System Settings."
+                return "Notifications are turned off for this app, so double bookings will only "
+                    + "show inside the app. Turn them on in System Settings."
             case .unknown(let detail):
                 return "Notifications are unavailable: \(detail)"
             }
@@ -41,18 +52,58 @@ public final class ConflictNotifier: @unchecked Sendable {
 
     public static var isBundled: Bool { Bundle.main.bundleIdentifier != nil }
 
+    /// Reads the current permission **without** asking for it.
+    ///
+    /// Asking on every launch is both rude and useless — macOS only shows the
+    /// prompt once — and it also makes a refusal indistinguishable from a
+    /// failure. Reading first means the app can say which one happened.
+    public func currentAvailability() async -> Availability {
+        #if canImport(UserNotifications)
+        guard Self.isBundled else { return .notBundled }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral: return .available
+        case .denied: return .denied
+        case .notDetermined: return .notRequested
+        @unknown default: return .unknown("unrecognised authorisation status")
+        }
+        #else
+        return .notBundled
+        #endif
+    }
+
+    /// Asks macOS for permission. Only shows a prompt the first time; after
+    /// that it returns the standing answer.
     public func requestAuthorization() async -> Availability {
         #if canImport(UserNotifications)
         guard Self.isBundled else { return .notBundled }
         do {
             let centre = UNUserNotificationCenter.current()
-            let granted = try await centre.requestAuthorization(options: [.alert, .sound])
-            return granted ? .available : .denied
+            let granted = try await centre.requestAuthorization(options: [.alert, .sound, .badge])
+            if granted { return .available }
+            // A refusal and an already-denied state look the same here, so ask
+            // the system which it was.
+            return await currentAvailability() == .notRequested ? .denied : await currentAvailability()
         } catch {
             return .unknown(error.localizedDescription)
         }
         #else
         return .notBundled
+        #endif
+    }
+
+    /// Opens System Settings at the notifications pane for this app.
+    public static func openSystemNotificationSettings() {
+        #if canImport(AppKit)
+        let identifier = Bundle.main.bundleIdentifier ?? ""
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.notifications?id=\(identifier)",
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+            "x-apple.systempreferences:com.apple.preference.notifications",
+        ]
+        for candidate in candidates {
+            if let url = URL(string: candidate), NSWorkspace.shared.open(url) { return }
+        }
         #endif
     }
 

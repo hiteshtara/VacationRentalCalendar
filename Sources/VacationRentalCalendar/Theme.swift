@@ -1,120 +1,258 @@
 import SwiftUI
 import VRCCore
 
-/// One visual rule runs through the whole app, and it mirrors the app icon:
+/// One rule runs through the whole interface, and it is the same rule as the
+/// app icon:
 ///
-/// **Filled means genuinely blocked. Outlined means still sellable.**
+/// **Solid means these nights are genuinely gone. Hollow means they are still
+/// yours to sell.**
 ///
-/// So a confirmed reservation is a solid block, and an Airbnb cancellation
-/// block — the thing this app exists to protect — is drawn as an outline,
-/// because those nights are still yours to sell.
+/// A test (`the hollow-bar rule matches what is actually exportable`) checks
+/// that the rule agrees with the export gate, so the calendar cannot drift into
+/// claiming something the policy would not do.
+///
+/// Two structural devices carry two different facts, and they are kept separate
+/// on purpose: the **bar's colour and fill** say what the classification is, and
+/// a **cap on its leading edge** says which platform it came from.
 enum Theme {
+
+    // MARK: Classification
+
+    static func color(for status: EventDisplayStatus) -> Color {
+        switch status {
+        case .confirmed: return Color(red: 0.11, green: 0.52, blue: 0.35)
+        case .ownerBlock: return Color(red: 0.24, green: 0.36, blue: 0.80)
+        case .maintenance: return Color(red: 0.71, green: 0.45, blue: 0.10)
+        case .cancellationBlock: return Color(red: 0.71, green: 0.29, blue: 0.82)
+        case .needsReview: return Color(red: 0.88, green: 0.54, blue: 0.12)
+        case .unknown: return Color(red: 0.42, green: 0.45, blue: 0.50)
+        }
+    }
+
     static func color(for kind: BlockKind) -> Color {
         switch kind {
-        case .confirmedReservation: return Color(red: 0.14, green: 0.66, blue: 0.42)
-        case .ownerBlock: return Color(red: 0.24, green: 0.43, blue: 0.94)
-        case .maintenanceBlock: return Color(red: 0.93, green: 0.58, blue: 0.13)
-        case .cancellationBlock: return Color(red: 0.72, green: 0.29, blue: 0.84)
-        case .unknownUnavailable: return Color(red: 0.55, green: 0.57, blue: 0.62)
+        case .confirmedReservation: return color(for: EventDisplayStatus.confirmed)
+        case .ownerBlock: return color(for: EventDisplayStatus.ownerBlock)
+        case .maintenanceBlock: return color(for: EventDisplayStatus.maintenance)
+        case .cancellationBlock: return color(for: EventDisplayStatus.cancellationBlock)
+        case .unknownUnavailable: return color(for: EventDisplayStatus.unknown)
         }
     }
 
-    /// True when the dates remain sellable elsewhere, and so are drawn hollow.
-    static func isSellable(_ classification: EventClassification) -> Bool {
-        !classification.kind.describesGenuineUnavailability || classification.needsReview
-    }
-
-    static func symbol(for kind: BlockKind) -> String {
-        switch kind {
-        case .confirmedReservation: return "person.fill.checkmark"
-        case .ownerBlock: return "house.fill"
-        case .maintenanceBlock: return "wrench.and.screwdriver.fill"
-        case .cancellationBlock: return "arrow.uturn.backward.circle.fill"
-        case .unknownUnavailable: return "questionmark.circle.fill"
-        }
-    }
+    // MARK: Platform
 
     static func color(for platform: RentalPlatform) -> Color {
         switch platform {
-        case .airbnb: return Color(red: 1.0, green: 0.35, blue: 0.37)
-        case .vrbo: return Color(red: 0.24, green: 0.43, blue: 0.94)
-        case .bookingCom: return Color(red: 0.0, green: 0.21, blue: 0.50)
-        case .other: return .secondary
+        case .airbnb: return Color(red: 1.00, green: 0.35, blue: 0.37)
+        case .vrbo: return Color(red: 0.18, green: 0.44, blue: 0.93)
+        case .bookingCom: return Color(red: 0.00, green: 0.21, blue: 0.50)
+        case .other: return Color(red: 0.45, green: 0.45, blue: 0.48)
+        }
+    }
+
+    /// A distinct mark per platform, so they are told apart without relying on
+    /// colour alone.
+    static func glyph(for platform: RentalPlatform) -> String {
+        switch platform {
+        case .airbnb: return "a.circle.fill"
+        case .vrbo: return "v.circle.fill"
+        case .bookingCom: return "b.circle.fill"
+        case .other: return "questionmark.circle.fill"
         }
     }
 }
 
-/// A coloured chip for one event, hollow when the dates stay sellable.
-struct EventChip: View {
-    let item: ClassifiedEvent
-    var compact = false
+// MARK: - Platform indicator
 
-    private var tint: Color { Theme.color(for: item.classification.kind) }
-    private var sellable: Bool { Theme.isSellable(item.classification) }
+/// Platform identity, used wherever an event is named.
+struct PlatformBadge: View {
+    let platform: RentalPlatform
+    var style: Style = .full
+
+    enum Style { case full, compact, dot }
+
+    var body: some View {
+        switch style {
+        case .dot:
+            Circle()
+                .fill(Theme.color(for: platform))
+                .frame(width: 8, height: 8)
+                .accessibilityLabel(platform.displayName)
+
+        case .compact:
+            Text(platform.shortTag)
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Theme.color(for: platform)))
+                .accessibilityLabel(platform.displayName)
+
+        case .full:
+            HStack(spacing: 4) {
+                Image(systemName: Theme.glyph(for: platform))
+                    .font(.system(size: 11))
+                Text(platform.displayName)
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(Theme.color(for: platform))
+        }
+    }
+}
+
+// MARK: - Classification indicator
+
+struct StatusBadge: View {
+    let status: EventDisplayStatus
+    var compact = false
 
     var body: some View {
         HStack(spacing: 4) {
+            Image(systemName: status.symbolName)
+                .font(.system(size: compact ? 8 : 10, weight: .bold))
             if !compact {
-                Image(systemName: Theme.symbol(for: item.classification.kind))
-                    .font(.system(size: 9, weight: .semibold))
+                Text(status.label).font(.system(size: 11, weight: .medium))
             }
-            Text(label)
-                .font(.system(size: compact ? 9 : 10, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
         }
-        .padding(.horizontal, compact ? 4 : 6)
-        .padding(.vertical, compact ? 1 : 3)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, compact ? 4 : 7)
+        .padding(.vertical, compact ? 2 : 3)
+        .foregroundStyle(status.isSellableElsewhere ? Theme.color(for: status) : .white)
         .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(sellable ? Color.clear : tint.opacity(0.9))
+            Capsule()
+                .fill(status.isSellableElsewhere
+                      ? Theme.color(for: status).opacity(0.12)
+                      : Theme.color(for: status))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 4)
-                .strokeBorder(tint, style: StrokeStyle(lineWidth: sellable ? 1.2 : 0,
-                                                       dash: sellable ? [3, 2] : []))
+            Capsule().strokeBorder(
+                Theme.color(for: status),
+                style: StrokeStyle(
+                    lineWidth: status.isSellableElsewhere ? 1 : 0,
+                    dash: status.isSellableElsewhere ? [3, 2] : []
+                )
+            )
         )
-        .foregroundStyle(sellable ? tint : .white)
-    }
-
-    private var label: String {
-        let platform = item.event.platform.shortTag
-        if compact { return platform }
-        return "\(platform) · \(item.classification.kind.displayName)"
     }
 }
 
-/// Explains the fill-versus-outline rule wherever the calendar is shown.
+// MARK: - The calendar bar
+
+/// A continuous date-range bar. One bar per stay, however many days it covers.
+struct EventBar: View {
+    let item: ClassifiedEvent
+    /// False when the stay continues in from the previous week, so the left
+    /// edge is squared off and the platform cap is omitted.
+    var isStart = true
+    /// False when the stay continues into the next week.
+    var isEnd = true
+    var isSelected = false
+    var height: CGFloat = 19
+
+    private var status: EventDisplayStatus { item.displayStatus }
+    private var tint: Color { Theme.color(for: status) }
+    private var hollow: Bool { status.isSellableElsewhere }
+
+    private var shape: UnevenRoundedRectangle {
+        UnevenRoundedRectangle(
+            topLeadingRadius: isStart ? 4 : 0,
+            bottomLeadingRadius: isStart ? 4 : 0,
+            bottomTrailingRadius: isEnd ? 4 : 0,
+            topTrailingRadius: isEnd ? 4 : 0
+        )
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // The platform cap. Only on the real beginning of a stay, so a bar
+            // continuing from last week reads as a continuation.
+            if isStart {
+                Rectangle()
+                    .fill(Theme.color(for: item.event.platform))
+                    .frame(width: 3)
+            }
+
+            HStack(spacing: 4) {
+                Image(systemName: status.symbolName)
+                    .font(.system(size: 8, weight: .bold))
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 5)
+            .padding(.trailing, 4)
+        }
+        .frame(height: height)
+        .foregroundStyle(hollow ? tint : .white)
+        .background(shape.fill(hollow ? tint.opacity(0.10) : tint))
+        .overlay(
+            shape.strokeBorder(
+                tint,
+                style: StrokeStyle(
+                    lineWidth: hollow ? 1 : 0,
+                    dash: hollow ? [3, 2] : []
+                )
+            )
+        )
+        .overlay(
+            shape.strokeBorder(Color.accentColor, lineWidth: isSelected ? 2 : 0)
+        )
+        .clipShape(shape)
+        .contentShape(Rectangle())
+        .help("\(item.event.platform.displayName) · \(status.label) · "
+            + "\(DayMath.mediumString(item.event.checkIn)) to "
+            + "\(DayMath.mediumString(item.event.checkOut))")
+    }
+
+    private var label: String {
+        isStart
+            ? "\(item.event.platform.shortTag)  \(status.label)"
+            : status.label
+    }
+}
+
+// MARK: - Legend
+
+/// Explains the fill-versus-outline rule. Shown under the calendar because the
+/// rule is the one thing a new user must learn to read this screen.
 struct LegendBar: View {
     var body: some View {
-        HStack(spacing: 14) {
-            ForEach(BlockKind.allCases) { kind in
+        HStack(spacing: 16) {
+            ForEach(EventDisplayStatus.allCases.filter { $0 != .unknown }) { status in
                 HStack(spacing: 5) {
                     RoundedRectangle(cornerRadius: 3)
-                        .fill(kind.describesGenuineUnavailability
-                              ? Theme.color(for: kind) : Color.clear)
+                        .fill(status.isSellableElsewhere
+                              ? Theme.color(for: status).opacity(0.12)
+                              : Theme.color(for: status))
                         .overlay(
-                            RoundedRectangle(cornerRadius: 3)
-                                .strokeBorder(
-                                    Theme.color(for: kind),
-                                    style: StrokeStyle(
-                                        lineWidth: kind.describesGenuineUnavailability ? 0 : 1.2,
-                                        dash: kind.describesGenuineUnavailability ? [] : [3, 2]
-                                    )
+                            RoundedRectangle(cornerRadius: 3).strokeBorder(
+                                Theme.color(for: status),
+                                style: StrokeStyle(
+                                    lineWidth: status.isSellableElsewhere ? 1 : 0,
+                                    dash: status.isSellableElsewhere ? [3, 2] : []
                                 )
+                            )
                         )
-                        .frame(width: 14, height: 11)
-                    Text(kind.displayName).font(.caption2)
+                        .frame(width: 16, height: 11)
+                    Text(status.label).font(.caption2)
                 }
             }
             Spacer()
-            Text("Outlined = still sellable elsewhere")
+            HStack(spacing: 10) {
+                ForEach(RentalPlatform.allCases.filter { $0 != .other }) { platform in
+                    HStack(spacing: 3) {
+                        Rectangle().fill(Theme.color(for: platform)).frame(width: 3, height: 11)
+                        Text(platform.displayName).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Text("Dashed outline: still on sale elsewhere")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
-        .background(.quaternary.opacity(0.4))
+        .background(.quaternary.opacity(0.35))
     }
 }
