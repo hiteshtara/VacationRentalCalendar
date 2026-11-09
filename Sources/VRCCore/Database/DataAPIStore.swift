@@ -590,7 +590,7 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
 
     // MARK: Failure classification
 
-    enum FailureKind {
+    public enum FailureKind {
         case resuming
         case transient
         case serializationFailure
@@ -598,14 +598,14 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
         case permanent
     }
 
-    struct Failure {
-        var kind: FailureKind
-        var type: String
-        var message: String
-        var description: String { "\(type): \(message)" }
+    public struct Failure {
+        public var kind: FailureKind
+        public var type: String
+        public var message: String
+        public var description: String { "\(type): \(message)" }
     }
 
-    static func classify(_ result: DataAPIResult) -> Failure {
+    public static func classify(_ result: DataAPIResult) -> Failure {
         let rawType = (result.payload["__type"] as? String)
             ?? (result.payload["code"] as? String) ?? ""
         let type = rawType.split(separator: "#").last.map(String.init) ?? rawType

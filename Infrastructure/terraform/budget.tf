@@ -8,7 +8,7 @@
 resource "aws_budgets_budget" "monthly" {
   count = var.budget_notification_email == "" ? 0 : 1
 
-  name         = "vrc-monthly"
+  name         = "${local.prefix}-monthly"
   budget_type  = "COST"
   limit_amount = tostring(var.monthly_budget_usd)
   limit_unit   = "USD"

@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "vrc-test", targets: ["vrc-test"]),
         .executable(name: "vrc", targets: ["vrc"]),
         .executable(name: "vrc-parity", targets: ["vrc-parity"]),
+        .executable(name: "vrc-verify-sigv4", targets: ["vrc-verify-sigv4"]),
         .executable(name: "vrc-schema-dump", targets: ["vrc-schema-dump"]),
         .library(name: "VRCLambda", targets: ["VRCLambda"]),
         .executable(name: "vrc-lambda-fetch", targets: ["vrc-lambda-fetch"]),
@@ -94,6 +95,8 @@ let package = Package(
             path: "Sources/vrc-lambda-sweeper"
         ),
         .executableTarget(name: "vrc-schema-dump", dependencies: ["VRCCore"], path: "Sources/vrc-schema-dump"),
+        // Asks AWS whether our SigV4 signatures are valid.
+        .executableTarget(name: "vrc-verify-sigv4", dependencies: ["VRCCore"], path: "Sources/vrc-verify-sigv4"),
         // Cross-platform parity harness. Builds on Linux as well as macOS,
         // which is the whole point: it proves the business rules agree.
         .executableTarget(

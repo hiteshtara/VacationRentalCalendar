@@ -18,13 +18,13 @@
 # to the system of record nor read the outbound tokens.
 
 resource "aws_secretsmanager_secret" "source_feed_urls" {
-  name                    = "vrc/sources/feed-urls"
+  name                    = "${local.prefix}/sources/feed-urls"
   description             = "Inbound platform iCal export URLs. Read only by the fetcher."
   recovery_window_in_days = 30
 }
 
 resource "aws_secretsmanager_secret" "outbound_feed_tokens" {
-  name                    = "vrc/outbound/feed-tokens"
+  name                    = "${local.prefix}/outbound/feed-tokens"
   description             = "Random object-key secrets for published feeds. Read only by the publisher."
   recovery_window_in_days = 30
 }

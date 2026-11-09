@@ -9,6 +9,22 @@ let context = ServiceContext(actor: "owner")
 LambdaRuntime.run { invocation in
     let event = LambdaJSON.object(invocation.payload)
     let request = ApiHandler.Request(event: event)
+
+    // Authentication is checked BEFORE the database is reached.
+    //
+    // API Gateway's AWS_IAM authoriser already rejects an unsigned request
+    // before this function is invoked, so this is defence in depth -- but the
+    // order matters for cost as well as security: building the store opens a
+    // connection, and with minimum capacity 0 that WAKES AURORA. An
+    // unauthenticated or malformed request must not be able to do that.
+    guard let principal = request.principal, !principal.isEmpty else {
+        return LambdaJSON.httpResponse(401, [
+            "error": "unauthenticated",
+            "detail": "this endpoint requires a SigV4-signed request",
+            "remoteSynchronised": false,
+        ])
+    }
+
     do {
         // Assembled over the repositories, so the handler runs tested
         // operations rather than its own SQL.

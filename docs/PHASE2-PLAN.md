@@ -1,5 +1,11 @@
 # Phase 2 readiness report
 
+> **Superseded.** The schema this document describes was replaced because the
+> repositories could not query it. See
+> [`Migrations/postgres/superseded/README.md`](../Migrations/postgres/superseded/README.md)
+> and the generated replacement, `010_repository_schema.sql`.
+
+
 **No AWS resources created. No billable infrastructure exists.** Stopping here
 for your approval, per instruction. `OutboundSyncGate.isEnabled` is `false`;
 the two approved Vrbo decisions, seven events and seven classifications are
@@ -197,7 +203,7 @@ is a correctness *and* a cost control.
 
 ### 2.2 Schema
 
-[`Migrations/postgres/001_central_schema.sql`](../Migrations/postgres/001_central_schema.sql)
+[`Migrations/postgres/001_central_schema.sql`](../Migrations/postgres/superseded/001_central_schema.sql)
 — 17 tables, applied and exercised against a real PostgreSQL 17 instance.
 Forward-only, tracked in `schema_migrations`.
 

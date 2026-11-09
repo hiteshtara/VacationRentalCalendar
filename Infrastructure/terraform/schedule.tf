@@ -2,7 +2,8 @@
 # schedule; it wakes the processor, and therefore the database, only when a
 # feed's semantic hash has actually changed.
 resource "aws_scheduler_schedule" "import" {
-  name                = "vrc-import"
+  count               = 1
+  name                = "${local.prefix}-import"
   schedule_expression = "rate(${var.import_interval_minutes} minutes)"
   flexible_time_window { mode = "OFF" }
 
@@ -17,7 +18,7 @@ resource "aws_scheduler_schedule" "import" {
 }
 
 resource "aws_scheduler_schedule" "sweeper" {
-  name                = "vrc-hold-sweeper"
+  name                = "${local.prefix}-hold-sweeper"
   schedule_expression = "rate(5 minutes)"
   flexible_time_window { mode = "OFF" }
 
@@ -30,7 +31,7 @@ resource "aws_scheduler_schedule" "sweeper" {
 }
 
 resource "aws_iam_role" "scheduler" {
-  name = "vrc-scheduler"
+  name = "${local.prefix}-scheduler"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

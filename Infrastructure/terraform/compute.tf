@@ -56,7 +56,7 @@ locals {
 
 resource "aws_cloudwatch_log_group" "functions" {
   for_each = local.functions
-  name     = "/aws/lambda/vrc-${each.key}"
+  name     = "/aws/lambda/${local.prefix}-${each.key}"
   # Logs are the second-largest idle cost after Secrets Manager, and nothing
   # here is worth keeping for a month.
   retention_in_days = 14
@@ -65,7 +65,7 @@ resource "aws_cloudwatch_log_group" "functions" {
 resource "aws_lambda_function" "functions" {
   for_each = local.functions
 
-  function_name = "vrc-${each.key}"
+  function_name = "${local.prefix}-${each.key}"
   description   = each.value.description
   role          = each.value.role
   architectures = ["arm64"]
@@ -87,13 +87,13 @@ resource "aws_lambda_function" "functions" {
         VRC_FEEDS_BUCKET         = aws_s3_bucket.main["feeds"].bucket
         VRC_SNAPSHOT_BUCKET      = aws_s3_bucket.main["snapshots"].bucket
         VRC_FEED_DOMAIN          = var.feed_domain
-        VRC_FEEDS_DIST_ID        = aws_cloudfront_distribution.feeds.id
+        VRC_FEEDS_DIST_ID        = var.create_cdn ? aws_cloudfront_distribution.feeds[0].id : ""
         VRC_SOURCE_SECRET_ARN    = aws_secretsmanager_secret.source_feed_urls.arn
-        VRC_PROCESS_FUNCTION     = "vrc-process"
+        VRC_PROCESS_FUNCTION     = "${local.prefix}-process"
         VRC_DISCONNECTED_SOURCES = "booking_com"
         # Outbound publication is off in the deployed service too, not only in
         # the Mac application. Flipping it is a reviewed change here as well.
-        VRC_OUTBOUND_ENABLED = "false"
+        VRC_OUTBOUND_ENABLED = tostring(var.outbound_enabled)
       },
       each.key == "fetch" ? {} : {
         VRC_CLUSTER_ARN   = aws_rds_cluster.main.arn
@@ -122,7 +122,7 @@ resource "aws_lambda_function" "functions" {
 # and it reuses code that is already tested.
 
 resource "aws_apigatewayv2_api" "sync" {
-  name          = "vrc-sync"
+  name          = "${local.prefix}-sync"
   protocol_type = "HTTP"
   description   = "Sync API for the VacationRentalCalendar Mac application."
 }
@@ -172,7 +172,7 @@ resource "aws_apigatewayv2_stage" "default" {
 }
 
 resource "aws_cloudwatch_log_group" "api_access" {
-  name              = "/aws/apigateway/vrc-sync"
+  name              = "/aws/apigateway/${local.prefix}-sync"
   retention_in_days = 14
 }
 
@@ -186,7 +186,7 @@ resource "aws_lambda_permission" "api" {
 
 # The IAM identity the Mac application assumes. Nothing else may call the API.
 resource "aws_iam_user" "mac_client" {
-  name = "vrc-mac-client"
+  name = "${local.prefix}-mac-client"
 }
 
 resource "aws_iam_user_policy" "mac_client" {

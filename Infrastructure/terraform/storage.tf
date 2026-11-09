@@ -23,7 +23,7 @@ resource "random_id" "suffix" {
 
 resource "aws_s3_bucket" "main" {
   for_each = local.buckets
-  bucket   = "vrc-${each.key}-${random_id.suffix.hex}"
+  bucket   = "${local.prefix}-${each.key}-${random_id.suffix.hex}"
 }
 
 resource "aws_s3_bucket_versioning" "main" {

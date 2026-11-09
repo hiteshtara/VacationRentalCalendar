@@ -7,7 +7,7 @@ resource "random_password" "db_master" {
 # configuration, in the database, or in this repository. Terraform state holds
 # it, which is why the production backend is encrypted.
 resource "aws_secretsmanager_secret" "db_master" {
-  name                    = "vrc/database/master"
+  name                    = "${local.prefix}/database/master"
   description             = "Aurora master credentials. Consumed by the RDS Data API by ARN."
   recovery_window_in_days = 30
 }
@@ -21,7 +21,7 @@ resource "aws_secretsmanager_secret_version" "db_master" {
 }
 
 resource "aws_rds_cluster" "main" {
-  cluster_identifier = "vrc-main"
+  cluster_identifier = "${local.prefix}-main"
   engine             = "aurora-postgresql"
   engine_mode        = "provisioned"
   # Verified against `aws rds describe-db-engine-versions` in us-east-1 on
@@ -55,12 +55,21 @@ resource "aws_rds_cluster" "main" {
 
   storage_encrypted = true
 
-  backup_retention_period      = 7
-  preferred_backup_window      = "07:00-08:00"
-  copy_tags_to_snapshot        = true
-  deletion_protection          = true
-  skip_final_snapshot          = false
-  final_snapshot_identifier    = "vrc-main-final"
+  backup_retention_period = local.is_production ? 7 : 1
+  preferred_backup_window = "07:00-08:00"
+  copy_tags_to_snapshot   = true
+  # Production is protected at the AWS level: `terraform destroy` fails against
+  # deletion_protection until someone deliberately flips it, which is two
+  # explicit steps rather than one command.
+  #
+  # Staging is destroyable on purpose. A staging environment that cannot be
+  # torn down is a liability, not a safety feature -- it becomes a permanent
+  # bill and a permanent attack surface. The Terraform-level `prevent_destroy`
+  # that used to sit here is gone for the same reason: it cannot be made
+  # conditional, so it would have blocked every legitimate staging teardown.
+  deletion_protection          = local.is_production
+  skip_final_snapshot          = !local.is_production
+  final_snapshot_identifier    = "${local.prefix}-main-final"
   apply_immediately            = false
   performance_insights_enabled = false # chargeable beyond 7 days; not needed at this size
 
@@ -72,7 +81,7 @@ resource "aws_rds_cluster" "main" {
 }
 
 resource "aws_rds_cluster_instance" "writer" {
-  identifier         = "vrc-main-writer"
+  identifier         = "${local.prefix}-main-writer"
   cluster_identifier = aws_rds_cluster.main.id
   instance_class     = "db.serverless"
   engine             = aws_rds_cluster.main.engine
@@ -93,13 +102,13 @@ resource "aws_rds_cluster_instance" "writer" {
 # No secret_version resource: the password is generated and written once, out
 # of band, so it never enters Terraform state.
 resource "aws_secretsmanager_secret" "db_runtime" {
-  name                    = "vrc/database/runtime"
+  name                    = "${local.prefix}/database/runtime"
   description             = "Restricted vrc_runtime login. Used by every Lambda via the Data API."
   recovery_window_in_days = 30
 }
 
 resource "aws_rds_cluster_parameter_group" "main" {
-  name   = "vrc-main-pg16"
+  name   = "${local.prefix}-main-pg16"
   family = "aurora-postgresql16"
 
   parameter {

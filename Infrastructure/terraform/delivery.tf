@@ -1,5 +1,8 @@
 
+# Only read when DNS is being created at all. In staging this data source does
+# not exist, so Terraform never even looks at a hosted zone.
 data "aws_route53_zone" "feeds" {
+  count        = var.create_dns ? 1 : 0
   name         = "${var.feed_zone_name}."
   private_zone = false
 }
@@ -9,6 +12,7 @@ data "aws_route53_zone" "feeds" {
 # read, modified or referenced.
 
 resource "aws_acm_certificate" "feeds" {
+  count             = var.create_dns ? 1 : 0
   domain_name       = var.feed_domain
   validation_method = "DNS"
   lifecycle { create_before_destroy = true }
@@ -16,10 +20,10 @@ resource "aws_acm_certificate" "feeds" {
 
 
 resource "aws_route53_record" "feeds_validation" {
-  for_each = {
-    for d in aws_acm_certificate.feeds.domain_validation_options : d.domain_name => d
-  }
-  zone_id = data.aws_route53_zone.feeds.zone_id
+  for_each = var.create_dns ? {
+    for d in aws_acm_certificate.feeds[0].domain_validation_options : d.domain_name => d
+  } : {}
+  zone_id = data.aws_route53_zone.feeds[0].zone_id
   name    = each.value.resource_record_name
   type    = each.value.resource_record_type
   records = [each.value.resource_record_value]
@@ -27,6 +31,7 @@ resource "aws_route53_record" "feeds_validation" {
 }
 
 resource "aws_cloudfront_origin_access_control" "s3" {
+  count                             = var.create_cdn ? 1 : 0
   name                              = "vrc-s3"
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
@@ -39,16 +44,17 @@ resource "aws_cloudfront_origin_access_control" "s3" {
 # short TTL plus an explicit invalidation on every publish, and a publication
 # that is not counted as complete until the invalidation confirms.
 resource "aws_cloudfront_distribution" "feeds" {
+  count           = var.create_cdn ? 1 : 0
   enabled         = true
   comment         = "VRC filtered iCal feeds"
-  aliases         = [var.feed_domain]
+  aliases         = var.create_dns ? [var.feed_domain] : []
   price_class     = "PriceClass_100"
   is_ipv6_enabled = true
 
   origin {
     domain_name              = aws_s3_bucket.main["feeds"].bucket_regional_domain_name
     origin_id                = "feeds"
-    origin_access_control_id = aws_cloudfront_origin_access_control.s3.id
+    origin_access_control_id = aws_cloudfront_origin_access_control.s3[0].id
   }
 
   default_cache_behavior {
@@ -57,11 +63,11 @@ resource "aws_cloudfront_distribution" "feeds" {
     allowed_methods        = ["GET", "HEAD"]
     cached_methods         = ["GET", "HEAD"]
     compress               = true
-    cache_policy_id        = aws_cloudfront_cache_policy.short.id
+    cache_policy_id        = aws_cloudfront_cache_policy.short[0].id
   }
 
   viewer_certificate {
-    acm_certificate_arn      = aws_acm_certificate.feeds.arn
+    acm_certificate_arn      = aws_acm_certificate.feeds[0].arn
     ssl_support_method       = "sni-only"
     minimum_protocol_version = "TLSv1.2_2021"
   }
@@ -72,6 +78,7 @@ resource "aws_cloudfront_distribution" "feeds" {
 }
 
 resource "aws_cloudfront_cache_policy" "short" {
+  count       = var.create_cdn ? 1 : 0
   name        = "vrc-short"
   default_ttl = 60
   min_ttl     = 0
@@ -86,3 +93,10 @@ resource "aws_cloudfront_cache_policy" "short" {
   }
 }
 
+
+# Read by Scripts/staging-teardown.sh, so the teardown can refuse to run
+# against a state that is not staging.
+output "environment" {
+  value       = var.environment
+  description = "Which environment this state manages."
+}

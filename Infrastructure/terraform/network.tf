@@ -16,7 +16,7 @@ resource "aws_vpc" "db" {
   cidr_block           = "10.42.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags                 = { Name = "vrc-db" }
+  tags                 = { Name = "${local.prefix}-db" }
 }
 
 resource "aws_subnet" "db" {
@@ -24,11 +24,11 @@ resource "aws_subnet" "db" {
   vpc_id            = aws_vpc.db.id
   cidr_block        = cidrsubnet(aws_vpc.db.cidr_block, 8, count.index)
   availability_zone = data.aws_availability_zones.available.names[count.index]
-  tags              = { Name = "vrc-db-${count.index}" }
+  tags              = { Name = "${local.prefix}-db-${count.index}" }
 }
 
 resource "aws_db_subnet_group" "db" {
-  name       = "vrc-db"
+  name       = "${local.prefix}-db"
   subnet_ids = aws_subnet.db[*].id
 }
 
@@ -36,7 +36,7 @@ resource "aws_db_subnet_group" "db" {
 # needs to reach the cluster over the network. An empty ingress list is the
 # point, not an omission.
 resource "aws_security_group" "db" {
-  name        = "vrc-db"
+  name        = "${local.prefix}-db"
   description = "Aurora cluster. No ingress: access is via the RDS Data API only."
   vpc_id      = aws_vpc.db.id
 
