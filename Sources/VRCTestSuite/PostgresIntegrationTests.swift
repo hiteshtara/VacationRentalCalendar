@@ -276,6 +276,76 @@ public enum PostgresIntegrationTests {
         return try freshStore()?.0
     }
 
+    /// A second, independent session on the same database.
+    ///
+    /// Deliberately does **no** clean-up: the caller has already prepared the
+    /// rows, and a second truncation would delete the very property the race
+    /// is about. Each call builds its own transport, so two of these contend
+    /// the way two Lambda invocations do — one connection each, nothing in
+    /// Swift coordinating them.
+    static func sibling() throws -> RentalStore? {
+        let environment = ProcessInfo.processInfo.environment
+        if usingAurora {
+            var configuration = try DataAPIStore.Configuration.fromEnvironment(environment)
+            configuration.actor = "owner"
+            return try RentalStore(
+                database: DataAPIStore(
+                    transport: try URLSessionDataAPITransport.fromEnvironment(environment),
+                    configuration: configuration),
+                credentials: InMemoryFeedCredentialStore(), skipMigration: true)
+        }
+        guard let port else { return nil }
+        return try RentalStore(
+            database: DataAPIStore(
+                transport: try PsqlTransport(port: port),
+                configuration: .init(resourceArn: "arn:local", secretArn: "arn:local",
+                                     database: "vrc", actor: "owner"),
+                sleeper: { _ in }),
+            credentials: InMemoryFeedCredentialStore(), skipMigration: true)
+    }
+
+    /// Two sessions each try to claim `nights` for `property`, released
+    /// together so both are in flight at once. Returns how many the database
+    /// accepted and the refusals it gave the rest.
+    static func race(
+        _ sessions: [RentalStore], property: Int64, checkIn: Date, checkOut: Date
+    ) -> (accepted: Int, refusals: [String]) {
+        let start = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var accepted = 0
+        var refusals: [String] = []
+
+        for (index, session) in sessions.enumerated() {
+            DispatchQueue.global().async {
+                start.wait()
+                do {
+                    _ = try session.database.run("""
+                        INSERT INTO holds (property_id, channel, check_in, check_out,
+                                           expires_at, external_ref, created_at)
+                        VALUES (?, 'race', ?, ?, now() + interval '1 day', ?,
+                                extract(epoch from now()))
+                        """,
+                        [.integer(property), .real(checkIn.timeIntervalSince1970),
+                         .real(checkOut.timeIntervalSince1970), .text("race-\(index)")])
+                    lock.lock(); accepted += 1; lock.unlock()
+                } catch {
+                    lock.lock(); refusals.append("\(error)"); lock.unlock()
+                }
+                finished.signal()
+            }
+        }
+        for _ in sessions { start.signal() }
+        for _ in sessions { finished.wait() }
+        return (accepted, refusals)
+    }
+
+    static func liveHolds(_ store: RentalStore, property: Int64) throws -> Int {
+        try store.database.query(
+            "SELECT external_ref FROM holds WHERE property_id = ? AND released_at IS NULL",
+            [.integer(property)]).count
+    }
+
     static func skipped(_ expect: Expect) -> Bool {
         if usingAurora { return false }
         if port == nil {
@@ -517,6 +587,63 @@ public enum PostgresIntegrationTests {
                          "the database view and the Swift rule agree on what blocks")
             expect.ok(genuine.allSatisfy { $0.classification.kind != .cancellationBlock },
                       "and a cancellation block is not among them")
+        },
+
+        // --- B6: concurrency over the Data API ---
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "two sessions racing the same nights leave exactly one winner") { expect in
+            if skipped(expect) { return }
+            guard let store = try backend() else { return }
+            let property = try store.properties.insert(
+                Property(name: "Race — 39 G Street", address: "South Boston, MA"))
+            guard let first = try sibling(), let second = try sibling() else { return }
+
+            let outcome = race([first, second], property: property.id!,
+                               checkIn: DayMath.day(2027, 6, 1),
+                               checkOut: DayMath.day(2027, 6, 5))
+
+            // The whole point: the database decides, and it decides once. A
+            // second accepted hold on the same nights is a double booking.
+            expect.equal(outcome.accepted, 1,
+                         "exactly one session may hold the same nights")
+            expect.equal(outcome.refusals.count, 1,
+                         "and the loser must be refused, not silently dropped")
+            // Which refusal matters. A dropped connection or a missing column
+            // would also leave one winner, and this test would then be
+            // passing while proving nothing about the constraint.
+            expect.ok(outcome.refusals.first?.contains("no_overlapping_live_holds") == true,
+                      "the refusal must come from the overlap constraint, got: "
+                      + (outcome.refusals.first ?? "none"))
+            expect.equal(try liveHolds(store, property: property.id!), 1,
+                         "exactly one live hold row survives the race")
+        },
+
+        // The control for the test above. Without it, a constraint that
+        // refused *every* hold would also report "exactly one winner" — the
+        // race test would pass for the wrong reason and nobody would know.
+        TestCase(group: "PostgreSQL integration",
+                 name: "two sessions on non-overlapping nights both win") { expect in
+            if skipped(expect) { return }
+            guard let store = try backend() else { return }
+            let property = try store.properties.insert(
+                Property(name: "No race — 39 G Street", address: "South Boston, MA"))
+            guard let first = try sibling(), let second = try sibling() else { return }
+
+            let early = race([first], property: property.id!,
+                             checkIn: DayMath.day(2027, 6, 1),
+                             checkOut: DayMath.day(2027, 6, 5))
+            // Starts on the first night the other gives up, which is the
+            // checkout-day adjacency the half-open range is there to allow.
+            let late = race([second], property: property.id!,
+                            checkIn: DayMath.day(2027, 6, 5),
+                            checkOut: DayMath.day(2027, 6, 9))
+
+            expect.equal(early.accepted, 1, "the earlier stay is accepted")
+            expect.equal(late.accepted, 1,
+                         "and so is an adjacent one — the constraint rejects overlap, not all holds")
+            expect.equal(try liveHolds(store, property: property.id!), 2,
+                         "both live holds coexist")
         },
     ] }
 }
