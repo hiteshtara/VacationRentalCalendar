@@ -59,6 +59,8 @@ func runHelp() {
                                    Record DRAFT decisions only; never advances
       vrc approve --decision <id>[,<id>…]
                                    Draft -> validated -> awaiting -> approved
+      vrc rehearse --property <id> [--to vrbo]
+                                   Run the publication pipeline in a sandbox
       vrc connection [--listing <id>] [--state <state>] [--detail "..."]
                                    Show or change a feed's connection state
       vrc doctor                   Check the database, Keychain and outbound gate
@@ -630,6 +632,142 @@ func runApprove() {
     print("Outbound publishing: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
 }
 
+/// Rehearses the whole publication pipeline against an isolated directory.
+///
+/// Uses the real decisions and the real feed generator, but a local hosting
+/// client — so nothing reaches the internet, no platform is contacted, and the
+/// outbound gate is untouched. Deliberate failures are injected so the
+/// recovery path is exercised rather than assumed.
+func runRehearsal() async {
+    let store = makeStore()
+    guard let propertyID = value(for: "--property").flatMap(Int64.init) else {
+        bail("--property <id> is required")
+    }
+    let destination = value(for: "--to").flatMap { RentalPlatform(rawValue: $0) } ?? .vrbo
+
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("vrc-rehearsal-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    // The rehearsal runs against a throwaway copy of the database.
+    //
+    // It writes publication rows and a last-known-good snapshot, and those
+    // describe publications that never happened. Left in the real database
+    // they would corrupt the next genuine publish: the safety diff compares
+    // against the last known good feed, and a rehearsal snapshot is not one.
+    let sandboxDatabasePath = root.appendingPathComponent("rehearsal.sqlite").path
+    let rehearsalStore: RentalStore
+    do {
+        try store.database.run("VACUUM INTO ?;", [.text(sandboxDatabasePath)])
+        rehearsalStore = try RentalStore(
+            database: try Database(path: sandboxDatabasePath),
+            credentials: InMemoryFeedCredentialStore()
+        )
+    } catch {
+        try? FileManager.default.removeItem(at: root)
+        bail("could not create the rehearsal sandbox: \(error)")
+    }
+    let token = FeedTokenRepository.generateKey()
+    let configuration = R2HostingConfiguration(
+        accountID: "<account>", bucket: "vrc-feeds",
+        customDomain: "feeds.example.invalid", zoneID: "<zone>"
+    )
+    let slug = "39-g-street"
+    let key = configuration.key(propertySlug: slug, destination: destination, token: token)
+
+    do {
+        let hosting = try LocalDirectoryHostingClient(root: root)
+        print("REHEARSAL — isolated, nothing leaves this Mac")
+        print("  sandbox: \(root.path)")
+        print("  key:     \(key.replacingOccurrences(of: token, with: "<token>"))")
+        print("  url:     \(configuration.redactedURL(propertySlug: slug, destination: destination))")
+        print("")
+
+        // 1. Without approval of the change, nothing may be served.
+        let held = try await rehearsalStore.outbound.runPipeline(
+            propertyID: propertyID, destination: destination,
+            hosting: hosting, key: key, changeApproved: false
+        )
+        print("1. publish without approving the change")
+        print("   stage: \(held.stage.rawValue) — \(held.stage.displayName)")
+        print("   served to a platform now: \(await hosting.servedBody(key: key) == nil ? "nothing" : "SOMETHING")")
+        print("")
+
+        // 2. Approved: the full path.
+        let ok = try await rehearsalStore.outbound.runPipeline(
+            propertyID: propertyID, destination: destination,
+            hosting: hosting, key: key, changeApproved: true
+        )
+        let served = await hosting.servedBody(key: key) ?? ""
+        let parsed = try? ICalParser.parse(served)
+        print("2. publish with the change approved")
+        print("   stage:   \(ok.stage.rawValue) — \(ok.stage.displayName)")
+        print("   verdict: \(ok.safety.verdict.rawValue)")
+        print("   diff:    \(ok.safety.diff.summary)")
+        print("   served:  \(parsed?.events.count ?? 0) events, "
+            + "\(parsed?.events.reduce(0) { $0 + max(1, DayMath.daysBetween($1.resolvedCheckIn ?? Date(), $1.resolvedCheckOut ?? Date())) } ?? 0) nights")
+        print("   remote synchronised? \(ok.isRemoteSynchronised) "
+            + "(only VERIFIED ever means yes)")
+        print("")
+
+        // 3. A failed upload must leave the previous feed serving.
+        await hosting.setFailUpload("simulated network failure")
+        let uploadFailed = try await rehearsalStore.outbound.runPipeline(
+            propertyID: propertyID, destination: destination,
+            hosting: hosting, key: key, changeApproved: true
+        )
+        let afterUploadFailure = await hosting.servedBody(key: key) ?? ""
+        print("3. upload fails")
+        print("   stage: \(uploadFailed.stage.rawValue)")
+        print("   detail: \(uploadFailed.detail)")
+        print("   still served: \((try? ICalParser.parse(afterUploadFailure))?.events.count ?? 0) events "
+            + "(the previous feed is intact)")
+        await hosting.setFailUpload(nil)
+        print("")
+
+        // 4. A failed cache purge must not be reported as success.
+        await hosting.setFailInvalidation("simulated purge API 500")
+        let purgeFailed = try await rehearsalStore.outbound.runPipeline(
+            propertyID: propertyID, destination: destination,
+            hosting: hosting, key: key, changeApproved: true
+        )
+        print("4. cache purge fails")
+        print("   stage: \(purgeFailed.stage.rawValue) — \(purgeFailed.stage.displayName)")
+        print("   counts as published? \(purgeFailed.succeeded)")
+        print("   \(purgeFailed.detail)")
+        await hosting.setFailInvalidation(nil)
+        print("")
+
+        // 5. Recovery to the last feed known good.
+        let restored = try await rehearsalStore.outbound.rollback(
+            propertyID: propertyID, destination: destination, hosting: hosting, key: key
+        )
+        let afterRollback = await hosting.servedBody(key: key) ?? ""
+        print("5. roll back to the last known good feed")
+        print("   restored revision: \(restored?.revision ?? -1)")
+        print("   entries restored:  \(restored?.entryCount ?? -1)")
+        print("   now served:        \((try? ICalParser.parse(afterRollback))?.events.count ?? 0) events")
+        print("")
+
+        print("publication history")
+        for row in try rehearsalStore.outbound.publicationHistory(
+            propertyID: propertyID, destination: destination, limit: 8
+        ) {
+            print("   rev \(row.revision)  \(pad(row.stage, 26)) \(pad(row.verdict, 26)) \(row.detail)")
+        }
+        print("")
+        print("Outbound gate: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
+        print("Nothing was uploaded to the internet and no platform was contacted.")
+        print("The real database was copied, not used: publication rows and snapshots")
+        print("stayed in the sandbox and are discarded with it.")
+
+        try? FileManager.default.removeItem(at: root)
+    } catch {
+        try? FileManager.default.removeItem(at: root)
+        bail("rehearsal failed: \(error)")
+    }
+}
+
 func runDoctor() {
     let store = makeStore()
     var problems = 0
@@ -687,6 +825,7 @@ case "connection": runConnection()
 case "preview": runPreview()
 case "draft": runDraft()
 case "approve": runApprove()
+case "rehearse": await runRehearsal()
 case "export": runExport()
 case "doctor": runDoctor()
 case "help", "--help", "-h": runHelp()

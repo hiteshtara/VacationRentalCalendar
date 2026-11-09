@@ -69,8 +69,11 @@ public final class RentalStore: @unchecked Sendable {
             decisions: repositories.availability,
             manager: availabilityManager,
             properties: repositories.properties,
+            snapshots: self.snapshots,
             database: database,
-            eventsProvider: provider
+            eventsProvider: provider,
+            listingsProvider: { [unowned self] in try self.listings.all() },
+            syncRunsProvider: { [unowned self] in try self.syncRuns.recent(limit: 50) }
         )
     }
 
