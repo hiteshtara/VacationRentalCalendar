@@ -54,6 +54,9 @@ func runHelp() {
       vrc preview --property <id> --from YYYY-MM-DD --to YYYY-MM-DD
                   --actions vrbo=block,airbnb=block,booking_com=block
                                    Dry run an availability plan; writes nothing
+      vrc draft --property <id> --platform <p> --action block
+                --ranges YYYY-MM-DD:YYYY-MM-DD[,...] [--reason "..."]
+                                   Record DRAFT decisions only; never advances
       vrc connection [--listing <id>] [--state <state>] [--detail "..."]
                                    Show or change a feed's connection state
       vrc doctor                   Check the database, Keychain and outbound gate
@@ -302,6 +305,28 @@ func runFeed() {
     do {
         let feed = try store.outbound.generateFeed(propertyID: propertyID, destination: destination)
         print(CalendarFeedGenerator().auditText(feed))
+
+        if flags.contains("--if-approved") {
+            // Hypothetical only: shows what the feed WOULD contain if every
+            // pending decision were approved. Nothing is saved or sent.
+            let hypothetical = try store.availability.forProperty(propertyID).map {
+                decision -> AvailabilityDecision in
+                var copy = decision
+                if copy.status.isPending { copy.status = .approved; copy.approvedAt = Date() }
+                return copy
+            }
+            let projected = CalendarFeedGenerator().generate(
+                destination: destination, propertyID: propertyID,
+                propertyName: try store.properties.find(id: propertyID)?.name ?? "",
+                sourceEvents: try store.classifiedEvents(), decisions: hypothetical
+            )
+            print("")
+            print("=== IF APPROVED (hypothetical — nothing saved or sent) ===")
+            print(CalendarFeedGenerator().auditText(projected))
+            print("")
+            print("--- the .ics that would be served ---")
+            print(CalendarFeedGenerator().makeICS(projected))
+        }
         print("")
         print("Outbound publishing: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
         if flags.contains("--raw") {
@@ -481,6 +506,85 @@ func runPreview() {
     }
 }
 
+/// Records DRAFT availability decisions. Validates and reports, but never
+/// advances past draft, and never contacts anything.
+func runDraft() {
+    let store = makeStore()
+    guard let propertyID = value(for: "--property").flatMap(Int64.init) else {
+        bail("--property <id> is required")
+    }
+    func parseDay(_ raw: Substring) -> Date? {
+        let parts = raw.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return DayMath.day(parts[0], parts[1], parts[2])
+    }
+    guard let raw = value(for: "--platform"),
+          let destination = RentalPlatform(rawValue: raw) else {
+        bail("--platform must be airbnb, vrbo or booking_com")
+    }
+    guard let actionRaw = value(for: "--action"),
+          let action = AvailabilityAction(rawValue: actionRaw) else {
+        bail("--action must be block, unblock or leaveUnchanged")
+    }
+    // One or more ranges: --ranges 2026-12-10:2026-12-17,2026-12-19:2026-12-20
+    guard let rangesRaw = value(for: "--ranges") else {
+        bail("--ranges is required, e.g. 2026-12-10:2026-12-17,2026-12-19:2026-12-20")
+    }
+    var ranges: [(Date, Date)] = []
+    for piece in rangesRaw.split(separator: ",") {
+        let bits = piece.split(separator: ":")
+        guard bits.count == 2, let from = parseDay(bits[0]), let to = parseDay(bits[1]),
+              to > from else {
+            bail("bad range \"\(piece)\" — use YYYY-MM-DD:YYYY-MM-DD, check-out exclusive")
+        }
+        ranges.append((from, to))
+    }
+
+    do {
+        let reason = value(for: "--reason") ?? ""
+        var created: [AvailabilityDecision] = []
+
+        for (from, to) in ranges {
+            let candidate = AvailabilityDecision(
+                propertyID: propertyID, destination: destination, action: action,
+                startDay: from, endDay: to, status: .draft, reason: reason,
+                createdBy: "owner"
+            )
+            // Validate for reporting only; the status stays draft.
+            let validation = store.availabilityManager.detector.validate(
+                candidate,
+                in: try store.availabilityManager.context(
+                    propertyID: propertyID, destination: destination
+                )
+            )
+            let stored = try store.availability.insert(candidate)
+            try store.auditLog.record(AuditEntry(
+                decisionID: stored.id, actor: "owner", toStatus: .draft,
+                event: "created-draft",
+                detail: stored.summaryLine
+                    + (validation.isRefused ? " — REFUSED: \(validation.headline)" : "")
+            ))
+            created.append(stored)
+
+            print("DRAFT #\(stored.id ?? 0)  \(destination.displayName)  \(action.displayName)")
+            print("  \(stored.nightsDescription)")
+            print("  status: draft — not validated, not approved, not published")
+            print("  checks: \(validation.isRefused ? "REFUSED" : (validation.needsReview ? "review first" : "no conflicts"))")
+            for violation in validation.violations {
+                print("    [\(violation.severity.rawValue)] \(violation.rule.rawValue) \(violation.message)")
+            }
+            print("")
+        }
+
+        let nights = created.reduce(0) { $0 + $1.nights }
+        print("Created \(created.count) draft decision(s), \(nights) nights total.")
+        print("Nothing is validated, approved, published or sent. Outbound publishing: "
+            + "\(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
+    } catch {
+        bail("draft failed: \(error)")
+    }
+}
+
 func runDoctor() {
     let store = makeStore()
     var problems = 0
@@ -536,6 +640,7 @@ case "feed": runFeed()
 case "availability": runAvailability()
 case "connection": runConnection()
 case "preview": runPreview()
+case "draft": runDraft()
 case "export": runExport()
 case "doctor": runDoctor()
 case "help", "--help", "-h": runHelp()

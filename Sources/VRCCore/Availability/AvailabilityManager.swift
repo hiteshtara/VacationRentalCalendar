@@ -93,7 +93,7 @@ public struct AvailabilityPreview: Sendable {
 public final class AvailabilityManager: @unchecked Sendable {
     let decisions: AvailabilityRepository
     let audit: AvailabilityAuditLog
-    let detector: AvailabilityConflictDetector
+    public let detector: AvailabilityConflictDetector
     let properties: PropertyRepository
     let listings: ListingRepository
     private let eventsProvider: @Sendable () throws -> [ClassifiedEvent]
