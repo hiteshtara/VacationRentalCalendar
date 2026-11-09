@@ -113,8 +113,8 @@ the one that can refuse a guest's booking.
 
 | Step | Action | Gate |
 |---|---|---|
-| G1 | Import both events into VRC as `source_events` on an `owner` listing, classified `needs_review`, unlocked. Historical record only. | — |
-| G2 | You classify them: Event A as a deliberate owner block or a test artefact; Event B as not an availability statement. | your decision |
+| G1 | **Nothing is migrated.** Decided 2026-11-08: the two events are not imported. See §2.5. | decided |
+| G2 | — | — |
 | G3 | Run VRC availability and the website's `getCombinedPublicCalendar` side by side nightly. Report every night where they disagree. | 14 consecutive clean days |
 | G4 | **Propose** replacing the website's read path — `getCombinedPublicCalendar` and `assertGoogleAvailableForBooking` — with a call to VRC. Still fail-closed, now against VRC. | **your approval** |
 | G5 | **Propose** removing the write path, so confirmations stop creating Google events. | **your approval** |
@@ -123,6 +123,33 @@ the one that can refuse a guest's booking.
 Nothing in G4–G6 happens in this phase. Per your instruction, Google is not
 removed from the website's availability calculation now; this is the plan for
 when you decide it should be.
+
+### 2.5 Why the two historical events are not migrated
+
+**Decision, 2026-11-08: do not migrate them.** Recorded here because the
+reasoning will not be obvious to anyone reading the schema later.
+
+Four reasons:
+
+1. **Both are in the past.** The later event ended 2026-10-26; today is
+   2026-11-08. Neither affects any bookable night.
+2. **Neither is an availability statement this system should hold.** Event B is
+   a personal appointment at an address unrelated to the property. It only ever
+   blocked a night because FreeBusy cannot carry that distinction. Importing it
+   would import the bug.
+3. **Event A's intent is unrecoverable.** It is untitled, and it was created the
+   same day all four website holds were taken and expired. Whether it was a
+   deliberate 38-night owner block or an artefact of that testing cannot be
+   established from the data. Importing an interval whose meaning is unknown
+   would put a `needs_review` row in the new system's history that no future
+   reader could ever resolve.
+4. **The new system's history should begin clean.** `source_events` is
+   append-only and `DELETE` is revoked for the application role, so anything
+   imported now is permanent. Importing two unexplainable past intervals buys
+   nothing and cannot be undone.
+
+The calendar itself is left untouched and read-only, so the events remain
+available in Google if they are ever needed. This document is their record.
 
 **Duplicate and circular import prevention.** Events imported at G1 are tagged
 with their Google event id, so a re-import updates rather than duplicates. VRC
@@ -295,6 +322,26 @@ Risk 3 is the only one that is live **today**, and it exists in the current
 system rather than being introduced by this plan.
 
 ---
+
+## 6a. Roslindale calendars — inactive, recorded only
+
+**Decision, 2026-11-08:** `ros1`
+(`9cc3d274b85b58f276123086fbed76be30338022dd742321ff93dc8d2cb9fed2@group.calendar.google.com`)
+and `ros2` / "roslindale 2"
+(`ba8f2244e1e2e444422186c364c8cc67ea4fb4bff2ae3283577f5965da5975da@group.calendar.google.com`)
+are **inactive future-property identifiers, not active listings.**
+
+Consequences for Phase 2:
+
+- No `properties` row, no `platform_listings` row, and no source adapter is
+  created for either.
+- No import job polls them, so they contribute nothing to cost or to
+  availability.
+- They are **not** read during reconciliation, and their contents are not
+  inventoried. Only their existence is recorded, here.
+- The schema is already multi-property (`properties.slug`, a per-property
+  `feed_host`), so activating one later is inserting rows, not reshaping
+  anything.
 
 ## 7. What was explicitly not done
 
