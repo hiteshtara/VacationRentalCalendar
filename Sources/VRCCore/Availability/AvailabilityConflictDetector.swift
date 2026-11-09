@@ -169,13 +169,17 @@ public struct AvailabilityConflictDetector: Sendable {
         if !cancellations.isEmpty, decision.action == .block,
            decision.destination != .airbnb {
             let nights = cancellations.reduce(0) { $0 + $1.event.nights }
+            // Name the platform that actually imposed it. Calling a Vrbo block
+            // an Airbnb penalty would be plainly untrue.
+            let sources = Set(cancellations.map(\.event.platform.displayName))
+                .sorted().joined(separator: " and ")
             result.add(RuleViolation(
                 rule: .neverPropagateCancellationBlock,
                 severity: .requiresReview,
-                message: "These nights overlap \(nights) night\(nights == 1 ? "" : "s") Airbnb "
-                    + "blocked after a cancellation. Those nights are still sellable on "
-                    + "\(decision.destination.displayName) — this app would never take them off "
-                    + "sale by itself, so make sure you mean to.",
+                message: "These nights overlap \(nights) night\(nights == 1 ? "" : "s") "
+                    + "\(sources) blocked after a cancellation. Those nights are still sellable "
+                    + "on \(decision.destination.displayName) — this app would never take them "
+                    + "off sale by itself, so make sure you mean to.",
                 relatedKeys: cancellations.map(\.event.eventKey)
             ))
         }

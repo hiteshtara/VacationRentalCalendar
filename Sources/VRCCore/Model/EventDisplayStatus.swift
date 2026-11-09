@@ -12,6 +12,7 @@ public enum EventDisplayStatus: String, CaseIterable, Sendable, Identifiable {
     case ownerBlock
     case maintenance
     case cancellationBlock
+    case platformRestriction
     case needsReview
     case unknown
 
@@ -24,6 +25,7 @@ public enum EventDisplayStatus: String, CaseIterable, Sendable, Identifiable {
         case .ownerBlock: return .ownerBlock
         case .maintenanceBlock: return .maintenance
         case .cancellationBlock: return .cancellationBlock
+        case .platformRestriction: return .platformRestriction
         case .unknownUnavailable: return .unknown
         }
     }
@@ -34,8 +36,27 @@ public enum EventDisplayStatus: String, CaseIterable, Sendable, Identifiable {
         case .ownerBlock: return "Owner block"
         case .maintenance: return "Maintenance"
         case .cancellationBlock: return "Cancellation block"
+        case .platformRestriction: return "Booking window"
         case .needsReview: return "Needs review"
         case .unknown: return "Unknown"
+        }
+    }
+
+    /// Platform-aware wording, so a Vrbo block is never described as an
+    /// Airbnb cancellation penalty.
+    public func consequence(for platform: RentalPlatform?) -> String {
+        guard let platform else { return consequence }
+        switch self {
+        case .cancellationBlock:
+            return "\(platform.displayName) took these nights back after a cancellation. They "
+                + "are not booked, so they stay on sale on "
+                + "\(BlockKind.otherPlatforms(excluding: platform)) and are never exported."
+        case .platformRestriction:
+            return "\(platform.displayName) will not take bookings for these nights — usually "
+                + "the end of your booking window there. Never copied to "
+                + "\(BlockKind.otherPlatforms(excluding: platform))."
+        default:
+            return consequence
         }
     }
 
@@ -49,8 +70,11 @@ public enum EventDisplayStatus: String, CaseIterable, Sendable, Identifiable {
         case .maintenance:
             return "The unit is unusable. These nights are shared once you approve them."
         case .cancellationBlock:
-            return "Airbnb took these nights after a cancellation. They stay on sale on Vrbo and "
-                + "Booking.com, and are never exported."
+            return "The platform took these nights back after a cancellation. They are not "
+                + "booked, so they stay on sale elsewhere and are never exported."
+        case .platformRestriction:
+            return "The platform will not take bookings for these nights — usually the end of "
+                + "your booking window. Never copied to your other platforms."
         case .needsReview:
             return "Undecided, so these nights stay on sale everywhere else until you say what "
                 + "they are."
@@ -65,7 +89,7 @@ public enum EventDisplayStatus: String, CaseIterable, Sendable, Identifiable {
     public var isSellableElsewhere: Bool {
         switch self {
         case .confirmed, .ownerBlock, .maintenance: return false
-        case .cancellationBlock, .needsReview, .unknown: return true
+        case .cancellationBlock, .platformRestriction, .needsReview, .unknown: return true
         }
     }
 
@@ -76,6 +100,7 @@ public enum EventDisplayStatus: String, CaseIterable, Sendable, Identifiable {
         case .ownerBlock: return "house.fill"
         case .maintenance: return "wrench.and.screwdriver.fill"
         case .cancellationBlock: return "arrow.uturn.backward"
+        case .platformRestriction: return "calendar.badge.minus"
         case .needsReview: return "questionmark"
         case .unknown: return "questionmark.diamond"
         }
@@ -88,6 +113,7 @@ public enum EventDisplayStatus: String, CaseIterable, Sendable, Identifiable {
         case .ownerBlock: return .ownerBlock
         case .maintenance: return .maintenanceBlock
         case .cancellationBlock: return .cancellationBlock
+        case .platformRestriction: return .platformRestriction
         case .needsReview, .unknown: return nil
         }
     }

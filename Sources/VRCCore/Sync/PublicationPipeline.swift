@@ -8,6 +8,8 @@ import Foundation
 public enum PublicationStage: String, CaseIterable, Sendable {
     /// Built on this Mac. Nothing has left it.
     case generated
+    /// Entries would be added and the owner has not approved them.
+    case awaitingAdditionApproval = "awaiting_addition_approval"
     /// Removals are present and the owner has not approved them.
     case awaitingRemovalApproval = "awaiting_removal_approval"
     /// The bytes are on the hosting endpoint.
@@ -29,6 +31,7 @@ public enum PublicationStage: String, CaseIterable, Sendable {
     public var displayName: String {
         switch self {
         case .generated: return "Generated locally"
+        case .awaitingAdditionApproval: return "Awaiting your approval to block dates"
         case .awaitingRemovalApproval: return "Awaiting your approval to remove dates"
         case .uploaded: return "Uploaded — not yet live"
         case .cacheInvalidated: return "Live — awaiting platform refresh"
@@ -43,6 +46,9 @@ public enum PublicationStage: String, CaseIterable, Sendable {
         switch self {
         case .generated:
             return "Built on this Mac for you to inspect. Nothing has been sent anywhere."
+        case .awaitingAdditionApproval:
+            return "This would take nights off sale on the destination, so it waits for you. "
+                + "Nothing has been sent anywhere."
         case .awaitingRemovalApproval:
             return "This would put previously blocked nights back on sale, so it waits for you."
         case .uploaded:
@@ -157,14 +163,15 @@ public struct PublicationPipeline: Sendable {
         self.generator = generator
     }
 
-    /// - Parameter removalApproved: the owner's explicit consent to put
-    ///   previously blocked nights back on sale. Never implied.
+    /// - Parameter changeApproved: the owner's explicit consent to serve this
+    ///   feed. Required for **any** change — additions take nights off sale on
+    ///   the destination, removals put them back on. Never implied.
     public func publish(
         feed: DestinationFeed,
         lastKnownGood: FeedSnapshot?,
         context: PublicationContext,
         key: String,
-        removalApproved: Bool = false,
+        changeApproved: Bool = false,
         now: Date = Date()
     ) async -> PublicationAttempt {
         let report = safety.assess(
@@ -178,9 +185,14 @@ public struct PublicationPipeline: Sendable {
                 detail: report.headline,
                 rolledBackTo: lastKnownGood?.revision
             )
-        case .requiresRemovalApproval where !removalApproved:
+        case .requiresRemovalApproval where !changeApproved:
             return PublicationAttempt(
                 destination: feed.destination, stage: .awaitingRemovalApproval,
+                safety: report, detail: report.headline
+            )
+        case .requiresAdditionApproval where !changeApproved:
+            return PublicationAttempt(
+                destination: feed.destination, stage: .awaitingAdditionApproval,
                 safety: report, detail: report.headline
             )
         default:
@@ -234,7 +246,7 @@ public struct PublicationPipeline: Sendable {
         snapshots: [RentalPlatform: FeedSnapshot],
         context: PublicationContext,
         keys: [RentalPlatform: String],
-        removalApproved: Set<RentalPlatform> = [],
+        changeApproved: Set<RentalPlatform> = [],
         now: Date = Date()
     ) async -> [PublicationAttempt] {
         var attempts: [PublicationAttempt] = []
@@ -244,7 +256,7 @@ public struct PublicationPipeline: Sendable {
                 lastKnownGood: snapshots[feed.destination],
                 context: context,
                 key: keys[feed.destination] ?? "missing-key",
-                removalApproved: removalApproved.contains(feed.destination),
+                changeApproved: changeApproved.contains(feed.destination),
                 now: now
             ))
         }

@@ -93,12 +93,20 @@ public enum FeedReductionCause: Sendable, Hashable, Identifiable {
 
 /// The verdict on a proposed publication.
 public enum PublicationVerdict: String, Sendable {
-    /// Nothing is removed, or the only changes are additions.
-    case safe
-    /// Removals are present and explained. The owner must approve them.
+    /// The proposed feed is identical to what is already served.
+    case noChange = "no_change"
+    /// Entries would be added. The owner approves before anything is served,
+    /// because an addition takes nights off sale somewhere.
+    case requiresAdditionApproval = "requires_addition_approval"
+    /// Entries would be removed, putting nights back on sale. The graver case.
     case requiresRemovalApproval = "requires_removal_approval"
     /// Something upstream failed. Never published, approved or not.
     case refused
+
+    /// Whether the owner must approve before this may be served.
+    public var needsApproval: Bool {
+        self == .requiresAdditionApproval || self == .requiresRemovalApproval
+    }
 }
 
 public struct PublicationSafetyReport: Sendable {
@@ -117,10 +125,12 @@ public struct PublicationSafetyReport: Sendable {
 
     public var headline: String {
         switch verdict {
-        case .safe:
-            return diff.isFirstPublication
-                ? "First publication: \(diff.proposedEntryCount) entries."
-                : "Safe to publish. \(diff.summary)"
+        case .noChange:
+            return "No change. The feed already matches."
+        case .requiresAdditionApproval:
+            return "This would take \(diff.addedNights) night"
+                + "\(diff.addedNights == 1 ? "" : "s") off sale on \(destination.displayName). "
+                + "Approve it first."
         case .requiresRemovalApproval:
             return "This would put \(diff.removedNights) previously blocked night"
                 + "\(diff.removedNights == 1 ? "" : "s") back on sale. Approve the removal first."
@@ -197,16 +207,32 @@ public struct FeedPublicationSafety: Sendable {
 
         // --- Verdict ----------------------------------------------------
 
-        // Nothing removed: additions and no-ops are always safe, even if a
-        // feed is stale. Adding a block cannot release a booked night.
+        // Nothing removed. An addition cannot release a booked night, so an
+        // upstream problem does not refuse it — but it still takes nights off
+        // sale somewhere, so it is never served without the owner's approval.
         guard diff.removesPublishedDates || diff.wouldEmptyFeed else {
+            guard !diff.added.isEmpty else {
+                return PublicationSafetyReport(
+                    destination: proposed.destination, diff: diff, causes: [],
+                    verdict: .noChange,
+                    reasons: ["The proposed feed is identical to the one already served."],
+                    lastKnownGood: lastKnownGood, reservationWarnings: []
+                )
+            }
+            reasons.append("This would take \(diff.addedNights) night"
+                + "\(diff.addedNights == 1 ? "" : "s") off sale on "
+                + "\(proposed.destination.displayName). Approve before it is served.")
             if !causes.isEmpty {
-                reasons.append("Upstream problems noted, but nothing is being removed, so "
-                    + "publishing cannot release a booked night.")
+                reasons.append("Upstream problems are noted below, but nothing is being removed, "
+                    + "so publishing cannot release a booked night.")
+                for cause in causes where !cause.isDeliberate {
+                    reasons.append("\(cause.label): \(cause.detail)")
+                }
             }
             return PublicationSafetyReport(
                 destination: proposed.destination, diff: diff,
-                causes: causes.filter { !$0.isDeliberate }, verdict: .safe,
+                causes: causes.filter { !$0.isDeliberate },
+                verdict: .requiresAdditionApproval,
                 reasons: reasons, lastKnownGood: lastKnownGood,
                 reservationWarnings: []
             )

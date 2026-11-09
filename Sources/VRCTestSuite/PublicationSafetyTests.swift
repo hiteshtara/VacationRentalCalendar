@@ -123,7 +123,8 @@ public enum PublicationSafetyTests {
             let report = FeedPublicationSafety().assess(
                 proposed: feed(decisions: []), lastKnownGood: nil, context: healthyContext()
             )
-            expect.equal(report.verdict, .safe)
+            expect.equal(report.verdict, .noChange,
+                         "an empty feed replacing nothing changes nothing")
             expect.ok(report.diff.isFirstPublication)
             expect.ok(!report.diff.wouldEmptyFeed, "nothing was published before")
         },
@@ -159,7 +160,9 @@ public enum PublicationSafetyTests {
                 lastKnownGood: snapshot(entries: []),
                 context: context
             )
-            expect.equal(report.verdict, .safe, "adding a block cannot release a booked night")
+            expect.equal(report.verdict, .requiresAdditionApproval,
+                         "an upstream failure must not refuse a growing feed")
+            expect.ok(report.verdict != .refused)
             expect.ok(!report.causes.isEmpty, "but the problem is still reported")
         },
 
@@ -229,7 +232,7 @@ public enum PublicationSafetyTests {
                 feed: feed(decisions: [reopen]),
                 lastKnownGood: snapshot(entries: [publishedBlock]),
                 context: healthyContext(decisions: [reopen]), key: "k",
-                removalApproved: true
+                changeApproved: true
             )
             expect.equal(proceeded.stage, .platformRefreshPending)
             expect.ok(!proceeded.isRemoteSynchronised,
@@ -282,7 +285,8 @@ public enum PublicationSafetyTests {
             let attempt = await PublicationPipeline(hosting: hosting).publish(
                 feed: feed(decisions: [blockDecision()]),
                 lastKnownGood: snapshot(entries: [], revision: 4),
-                context: healthyContext(decisions: [blockDecision()]), key: "k"
+                context: healthyContext(decisions: [blockDecision()]), key: "k",
+                changeApproved: true
             )
             expect.equal(attempt.stage, .failed)
             expect.contains(attempt.detail, "Upload failed")
@@ -299,7 +303,8 @@ public enum PublicationSafetyTests {
             let attempt = await PublicationPipeline(hosting: hosting).publish(
                 feed: feed(decisions: [blockDecision()]),
                 lastKnownGood: snapshot(entries: []),
-                context: healthyContext(decisions: [blockDecision()]), key: "k"
+                context: healthyContext(decisions: [blockDecision()]), key: "k",
+                changeApproved: true
             )
             expect.equal(attempt.stage, .uploaded,
                          "uploaded but not live is its own state")
@@ -345,7 +350,8 @@ public enum PublicationSafetyTests {
             let attempts = await pipeline.publishAll(
                 feeds: feeds, snapshots: snapshots,
                 context: healthyContext(decisions: [vrboDecision, bookingDecision]),
-                keys: [.vrbo: "kv", .bookingCom: "kb"]
+                keys: [.vrbo: "kv", .bookingCom: "kb"],
+                changeApproved: [.vrbo, .bookingCom]
             )
             expect.equal(attempts.count, 2)
             let vrbo = attempts.first { $0.destination == .vrbo }

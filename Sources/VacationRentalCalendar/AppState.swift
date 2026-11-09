@@ -40,6 +40,8 @@ final class AppState: ObservableObject {
     @Published private(set) var hasAskedForNotifications = false
     @Published private(set) var signature: CodeSignatureInfo = .init(kind: .unsigned)
     @Published private(set) var storeFailure: String?
+    /// How many long periods the one-off sweep brought back for review.
+    private(set) var longPeriodsFlagged = 0
 
     // Settings
     @Published var autoRefreshEnabled = true
@@ -93,6 +95,9 @@ final class AppState: ObservableObject {
             do {
                 let created = try RentalStore.makeDefault()
                 try SeedData.apply(to: created)
+                // Raises the review flag on unusually long periods. Never
+                // changes a classification — see LongPeriodReview.
+                self.longPeriodsFlagged = (try? LongPeriodReview.runOnce(in: created))?.count ?? 0
                 self.store = created
             } catch {
                 self.storeFailure = "The local database could not be opened: \(error)"
