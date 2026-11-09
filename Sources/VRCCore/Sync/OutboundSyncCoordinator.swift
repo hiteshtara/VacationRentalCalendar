@@ -42,7 +42,7 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
     let generator: CalendarFeedGenerator
     let decisions: AvailabilityRepository
     let manager: AvailabilityManager
-    let database: Database
+    let database: DataStore
     let properties: PropertyRepository
     let snapshots: FeedSnapshotRepository
     private let eventsProvider: @Sendable () throws -> [ClassifiedEvent]
@@ -57,7 +57,7 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
         manager: AvailabilityManager,
         properties: PropertyRepository,
         snapshots: FeedSnapshotRepository,
-        database: Database,
+        database: DataStore,
         eventsProvider: @escaping @Sendable () throws -> [ClassifiedEvent],
         listingsProvider: @escaping @Sendable () throws -> [PlatformListing],
         syncRunsProvider: @escaping @Sendable () throws -> [SyncRun],

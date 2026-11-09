@@ -48,6 +48,15 @@ public enum DataAPIError: Error, LocalizedError {
     case indeterminate(String)
     case retriesExhausted(attempts: Int, lastError: String)
     case unsupported(String)
+    /// SQLSTATE 40001 or 40P01. The database has already rolled the whole
+    /// transaction back, so the only correct response is to run the entire
+    /// transaction again -- never to retry the one statement, which would
+    /// execute inside a transaction the server has already aborted.
+    case serializationFailure(String)
+    /// Two threads tried to use one store while a transaction was open. The
+    /// transaction id is per-instance state, so this would interleave
+    /// statements from different transactions.
+    case concurrentUse(String)
 
     public var errorDescription: String? {
         switch self {
@@ -64,6 +73,12 @@ public enum DataAPIError: Error, LocalizedError {
             return "Gave up after \(attempts) attempts. Last error: \(last)"
         case .unsupported(let what):
             return "Not supported against Aurora over the Data API: \(what)"
+        case .serializationFailure(let detail):
+            return "The database rolled this transaction back to preserve "
+                + "serialisability: \(detail)"
+        case .concurrentUse(let detail):
+            return "This database connection is already inside a transaction on "
+                + "another thread: \(detail)"
         }
     }
 }
@@ -144,6 +159,11 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
     private var transactionID: String?
     private var transactionDepth = 0
     private var lastGeneratedID: Int64 = 0
+    /// Which thread owns the open transaction. The transaction id is
+    /// per-instance, so a second thread issuing statements would interleave
+    /// them into someone else's transaction. Detected and refused rather than
+    /// silently corrupting both.
+    private var transactionOwner: ObjectIdentifier?
     /// Set once per transaction, so `vrc.actor` is declared before any
     /// statement the guards would inspect.
     private var actorDeclared = false
@@ -210,73 +230,148 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
     // MARK: Transactions
 
     public func transaction<T>(_ body: () throws -> T) throws -> T {
-        lock.lock()
-        let joiningExisting = transactionDepth > 0
-        transactionDepth += 1
-        lock.unlock()
+        try transaction(attempts: 3, body)
+    }
 
-        if joiningExisting {
-            // Re-entrant call: join the outer transaction. Committing here
-            // would end it early and leave the outer scope writing outside a
-            // transaction without knowing it.
+    /// Runs `body` in a transaction, restarting the WHOLE transaction if the
+    /// database rolls it back for serialisability.
+    ///
+    /// Restarting the whole thing is the only correct response to SQLSTATE
+    /// 40001 or 40P01. PostgreSQL aborts the entire transaction, so every
+    /// later statement in it fails with "current transaction is aborted" --
+    /// retrying the single statement that happened to trip it would run inside
+    /// a transaction the server has already discarded. An earlier revision did
+    /// exactly that.
+    ///
+    /// `body` must therefore be safe to run more than once. Every caller in
+    /// this project is: they read, decide, and write inside the same closure.
+    public func transaction<T>(attempts: Int, _ body: () throws -> T) throws -> T {
+        // Re-entrant: a nested call joins the outer transaction. Committing
+        // here would end it early and leave the outer scope writing outside a
+        // transaction without knowing it.
+        if try isInTransactionOnThisThread() {
+            lock.lock(); transactionDepth += 1; lock.unlock()
             defer { lock.lock(); transactionDepth -= 1; lock.unlock() }
             return try body()
         }
 
-        let begun = try call(.beginTransaction, body: baseBody())
-        guard let id = begun.payload["transactionId"] as? String, !id.isEmpty else {
-            throw DataAPIError.malformedResponse("BeginTransaction returned no transactionId")
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                return try runOneTransaction(body)
+            } catch let error as DataAPIError {
+                guard case .serializationFailure(let detail) = error,
+                      attempt < max(1, attempts) else { throw error }
+                // Nothing was applied, so running it again is safe. Jittered
+                // so two contending writers do not retry in lockstep for ever.
+                let base = min(1.0, 0.05 * pow(2, Double(attempt - 1)))
+                sleeper(base + Double.random(in: 0...(base / 2)))
+                _ = detail
+                continue
+            }
         }
-        lock.lock(); transactionID = id; actorDeclared = false; lock.unlock()
+    }
 
-        func clear() {
+    /// One attempt. Guarantees that instance state is clean on every exit path
+    /// — including a failed BeginTransaction, a response with no transaction
+    /// id, a throwing body, a failed rollback and an unconfirmed commit.
+    private func runOneTransaction<T>(_ body: () throws -> T) throws -> T {
+        // Claim ownership BEFORE anything can fail, and release it in a defer,
+        // so no error path can leave depth or ownership behind. The previous
+        // implementation incremented the depth first and then called
+        // BeginTransaction: when that throw happened, the depth stayed at 1
+        // and every later transaction silently ran with no transaction at all.
+        lock.lock()
+        transactionDepth = 1
+        transactionOwner = ObjectIdentifier(Thread.current)
+        transactionID = nil
+        actorDeclared = false
+        lock.unlock()
+
+        defer {
             lock.lock()
             transactionID = nil
-            transactionDepth -= 1
+            transactionDepth = 0
+            transactionOwner = nil
             actorDeclared = false
             lock.unlock()
         }
+
+        let begun = try call(.beginTransaction, body: baseBody())
+        guard let id = begun.payload["transactionId"] as? String, !id.isEmpty else {
+            throw DataAPIError.malformedResponse(
+                "BeginTransaction returned no transactionId, so there is no transaction to "
+                + "run in")
+        }
+        lock.lock(); transactionID = id; lock.unlock()
 
         let value: T
         do {
             value = try body()
         } catch {
-            // Roll back, but report the ORIGINAL failure. A rollback that
-            // itself fails is worth knowing about and is reported as
-            // indeterminate rather than swallowed.
+            // Roll back, and report the ORIGINAL failure — except when the
+            // rollback itself fails, which the caller needs to know about
+            // because the server may still hold the transaction open until it
+            // expires.
+            lock.lock(); transactionID = nil; lock.unlock()
+            var rollback = baseBody()
+            rollback["transactionId"] = id
             do {
-                var rollback = baseBody()
-                rollback["transactionId"] = id
-                _ = try call(.rollbackTransaction, body: rollback)
-                clear()
+                _ = try call(.rollbackTransaction, body: rollback, insideTransaction: false)
             } catch let rollbackError {
-                clear()
+                // A serialisation failure needs to reach the retry loop even
+                // when the rollback also failed: the database has already
+                // discarded the transaction either way.
+                if let original = error as? DataAPIError,
+                   case .serializationFailure = original {
+                    throw original
+                }
                 throw DataAPIError.indeterminate(
                     "the transaction failed (\(error)) and the rollback also failed "
-                    + "(\(rollbackError)); the database may hold a partial change")
+                    + "(\(rollbackError)); the server may hold this transaction open until it "
+                    + "expires, and whether any of its statements applied is unknown")
             }
             throw error
         }
 
         var commit = baseBody()
         commit["transactionId"] = id
+        lock.lock(); transactionID = nil; lock.unlock()
         do {
             // isWrite: true deliberately. A commit is the most consequential
-            // write there is, and retrying one whose result is unknown could
-            // apply the whole transaction twice. An earlier revision left this
-            // as a read, so a 500 on commit was retried and could report
-            // success for work that had not landed.
-            _ = try call(.commitTransaction, body: commit, isWrite: true)
+            // write there is; retrying one whose result is unknown could apply
+            // the whole transaction twice.
+            _ = try call(.commitTransaction, body: commit, isWrite: true,
+                         insideTransaction: false)
+        } catch let error as DataAPIError {
+            // A commit that was rolled back for serialisability is a clean
+            // restart, not an unknown outcome.
+            if case .serializationFailure = error { throw error }
+            throw DataAPIError.indeterminate(
+                "the commit did not confirm, so whether this change was applied is "
+                + "unknown: \(error)")
         } catch {
-            clear()
-            // A commit whose result is unknown must not be reported as
-            // success: the caller cannot tell whether the work landed.
             throw DataAPIError.indeterminate(
                 "the commit did not confirm, so whether this change was applied is "
                 + "unknown: \(error)")
         }
-        clear()
         return value
+    }
+
+    /// True when this thread already holds a transaction on this store.
+    /// Throws when a DIFFERENT thread holds one, because sharing a store
+    /// across threads mid-transaction would interleave statements from two
+    /// transactions into whichever id happened to be set.
+    private func isInTransactionOnThisThread() throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let owner = transactionOwner else { return false }
+        guard owner == ObjectIdentifier(Thread.current) else {
+            throw DataAPIError.concurrentUse(
+                "a transaction is open on another thread; give each thread its own "
+                + "DataAPIStore rather than sharing one")
+        }
+        return true
     }
 
     // MARK: Plumbing
@@ -332,21 +427,37 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
         lock.lock()
         let inTransaction = transactionID != nil
         let already = actorDeclared
-        if inTransaction { actorDeclared = true }
+        let txn = transactionID
         lock.unlock()
 
         guard inTransaction, !already else { return }
+
         var body = baseBody()
         body["sql"] = "SELECT set_config('vrc.actor', :actor, true)"
         body["parameters"] = [["name": "actor", "value": ["stringValue": configuration.actor]]]
-        lock.lock(); let txn = transactionID; lock.unlock()
         if let txn { body["transactionId"] = txn }
+
+        // Marked only AFTER the statement succeeds. An earlier revision set
+        // the flag first, so a failed declaration left the store believing the
+        // actor had been declared — and every subsequent statement in that
+        // transaction would then run as the database's default actor,
+        // 'importer', silently losing the owner's privileges.
         _ = try call(.execute, body: body, isWrite: false)
+        lock.lock(); actorDeclared = true; lock.unlock()
     }
 
     private func call(
-        _ action: DataAPICall.Action, body: [String: Any], isWrite: Bool = false
+        _ action: DataAPICall.Action,
+        body: [String: Any],
+        isWrite: Bool = false,
+        insideTransaction: Bool? = nil
     ) throws -> DataAPIResult {
+        // Default: whatever the store's current state says.
+        let withinTransaction: Bool = {
+            if let insideTransaction { return insideTransaction }
+            lock.lock(); defer { lock.unlock() }
+            return transactionID != nil
+        }()
         var attempt = 0
         var waited: TimeInterval = 0
         var lastDescription = "none"
@@ -389,8 +500,19 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
                     continue
 
                 case .serializationFailure:
-                    // 40001 / 40P01. Safe to retry: the transaction was
-                    // rolled back by the database, so nothing applied.
+                    // 40001 / 40P01.
+                    //
+                    // Inside a transaction this must NOT be retried here.
+                    // PostgreSQL has aborted the whole transaction, so the
+                    // retried statement would run inside one the server has
+                    // already discarded and fail with "current transaction is
+                    // aborted". It is surfaced so `transaction()` can restart
+                    // the entire body, which is the only correct recovery.
+                    if withinTransaction {
+                        throw DataAPIError.serializationFailure(failure.description)
+                    }
+                    // Outside a transaction a single statement is its own
+                    // transaction, so retrying it here is safe.
                     sleeper(min(1, 0.1 * pow(2, Double(attempt - 1))))
                     continue
 

@@ -48,9 +48,9 @@ public struct AuditEntry: Identifiable, Sendable, Hashable {
 /// that is another entry, not an erasure — the question "what did I approve,
 /// and when?" has to stay answerable afterwards.
 public struct AvailabilityAuditLog: Sendable {
-    let database: Database
+    let database: DataStore
 
-    public init(database: Database) { self.database = database }
+    public init(database: DataStore) { self.database = database }
 
     @discardableResult
     public func record(_ entry: AuditEntry) throws -> AuditEntry {

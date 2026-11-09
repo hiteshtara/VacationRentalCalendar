@@ -7,7 +7,7 @@ import Foundation
 /// fast enough locally that a background queue would add risk without adding
 /// responsiveness.
 public final class RentalStore: @unchecked Sendable {
-    public let database: Database
+    public let database: DataStore
     public let credentials: FeedCredentialStore
     public let properties: PropertyRepository
     public let listings: ListingRepository
@@ -27,10 +27,21 @@ public final class RentalStore: @unchecked Sendable {
     public private(set) var availabilityManager: AvailabilityManager!
     public private(set) var outbound: OutboundSyncCoordinator!
 
-    public init(database: Database, credentials: FeedCredentialStore) throws {
+    public init(database: DataStore, credentials: FeedCredentialStore) throws {
         self.database = database
         self.credentials = credentials
-        try Migrator.migrate(database)
+        // The SQLite migrator builds the local schema. Postgres is migrated by
+        // the numbered files in Migrations/postgres, applied once against the
+        // cluster rather than on every connection — so a cloud store arrives
+        // already migrated and this step is skipped.
+        if let sqlite = database as? Database {
+            try Migrator.migrate(sqlite)
+        } else if try database.scalarInt(
+            "SELECT count(*) FROM schema_migrations") == 0 {
+            throw DataAPIError.notConfigured(
+                "the database has no applied migrations — apply Migrations/postgres/*.sql "
+                + "before pointing the service at it")
+        }
         self.properties = PropertyRepository(database: database)
         self.listings = ListingRepository(database: database, credentials: credentials)
         self.events = EventRepository(database: database)
@@ -109,6 +120,14 @@ public final class RentalStore: @unchecked Sendable {
     #endif
 
     /// A throwaway store for tests.
+    /// The same repositories, backed by Aurora. Used by the Lambda handlers so
+    /// they run the tested repository operations rather than their own SQL.
+    public static func makeCloud(
+        store: DataStore, credentials: FeedCredentialStore = InMemoryFeedCredentialStore()
+    ) throws -> RentalStore {
+        try RentalStore(database: store, credentials: credentials)
+    }
+
     public static func makeInMemory() throws -> RentalStore {
         try RentalStore(database: Database.inMemory(), credentials: InMemoryFeedCredentialStore())
     }

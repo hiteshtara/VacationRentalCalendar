@@ -3,10 +3,10 @@ import Foundation
 /// Reads and writes listings, routing the iCal URL through the credential store
 /// whenever the listing is marked as Keychain-backed.
 public struct ListingRepository: Sendable {
-    let database: Database
+    let database: DataStore
     let credentials: FeedCredentialStore
 
-    public init(database: Database, credentials: FeedCredentialStore) {
+    public init(database: DataStore, credentials: FeedCredentialStore) {
         self.database = database
         self.credentials = credentials
     }

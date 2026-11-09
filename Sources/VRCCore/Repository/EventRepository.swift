@@ -10,8 +10,8 @@ public enum UpsertResult: String, Sendable {
 }
 
 public struct EventRepository: Sendable {
-    let database: Database
-    public init(database: Database) { self.database = database }
+    let database: DataStore
+    public init(database: DataStore) { self.database = database }
 
     private func decode(_ row: Row) -> CalendarEvent {
         CalendarEvent(

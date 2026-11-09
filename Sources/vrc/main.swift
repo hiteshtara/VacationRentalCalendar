@@ -240,7 +240,9 @@ func runStatus() {
 
         print("Schema version: \(try Migrator.currentVersion(store.database)) "
             + "of \(Migrator.latestVersion)")
-        print("Database:       \(store.database.path)")
+        // The CLI only ever runs against the local SQLite file; the cloud
+        // store is reached by the Lambdas, not from here.
+        print("Database:       \((store.database as? Database)?.path ?? "(not a local file)")")
         print("Feed URLs:      \(store.credentials.storageDescription)")
         print("Outbound sync:  \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
         print("")

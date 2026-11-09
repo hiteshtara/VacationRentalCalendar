@@ -337,7 +337,7 @@ public enum Migrator {
         return performed
     }
 
-    public static func currentVersion(_ database: Database) throws -> Int {
+    public static func currentVersion(_ database: DataStore) throws -> Int {
         let rows = try database.query(
             "SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations;"
         )
