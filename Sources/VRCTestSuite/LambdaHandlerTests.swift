@@ -8,6 +8,28 @@ public enum LambdaHandlerTests {
 
     // MARK: Doubles
 
+    /// A store whose every operation fails, for the fail-closed path.
+    final class FailingStore: DataStore, @unchecked Sendable {
+        var dialect: SQLDialect { .postgres }
+        var lastInsertRowID: Int64 { 0 }
+        func execute(_ sql: String) throws { throw DataAPIError.notConfigured("test") }
+        func run(_ sql: String, _ p: [SQLValue]) throws -> Int {
+            throw DataAPIError.notConfigured("test")
+        }
+        func query(_ sql: String, _ p: [SQLValue]) throws -> [Row] {
+            throw DataAPIError.notConfigured("test")
+        }
+        func queryOne(_ sql: String, _ p: [SQLValue]) throws -> Row? {
+            throw DataAPIError.notConfigured("test")
+        }
+        func scalarInt(_ sql: String, _ p: [SQLValue]) throws -> Int {
+            throw DataAPIError.notConfigured("test")
+        }
+        func transaction<T>(_ body: () throws -> T) throws -> T {
+            throw DataAPIError.notConfigured("test")
+        }
+    }
+
     final class FakeObjects: ObjectStore, @unchecked Sendable {
         private let lock = NSLock()
         var stored: [String: Data] = [:]
@@ -329,21 +351,16 @@ public enum LambdaHandlerTests {
         TestCase(group: "Lambda handlers",
                  name: "an unreachable database is 503, never an empty all-clear") { expect in
             // The dangerous failure: reporting zero conflicts because the
-            // database could not be read.
-            let transport = RecordingDataAPITransport(responses: [
-                .init(statusCode: 400, payload: [
-                    "__type": "BadRequestException", "message": "no",
-                ]),
-            ])
-            let store = DataAPIStore(
-                transport: transport,
-                configuration: .init(resourceArn: "a", secretArn: "b", database: "vrc",
-                                     maxAttempts: 1),
-                sleeper: { _ in })
-            let response = ApiHandler(context: ServiceContext(actor: "owner", environment: [:]))
-                .handle(.init(method: "GET", path: "/status",
-                              principal: "arn:aws:iam::1:user/vrc-mac-client", body: [:]),
-                        store: store)
+            // database could not be read. Driven through the repository layer,
+            // which is what the deployed handler uses.
+            let rental = try RentalStore(
+                database: FailingStore(), credentials: InMemoryFeedCredentialStore(),
+                skipMigration: true)
+            let api = ApiHandler(context: ServiceContext(actor: "owner", environment: [:]))
+            let response = api.handle(
+                ApiHandler.Request(method: "GET", path: "/status",
+                                   principal: "arn:aws:iam::1:user/vrc-mac-client", body: [:]),
+                rental: rental)
             let decoded = LambdaJSON.object(response)
             expect.equal(decoded["statusCode"] as? Int, 503)
             let body = LambdaJSON.object(Data((decoded["body"] as? String ?? "").utf8))
@@ -352,30 +369,39 @@ public enum LambdaHandlerTests {
 
         TestCase(group: "Lambda handlers",
                  name: "status never claims a platform has read the feed") { expect in
-            let transport = RecordingDataAPITransport(responses: [
-                .init(statusCode: 200, payload: ["columnMetadata": [["name": "c"]],
-                                                 "records": [[["longValue": NSNumber(value: 7)]]]]),
-                .init(statusCode: 200, payload: ["columnMetadata": [["name": "c"]],
-                                                 "records": [[["longValue": NSNumber(value: 2)]]]]),
-                .init(statusCode: 200, payload: ["columnMetadata": [["name": "c"]],
-                                                 "records": [[["longValue": NSNumber(value: 0)]]]]),
-                .init(statusCode: 200, payload: ["columnMetadata": [["name": "c"]],
-                                                 "records": [[["longValue": NSNumber(value: 0)]]]]),
-                .init(statusCode: 200, payload: ["columnMetadata": [["name": "at"]],
-                                                 "records": [[["isNull": true]]]]),
-            ])
-            let store = DataAPIStore(
-                transport: transport,
-                configuration: .init(resourceArn: "a", secretArn: "b", database: "vrc"),
-                sleeper: { _ in })
-            let response = ApiHandler(context: ServiceContext(actor: "owner", environment: [:]))
-                .handle(.init(method: "GET", path: "/status",
-                              principal: "arn:aws:iam::1:user/x", body: [:]),
-                        store: store)
+            // Real repositories, real rows, so the counts come from the same
+            // code the Mac uses rather than from a scripted transport.
+            let rental = try RentalStore.makeInMemory()
+            let property = try rental.properties.insert(Property(name: "39 G Street"))
+            let listing = try rental.listings.insert(PlatformListing(
+                propertyID: property.id!, platform: .airbnb, label: "Airbnb",
+                icalURL: "https://example.test/a.ics", urlStorage: .database,
+                connectionState: .connected))
+            for index in 1...7 {
+                _ = try rental.events.upsert(CalendarEvent(
+                    listingID: listing.id!, eventKey: "s-\(index)", uid: "s-\(index)",
+                    platform: .airbnb, summary: "Blocked", details: "",
+                    checkIn: DayMath.day(2027, 5, index), checkOut: DayMath.day(2027, 5, index + 1)))
+            }
+            for index in 0..<2 {
+                _ = try rental.availability.insert(AvailabilityDecision(
+                    propertyID: property.id!, destination: .vrbo, action: .block,
+                    startDay: DayMath.day(2026, 12, 10 + index * 9),
+                    endDay: DayMath.day(2026, 12, 11 + index * 9),
+                    status: .approved, publicationUID: "vrc-status-\(index)",
+                    approvedAt: Date(), approvedBy: "owner"))
+            }
+
+            let api = ApiHandler(context: ServiceContext(actor: "owner", environment: [:]))
+            let response = api.handle(
+                ApiHandler.Request(method: "GET", path: "/status",
+                                   principal: "arn:aws:iam::1:user/x", body: [:]),
+                rental: rental)
             let body = LambdaJSON.object(
                 Data((LambdaJSON.object(response)["body"] as? String ?? "").utf8))
             expect.equal(body["liveSourceEvents"] as? Int, 7)
             expect.equal(body["approvedDecisions"] as? Int, 2)
+            expect.equal(body["publishedDecisions"] as? Int, 0)
             expect.ok(body["remoteSynchronised"] as? Bool == false,
                       "publishing is not importing, and the Mac must not be told otherwise")
             expect.ok(body["outboundEnabled"] as? Bool == false)

@@ -27,14 +27,20 @@ public final class RentalStore: @unchecked Sendable {
     public private(set) var availabilityManager: AvailabilityManager!
     public private(set) var outbound: OutboundSyncCoordinator!
 
-    public init(database: DataStore, credentials: FeedCredentialStore) throws {
+    public init(
+        database: DataStore,
+        credentials: FeedCredentialStore,
+        skipMigration: Bool = false
+    ) throws {
         self.database = database
         self.credentials = credentials
         // The SQLite migrator builds the local schema. Postgres is migrated by
         // the numbered files in Migrations/postgres, applied once against the
         // cluster rather than on every connection — so a cloud store arrives
         // already migrated and this step is skipped.
-        if let sqlite = database as? Database {
+        if skipMigration {
+            // A store whose schema is managed elsewhere, or a test double.
+        } else if let sqlite = database as? Database {
             try Migrator.migrate(sqlite)
         } else if try database.scalarInt(
             "SELECT count(*) FROM schema_migrations") == 0 {

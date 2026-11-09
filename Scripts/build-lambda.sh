@@ -37,6 +37,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE="swift:6.3.3-amazonlinux2023"
+# Which environment's functions to update. Staging by default, so a careless
+# --deploy cannot reach production: that needs the prefix stated explicitly.
+PREFIX="${VRC_FUNCTION_PREFIX:-vrc-staging}"
 FUNCTIONS=(fetch process publish api sweeper)
 OUT=".build/lambda"
 WORK="$(mktemp -d)"
@@ -120,12 +123,12 @@ step "4. Deploying function code"
 say "  This replaces code only. It creates nothing, enables no schedule, and"
 say "  does not turn on outbound publication."
 for f in "${FUNCTIONS[@]}"; do
-    if aws lambda update-function-code --function-name "vrc-${f}" \
+    if aws lambda update-function-code --function-name "${PREFIX}-${f}" \
             --zip-file "fileb://${OUT}/${f}.zip" --query 'LastUpdateStatus' \
             --output text >/dev/null 2>&1; then
-        ok "vrc-${f} updated"
+        ok "${PREFIX}-${f} updated"
     else
-        bad "vrc-${f} not updated (does the function exist yet?)"
+        bad "${PREFIX}-${f} not updated (does the function exist yet?)"
     fi
 done
 step "Done"

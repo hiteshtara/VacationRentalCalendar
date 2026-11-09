@@ -81,8 +81,15 @@ public struct ApiHandler {
             }
             return routes.lookup(
                 publicationUID: uid.removingPercentEncoding ?? uid, store: rental)
+        case ("GET", "/status"), ("GET", "/"):
+            return status(rental: rental)
+        case ("GET", "/availability"):
+            return availability(store: rental.database)
         default:
-            return handle(request, store: rental.database)
+            return LambdaJSON.httpResponse(404, [
+                "error": "no such route",
+                "detail": "\(request.method) \(request.path)",
+            ])
         }
     }
 
@@ -98,7 +105,9 @@ public struct ApiHandler {
 
         switch (request.method, request.path) {
         case ("GET", "/status"), ("GET", "/"):
-            return status(store: store)
+            return LambdaJSON.httpResponse(500, [
+                "error": "this overload requires the repository layer",
+            ])
         case ("GET", "/availability"):
             return availability(store: store)
         default:
@@ -109,42 +118,85 @@ public struct ApiHandler {
         }
     }
 
-    private func status(store: DataStore) -> Data {
+    /// Built on the repositories rather than hand-written SQL.
+    ///
+    /// The previous version queried `source_events` and `import_runs` — table
+    /// names from the superseded schema. They do not exist in the repository
+    /// schema, so every call returned 503 against the real cluster. Using the
+    /// repositories means the handler cannot drift from the schema the Mac
+    /// uses, because it is the same code.
+    private func status(rental: RentalStore) -> Data {
         do {
-            let events = try store.scalarInt(
-                "SELECT count(*) FROM source_events WHERE withdrawn_at IS NULL")
-            let approved = try store.scalarInt(
-                "SELECT count(*) FROM availability_decisions WHERE status = ?", [.text("approved")])
-            let published = try store.scalarInt(
-                "SELECT count(*) FROM availability_decisions WHERE status = ?", [.text("published")])
-            let conflicts = try store.scalarInt(
-                "SELECT count(*) FROM conflicts WHERE resolved_at IS NULL")
-            let lastImport = try store.queryOne(
-                "SELECT max(finished_at) AS at FROM import_runs WHERE outcome = ?",
-                [.text("ok")])
+            let events = try rental.events.allActive()
+            let decisions = try rental.availability.all()
+            let listings = try rental.listings.all()
+            let runs = try rental.syncRuns.recent(limit: 50)
+
+            // A source is failing if its connection state says so; stale if it
+            // has not succeeded inside the freshness window. Both are reported
+            // rather than collapsed into a single "healthy" flag, because they
+            // need different responses.
+            var failing: [String: String] = [:]
+            var stale: [String: String] = [:]
+            let now = Date()
+            for listing in listings {
+                let platform = listing.platform.rawValue
+                if !listing.connectionState.shouldAttemptImport {
+                    failing[platform] = listing.connectionState.rawValue
+                    continue
+                }
+                guard let last = listing.lastSyncAt else {
+                    stale[platform] = "never imported"
+                    continue
+                }
+                let age = now.timeIntervalSince(last)
+                if age > 6 * 3600 {
+                    stale[platform] = "last success \(Int(age / 3600))h ago"
+                }
+            }
+
+            let lastSuccess = runs
+                .filter { $0.outcome == .success }
+                .compactMap(\.finishedAt)
+                .max()
+
+            // `conflicts` is created by 011_safety.sql and has no repository,
+            // so this is the one direct query left — and it is a count, not a
+            // business decision.
+            let openConflicts = (try? rental.database.scalarInt(
+                "SELECT count(*) FROM conflicts WHERE resolved_at IS NULL")) ?? 0
 
             return LambdaJSON.httpResponse(200, [
-                "liveSourceEvents": events,
-                "approvedDecisions": approved,
-                "publishedDecisions": published,
-                "openConflicts": conflicts,
-                "lastSuccessfulImport": lastImport?.string("at") ?? "never",
+                "liveSourceEvents": events.count,
+                "approvedDecisions": decisions.filter { $0.status == .approved }.count,
+                "publishedDecisions": decisions.filter {
+                    $0.status == .published || $0.status == .verified
+                }.count,
+                "openConflicts": openConflicts,
+                "lastSuccessfulImport": lastSuccess
+                    .map { ISO8601DateFormatter().string(from: $0) } ?? "never",
                 "outboundEnabled": context.outboundEnabled && OutboundSyncGate.isEnabled,
                 // Said plainly, because a published feed is not an imported
                 // one and the Mac must not display it as synchronised.
                 "remoteSynchronised": false,
+                "failingSources": failing,
+                "staleSources": stale,
                 "note": "a published feed is not evidence that a platform has read it",
             ])
         } catch let error as DataAPIError {
-            // Fail closed: an unreadable database is reported as unknown, never
-            // as zero conflicts and nothing to do.
+            // Fail closed: an unreadable database is reported as unavailable,
+            // never as zero conflicts and nothing to do.
             return LambdaJSON.httpResponse(503, [
                 "error": "database unavailable",
                 "detail": error.errorDescription ?? "\(error)",
                 "remoteSynchronised": false,
             ])
         } catch {
-            return LambdaJSON.httpResponse(500, ["error": "\(error)"])
+            return LambdaJSON.httpResponse(503, [
+                "error": "database unavailable",
+                "detail": "\(error)",
+                "remoteSynchronised": false,
+            ])
         }
     }
 
