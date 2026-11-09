@@ -100,6 +100,7 @@ public enum TestRegistry {
         MigrationTests.cases
             + ICalParsingTests.cases
             + SemanticHashTests.cases
+            + SQLScannerTests.cases
             + DataStoreTests.cases
             + TransactionLifecycleTests.cases
             + DataStoreParityTests.cases

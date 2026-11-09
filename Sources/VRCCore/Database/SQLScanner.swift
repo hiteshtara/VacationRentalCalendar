@@ -124,16 +124,24 @@ public enum SQLScanner {
         return Rewritten(sql: output, placeholderCount: placeholders)
     }
 
-    /// Splits on semicolons that are genuinely statement terminators. Used only
-    /// to refuse a multi-statement call, because running the first and
-    /// silently dropping the rest would be worse than an error.
+    /// Splits a script into statements, on semicolons that are genuinely
+    /// terminators.
+    ///
+    /// Dollar-quoting is the part that matters. A PostgreSQL function body is
+    /// written `AS $$ … $$`, and those bodies are full of semicolons. A
+    /// splitter that does not track them shreds every `CREATE FUNCTION` into
+    /// fragments — which is exactly what this did before, turning one function
+    /// into five "statements" and making it impossible to run a migration over
+    /// the Data API, where statements must be sent one at a time.
     public static func splitStatements(_ sql: String) -> [String] {
         var statements: [String] = []
         var current = ""
         var depth = 0
 
-        enum Context { case code, singleQuoted, doubleQuoted, lineComment, blockComment }
+        enum Context { case code, singleQuoted, doubleQuoted, lineComment, blockComment, dollarQuoted }
         var context = Context.code
+        var dollarTag = ""
+
         let characters = Array(sql)
         var index = 0
 
@@ -142,46 +150,83 @@ public enum SQLScanner {
             return target < characters.count ? characters[target] : nil
         }
 
+        func flush() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { statements.append(trimmed) }
+            current = ""
+        }
+
         while index < characters.count {
             let character = characters[index]
+
             switch context {
             case .code:
                 if character == "'" { context = .singleQuoted }
                 else if character == "\"" { context = .doubleQuoted }
                 else if character == "-", peek(1) == "-" { context = .lineComment }
                 else if character == "/", peek(1) == "*" { context = .blockComment }
+                else if character == "$" {
+                    // $$ … $$ or $tag$ … $tag$
+                    var scan = index + 1
+                    var tag = ""
+                    while scan < characters.count, characters[scan] != "$" {
+                        tag.append(characters[scan]); scan += 1
+                    }
+                    if scan < characters.count, characters[scan] == "$",
+                       tag.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) {
+                        dollarTag = "$\(tag)$"
+                        current += dollarTag
+                        index = scan + 1
+                        context = .dollarQuoted
+                        continue
+                    }
+                }
                 else if character == "(" { depth += 1 }
                 else if character == ")" { depth = max(0, depth - 1) }
                 else if character == ";", depth == 0 {
-                    let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { statements.append(trimmed) }
-                    current = ""
+                    flush()
                     index += 1
                     continue
                 }
+
             case .singleQuoted:
                 if character == "'" {
-                    if peek(1) == "'" { current.append("''"); index += 2; continue }
+                    if peek(1) == "'" { current += "''"; index += 2; continue }
                     context = .code
                 }
+
             case .doubleQuoted:
                 if character == "\"" {
-                    if peek(1) == "\"" { current.append("\"\""); index += 2; continue }
+                    if peek(1) == "\"" { current += "\"\""; index += 2; continue }
                     context = .code
                 }
+
             case .lineComment:
                 if character == "\n" { context = .code }
+
             case .blockComment:
                 if character == "*", peek(1) == "/" {
-                    current.append("*/"); index += 2; context = .code; continue
+                    current += "*/"; index += 2; context = .code; continue
+                }
+
+            case .dollarQuoted:
+                if character == "$", !dollarTag.isEmpty,
+                   characters.count - index >= dollarTag.count,
+                   String(characters[index..<(index + dollarTag.count)]) == dollarTag {
+                    current += dollarTag
+                    index += dollarTag.count
+                    context = .code
+                    dollarTag = ""
+                    continue
                 }
             }
+
             current.append(character)
             index += 1
         }
 
-        let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { statements.append(trimmed) }
+        flush()
         return statements
     }
+
 }
