@@ -111,8 +111,11 @@ public struct BlockClassifier: Sendable {
             proposal.rationale += " This range covers \(nights) nights, which is long enough to "
                 + "be the edge of your booking window rather than a real hold — platforms export "
                 + "the dates past the end of your window as unavailable."
-            if proposal.kind.describesGenuineUnavailability, proposal.kind != .confirmedReservation {
-                proposal.kind = .unknownUnavailable
+            // Now has a name of its own rather than being lumped in with
+            // genuinely unexplained blocks. Still reviewed, still never
+            // exported — but the owner is told what it probably is.
+            if proposal.kind != .confirmedReservation {
+                proposal.kind = .platformRestriction
             }
         }
 

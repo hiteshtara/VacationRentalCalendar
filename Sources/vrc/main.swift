@@ -48,6 +48,11 @@ func runHelp() {
       vrc conflicts                Show overlapping ranges
       vrc export --property <id> [--to airbnb|vrbo|booking_com] [--write <path>]
                                    Build a filtered feed and show what was excluded
+      vrc feed --property <id> --to <platform> [--raw]
+                                   Show the feed a destination would receive
+      vrc availability             List availability decisions and audit history
+      vrc connection [--listing <id>] [--state <state>] [--detail "..."]
+                                   Show or change a feed's connection state
       vrc doctor                   Check the database, Keychain and outbound gate
 
     KINDS
@@ -282,6 +287,111 @@ func runExport() {
     }
 }
 
+/// Shows the feed a destination would receive, entry by entry, with reasons.
+func runFeed() {
+    let store = makeStore()
+    guard let propertyID = value(for: "--property").flatMap(Int64.init) else {
+        bail("--property <id> is required")
+    }
+    guard let raw = value(for: "--to"), let destination = RentalPlatform(rawValue: raw) else {
+        bail("--to must be one of: airbnb, vrbo, booking_com")
+    }
+    do {
+        let feed = try store.outbound.generateFeed(propertyID: propertyID, destination: destination)
+        print(CalendarFeedGenerator().auditText(feed))
+        print("")
+        print("Outbound publishing: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
+        if flags.contains("--raw") {
+            print("")
+            print(CalendarFeedGenerator().makeICS(feed))
+        }
+    } catch {
+        bail("feed generation failed: \(error)")
+    }
+}
+
+func runAvailability() {
+    let store = makeStore()
+    do {
+        let decisions = try store.availability.all()
+        if decisions.isEmpty {
+            print("No availability decisions recorded.")
+        } else {
+            for decision in decisions {
+                print("[\(decision.id ?? 0)] \(decision.summaryLine)")
+                print("     status: \(decision.status.rawValue) — \(decision.status.explanation)")
+                if let reason = decision.failureReason { print("     refused: \(reason)") }
+            }
+        }
+        print("")
+        let audit = try store.auditLog.recent(limit: 20)
+        if !audit.isEmpty {
+            print("Recent audit entries:")
+            for entry in audit.reversed() { print("  \(entry.line)") }
+        }
+    } catch {
+        bail("availability listing failed: \(error)")
+    }
+}
+
+/// Shows or changes a feed's connection state, with history.
+func runConnection() {
+    let store = makeStore()
+    guard let listingID = value(for: "--listing").flatMap(Int64.init) else {
+        // No listing given: summarise them all.
+        do {
+            for listing in try store.listings.all() {
+                print("[\(listing.id ?? 0)] \(pad(listing.platform.displayName, 12)) "
+                    + "\(pad(listing.connectionState.displayName, 28)) \(listing.label)")
+                if !listing.connectionDetail.isEmpty {
+                    print("      \(listing.connectionDetail)")
+                }
+                if let next = listing.connectionState.nextStep {
+                    print("      next: \(next)")
+                }
+            }
+        } catch {
+            bail("could not list connections: \(error)")
+        }
+        return
+    }
+
+    do {
+        guard let listing = try store.listings.find(id: listingID) else {
+            bail("no listing with id \(listingID)")
+        }
+        if let raw = value(for: "--state") {
+            guard let state = FeedConnectionState(rawValue: raw) else {
+                bail("--state must be one of: "
+                    + FeedConnectionState.allCases.map(\.rawValue).joined(separator: ", "))
+            }
+            try store.listings.setConnectionState(
+                listingID: listingID, to: state,
+                detail: value(for: "--detail") ?? "",
+                httpStatus: value(for: "--http").flatMap(Int.init),
+                actor: value(for: "--actor") ?? "owner"
+            )
+            print("\(listing.label) → \(state.displayName)")
+            if !state.shouldAttemptImport {
+                print("This feed will no longer be fetched.")
+            }
+        }
+
+        let updated = try store.listings.find(id: listingID)!
+        print("")
+        print("State:  \(updated.connectionState.displayName)")
+        print("        \(updated.connectionState.explanation)")
+        if let next = updated.connectionState.nextStep { print("Next:   \(next)") }
+        print("")
+        print("History:")
+        for entry in try store.listings.connectionHistory(listingID: listingID) {
+            print("  \(entry.line)")
+        }
+    } catch {
+        bail("connection command failed: \(error)")
+    }
+}
+
 func runDoctor() {
     let store = makeStore()
     var problems = 0
@@ -306,7 +416,12 @@ func runDoctor() {
         print("")
         let signature = CodeSignatureInfo.current()
         check("code signature survives a rebuild", signature.kind.survivesRebuild,
-              signature.kind.rawValue)
+              signature.kind.rawValue
+                  + (signature.authority.map { " — \($0)" } ?? ""))
+        if !signature.kind.survivesRebuild {
+            print("     Run ./Scripts/fix-signing.sh once to stop the repeated")
+            print("     Keychain prompts after every rebuild.")
+        }
         print("")
         print("Credential store: \(store.credentials.storageDescription)")
         print("Code signature:   \(signature.kind.rawValue)"
@@ -328,6 +443,9 @@ case "import": await runImport()
 case "review": runReview()
 case "classify": runClassify()
 case "conflicts": runConflicts()
+case "feed": runFeed()
+case "availability": runAvailability()
+case "connection": runConnection()
 case "export": runExport()
 case "doctor": runDoctor()
 case "help", "--help", "-h": runHelp()

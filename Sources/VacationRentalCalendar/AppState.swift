@@ -23,6 +23,15 @@ final class AppState: ObservableObject {
     /// Keys ticked in the review queue for a batch decision.
     @Published var reviewSelection: Set<String> = []
 
+    // Availability editing
+    @Published var rangeStart: Date?
+    @Published var rangeEnd: Date?
+    @Published var plannedActions: [RentalPlatform: AvailabilityAction] = [:]
+    @Published var planReason: String = ""
+    @Published private(set) var decisions: [AvailabilityDecision] = []
+    @Published private(set) var auditEntries: [AuditEntry] = []
+    @Published private(set) var syncStates: [DestinationSyncState] = []
+
     // Status
     @Published private(set) var isRefreshing = false
     @Published private(set) var statusMessage = ""
@@ -31,6 +40,8 @@ final class AppState: ObservableObject {
     @Published private(set) var hasAskedForNotifications = false
     @Published private(set) var signature: CodeSignatureInfo = .init(kind: .unsigned)
     @Published private(set) var storeFailure: String?
+    /// How many long periods the one-off sweep brought back for review.
+    private(set) var longPeriodsFlagged = 0
 
     // Settings
     @Published var autoRefreshEnabled = true
@@ -41,13 +52,14 @@ final class AppState: ObservableObject {
     private var refreshTask: Task<Void, Never>?
 
     enum Section: String, CaseIterable, Identifiable, Hashable {
-        case calendar, review, conflicts, export, feeds, history
+        case calendar, review, availability, conflicts, export, feeds, history
         var id: String { rawValue }
 
         var title: String {
             switch self {
             case .calendar: return "Calendar"
             case .review: return "Needs Review"
+            case .availability: return "Availability"
             case .conflicts: return "Conflicts"
             case .export: return "Filtered Export"
             case .feeds: return "Feeds"
@@ -59,6 +71,7 @@ final class AppState: ObservableObject {
             switch self {
             case .calendar: return "calendar"
             case .review: return "questionmark.circle"
+            case .availability: return "slider.horizontal.3"
             case .conflicts: return "exclamationmark.triangle"
             case .export: return "square.and.arrow.up"
             case .feeds: return "antenna.radiowaves.left.and.right"
@@ -82,6 +95,9 @@ final class AppState: ObservableObject {
             do {
                 let created = try RentalStore.makeDefault()
                 try SeedData.apply(to: created)
+                // Raises the review flag on unusually long periods. Never
+                // changes a classification — see LongPeriodReview.
+                self.longPeriodsFlagged = (try? LongPeriodReview.runOnce(in: created))?.count ?? 0
                 self.store = created
             } catch {
                 self.storeFailure = "The local database could not be opened: \(error)"
@@ -134,6 +150,11 @@ final class AppState: ObservableObject {
             events = try store.classifiedEvents()
             conflicts = try store.conflicts()
             syncRuns = try store.syncRuns.recent(limit: 100)
+            decisions = try store.availability.all()
+            auditEntries = try store.auditLog.recent(limit: 200)
+            if let propertyID = selectedPropertyID {
+                syncStates = (try? store.outbound.allStates(propertyID: propertyID)) ?? []
+            }
             if selectedPropertyID == nil { selectedPropertyID = properties.first?.id }
             lastError = nil
         } catch {
@@ -448,6 +469,128 @@ final class AppState: ObservableObject {
         } catch {
             lastError = "Could not add that property: \(error)"
         }
+    }
+
+    // MARK: - Availability
+
+    /// The nights currently selected in the calendar, checkout-exclusive.
+    var selectedRange: (start: Date, end: Date)? {
+        guard let rangeStart, let rangeEnd else { return nil }
+        let lower = min(rangeStart, rangeEnd)
+        let upper = max(rangeStart, rangeEnd)
+        // The user picks the last night; the stored end is the morning after.
+        return (lower, DayMath.adding(days: 1, to: upper))
+    }
+
+    var selectedNights: Int {
+        guard let range = selectedRange else { return 0 }
+        return max(0, DayMath.daysBetween(range.start, range.end))
+    }
+
+    /// Clicking a day starts a range; clicking a second day completes it.
+    func selectDay(_ day: Date) {
+        let value = DayMath.utcMidnight(day)
+        if rangeStart == nil || rangeEnd != nil {
+            rangeStart = value
+            rangeEnd = nil
+        } else {
+            rangeEnd = value
+        }
+    }
+
+    func extendSelection(to day: Date) {
+        if rangeStart == nil { rangeStart = DayMath.utcMidnight(day) }
+        rangeEnd = DayMath.utcMidnight(day)
+    }
+
+    func clearRange() {
+        rangeStart = nil
+        rangeEnd = nil
+        plannedActions = [:]
+        planReason = ""
+    }
+
+    func isDayInSelection(_ day: Date) -> Bool {
+        guard let range = selectedRange else { return false }
+        let value = DayMath.utcMidnight(day)
+        return value >= range.start && value < range.end
+    }
+
+    var currentPlan: AvailabilityPlan? {
+        guard let propertyID = selectedPropertyID, let range = selectedRange,
+              !plannedActions.isEmpty else { return nil }
+        return AvailabilityPlan(
+            propertyID: propertyID, startDay: range.start, endDay: range.end,
+            reason: planReason, actions: plannedActions
+        )
+    }
+
+    /// Works out what the plan would do. Writes nothing.
+    func previewPlan() -> VRCCore.AvailabilityPreview? {
+        guard let store, let plan = currentPlan else { return nil }
+        return try? store.availabilityManager.preview(plan)
+    }
+
+    func submitPlan() {
+        guard let store, let plan = currentPlan else { return }
+        do {
+            let submitted = try store.availabilityManager.submit(plan)
+            reload()
+            let refused = submitted.filter { $0.status == .failed }.count
+            statusMessage = refused == 0
+                ? "\(submitted.count) change\(submitted.count == 1 ? "" : "s") waiting for your approval."
+                : "\(submitted.count - refused) waiting for approval, \(refused) refused."
+            clearRange()
+        } catch {
+            lastError = "Could not save that plan: \(error.localizedDescription)"
+        }
+    }
+
+    func approve(decisionID: Int64) {
+        guard let store else { return }
+        do {
+            let approved = try store.availabilityManager.approve(decisionID: decisionID)
+            reload()
+            statusMessage = "Approved: \(approved.summaryLine). Nothing has been sent anywhere."
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+            reload()
+        }
+    }
+
+    func cancel(decisionID: Int64) {
+        guard let store else { return }
+        try? store.availabilityManager.cancel(decisionID: decisionID)
+        reload()
+        statusMessage = "Change cancelled."
+    }
+
+    func cancelAllPending() {
+        guard let store, let propertyID = selectedPropertyID else { return }
+        let count = (try? store.availabilityManager.cancelPending(propertyID: propertyID)) ?? 0
+        reload()
+        statusMessage = "Cleared \(count) pending change\(count == 1 ? "" : "s")."
+    }
+
+    var decisionsForSelectedProperty: [AvailabilityDecision] {
+        guard let id = selectedPropertyID else { return decisions }
+        return decisions.filter { $0.propertyID == id }
+    }
+
+    var pendingDecisions: [AvailabilityDecision] {
+        decisionsForSelectedProperty.filter { $0.status.isPending }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    func destinationFeed(for destination: RentalPlatform) -> DestinationFeed? {
+        guard let store, let id = selectedPropertyID else { return nil }
+        return try? store.outbound.generateFeed(propertyID: id, destination: destination)
+    }
+
+    func auditEntries(forDecision id: Int64) -> [AuditEntry] {
+        guard let store else { return [] }
+        return (try? store.auditLog.entries(forDecision: id)) ?? []
     }
 
     // MARK: - Export

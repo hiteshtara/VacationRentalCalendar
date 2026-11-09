@@ -136,6 +136,34 @@ sign_bounded "${SIGN_WITH}" "${BUNDLE_ID}" "${APP}" \
 
 codesign --verify --deep --strict "${APP}" && echo "signature verifies"
 
+# Record the designated requirement and compare it with the previous build.
+# A stable requirement is the whole point of signing with a certificate: it is
+# what lets a Keychain permission survive a rebuild.
+REQ_FILE=".build/last-designated-requirement"
+CURRENT_REQ="$(codesign -d -r- "${APP}" 2>&1 | grep 'designated' | head -1)"
+if [ -f "${REQ_FILE}" ]; then
+    PREVIOUS_REQ="$(cat "${REQ_FILE}")"
+    if [ "${CURRENT_REQ}" = "${PREVIOUS_REQ}" ]; then
+        echo "signature is stable across rebuilds — Keychain permissions will stick"
+    else
+        echo ""
+        echo "  !! The signature changed since the last build."
+        echo "     previous: ${PREVIOUS_REQ}"
+        echo "     current:  ${CURRENT_REQ}"
+        echo "     macOS will ask for Keychain permission again."
+        echo "     Fix it permanently with:  ./Scripts/fix-signing.sh"
+        echo ""
+    fi
+fi
+printf '%s' "${CURRENT_REQ}" > "${REQ_FILE}"
+
+case "${CURRENT_REQ}" in
+    *cdhash*)
+        echo "  note: ad-hoc signed. Run ./Scripts/fix-signing.sh once to stop"
+        echo "        the repeated Keychain prompts."
+        ;;
+esac
+
 # ------------------------------------------------------------------ install
 
 if [ "${INSTALL}" = true ]; then

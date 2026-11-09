@@ -299,6 +299,7 @@ struct SyncHistoryView: View {
         case .success: return "checkmark.circle.fill"
         case .failure: return "xmark.octagon.fill"
         case .skipped: return "minus.circle"
+        case .disconnected: return "link.badge.plus"
         }
     }
 
@@ -307,6 +308,7 @@ struct SyncHistoryView: View {
         case .success: return .green
         case .failure: return .red
         case .skipped: return .secondary
+        case .disconnected: return .orange
         }
     }
 }

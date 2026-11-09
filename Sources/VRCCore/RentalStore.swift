@@ -20,6 +20,12 @@ public final class RentalStore: @unchecked Sendable {
     public let detector: ConflictDetector
     public let exporter: ExportService
     public let policy: ExportPolicy
+    public let availability: AvailabilityRepository
+    public let auditLog: AvailabilityAuditLog
+    public let snapshots: FeedSnapshotRepository
+    public let feedTokens: FeedTokenRepository
+    public private(set) var availabilityManager: AvailabilityManager!
+    public private(set) var outbound: OutboundSyncCoordinator!
 
     public init(database: Database, credentials: FeedCredentialStore) throws {
         self.database = database
@@ -36,6 +42,36 @@ public final class RentalStore: @unchecked Sendable {
         self.detector = ConflictDetector()
         self.policy = ExportPolicy()
         self.exporter = ExportService(policy: policy)
+        self.availability = AvailabilityRepository(database: database)
+        self.auditLog = AvailabilityAuditLog(database: database)
+        self.snapshots = FeedSnapshotRepository(database: database)
+        self.feedTokens = FeedTokenRepository(database: database, credentials: credentials)
+
+        // Built after the stored properties so they can close over `self`
+        // safely; the closure only reads, and only on demand.
+        let repositories = (
+            availability: self.availability,
+            audit: self.auditLog,
+            properties: self.properties,
+            listings: self.listings
+        )
+        let provider: @Sendable () throws -> [ClassifiedEvent] = { [unowned self] in
+            try self.classifiedEvents()
+        }
+        self.availabilityManager = AvailabilityManager(
+            decisions: repositories.availability,
+            audit: repositories.audit,
+            properties: repositories.properties,
+            listings: repositories.listings,
+            eventsProvider: provider
+        )
+        self.outbound = OutboundSyncCoordinator(
+            decisions: repositories.availability,
+            manager: availabilityManager,
+            properties: repositories.properties,
+            database: database,
+            eventsProvider: provider
+        )
     }
 
     /// The real on-disk store.

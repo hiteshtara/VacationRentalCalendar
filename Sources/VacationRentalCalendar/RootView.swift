@@ -97,6 +97,9 @@ struct RootView: View {
         case .conflicts:
             let count = state.doubleBookingCount
             return count > 0 ? ("\(count)", .red) : nil
+        case .availability:
+            let count = state.pendingDecisions.count
+            return count > 0 ? ("\(count)", .blue) : nil
         default:
             return nil
         }
@@ -110,6 +113,7 @@ struct RootView: View {
             switch state.selectedSection {
             case .calendar: calendarPane
             case .review: ReviewView()
+            case .availability: AvailabilityPane()
             case .conflicts: ConflictsView()
             case .export: ExportView()
             case .feeds: FeedsView()
@@ -154,6 +158,8 @@ struct RootView: View {
             case .week: WeekStripView()
             case .list: EventListView()
             }
+
+            RangeSelectionBar()
         }
         .inspector(isPresented: $state.isDetailPanelPresented) {
             Group {
