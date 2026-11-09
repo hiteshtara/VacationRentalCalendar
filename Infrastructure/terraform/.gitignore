@@ -1,0 +1,9 @@
+# Provider binaries and local state. State for this project lives in S3 (see
+# the commented backend block in versions.tf); nothing local is ever authoritative.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+crash.log
