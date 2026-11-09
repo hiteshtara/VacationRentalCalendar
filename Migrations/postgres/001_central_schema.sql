@@ -417,8 +417,19 @@ UNION ALL
 -- Roles
 -- ===========================================================================
 
-CREATE ROLE vrc_app;        -- the Lambdas
-CREATE ROLE vrc_readonly;   -- dashboard read paths
+-- Roles are cluster-wide, not per-database, so creating them unconditionally
+-- fails whenever the cluster already has them -- a second database, or simply
+-- re-running this file. Guarded so the migration is idempotent.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vrc_app') THEN
+        CREATE ROLE vrc_app;        -- the Lambdas
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vrc_readonly') THEN
+        CREATE ROLE vrc_readonly;   -- dashboard read paths
+    END IF;
+END
+$$;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO vrc_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vrc_app;
