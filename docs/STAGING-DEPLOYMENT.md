@@ -154,13 +154,37 @@ tested is the production code path.
 |---|---|---|---|
 | 1 | `OutboundSyncGate.isEnabled` in Swift | `false` | a reviewed code change |
 | 2 | `VRC_OUTBOUND_ENABLED` in every function's environment | `"false"` | a Terraform variable |
-| 3 | `check "staging_never_publishes"` | fails the plan if layer 2 is true in staging | nobody, in staging |
+| 3 | `precondition` on `terraform_data.staging_invariants` | **errors and stops** plan and apply | nobody, in staging |
 | 4 | `app_settings.outbound_sync_enabled` in the database | `'false'` | a deliberate SQL write |
 
 Layer 3 exists because the Lambda environment is assembled with `merge()`,
 whose result is unknown until apply — so `terraform show` on a plan **cannot**
-prove what layer 2 will be. A `check` block can. It was confirmed to fail the
-plan when `outbound_enabled=true` is passed.
+prove what layer 2 will be.
+
+**A correction.** Earlier revisions of this document said a Terraform `check`
+block would fail the plan. That is wrong, and I verified it:
+
+```
+terraform plan -var=outbound_enabled=true
+  exit code: 0       warnings: 1       errors: 0
+  plan file written: YES (29287 bytes)
+```
+
+A `check` block **warns**. It exits zero and still writes an applyable plan.
+Anything relying on it as a gate was relying on nothing.
+
+The gates are now `precondition` blocks, which raise errors and stop both plan
+and apply. Verified by trying to get past each one:
+
+```
+  outbound_enabled=true          exit=1  BLOCKED
+  create_dns=true                exit=1  BLOCKED
+  create_cdn=true                exit=1  BLOCKED
+  allow_priyankahomes_read=true  exit=1  BLOCKED
+  region=eu-west-1               exit=1  BLOCKED
+```
+
+The `check` blocks are kept, relabelled as reporting only.
 
 There is also no publication path to misfire into: staging creates **no**
 CloudFront distribution and **no** DNS record, so even a feed written to S3 is
@@ -185,6 +209,9 @@ It re-derives the plan and re-checks every invariant, then prints one verdict.
 Current run:
 
 ```
+==> 0. Account and region
+  ok   account ends …1110
+  ok   region is us-east-1
 ==> 1. Business rules
   ok   All 330 tests passed (1109 assertions)
   ok   parity digest unchanged
@@ -195,8 +222,9 @@ Current run:
 ==> 3. Lambda packages
   ok   fetch.zip … sweeper.zip: bootstrap + 33 libs
 ==> 4. Re-deriving the staging plan
-  ok   plan succeeded (check blocks passed)
-  ok   60 resources to create, as expected
+  ok   plan succeeded and was saved (preconditions held)
+  ok   58 AWS resources to create, as expected (+3 local-only)
+  ok   the precondition carrier is in the plan
   ok   nothing to update or destroy
   ok   no Route 53, ACM or CloudFront resources
   ok   no DynamoDB access granted
@@ -213,8 +241,20 @@ Current run:
   ok   0 published decisions
   ok   7 events
   ok   7 classifications
+==> 6. Independent enforcement
+  ok   staging.tfvars declares environment = staging
+  ok   create_dns = false in tfvars
+  ok   create_cdn = false in tfvars
+  ok   allow_priyankahomes_read = false in tfvars
+  ok   outbound_enabled unset, so it defaults to false
+==> 7. Proving the refusals still refuse
+  ok   outbound_enabled=true is refused (non-zero exit)
+  ok   create_dns=true is refused (non-zero exit)
+  ok   allow_priyankahomes_read=true is refused (non-zero exit)
 ==> Verdict
-  GO — the plan is valid and every invariant holds.
+  GO — the plan is valid and every invariant holds independently.
+  Saved plan:  Infrastructure/terraform/staging.tfplan
+  sha256:      7b545fbd…d48daa
 ```
 
 It exits non-zero on any failure, so it can gate the apply rather than merely
@@ -286,7 +326,7 @@ than prerequisites.
 | # | Test | Pass condition |
 |---|---|---|
 | A1 | `./Scripts/staging-preflight.sh` | **GO** |
-| A2 | `terraform apply -var-file=staging.tfvars` | 60 created; `terraform output environment` = `staging` |
+| A2 | `./Scripts/staging-apply.sh` — applies the **saved** plan, refusing if its hash moved | 58 AWS resources created; `terraform output environment` = `staging` |
 | A3 | `vrc-migrate --apply 010` then `011` | `--status` reports `10, 11`; 18 tables, 6 generated columns, 5 triggers |
 | A4 | Set the `vrc_runtime` password into `vrc-staging/database/runtime` out of band | the secret holds it; Terraform state does not |
 | A5 | Deploy function code: `./Scripts/build-lambda.sh --deploy` | five functions updated; schedules still disabled |
@@ -403,15 +443,101 @@ Refinements 6 and 8.
 
 ---
 
+## 8a. The five final safeguards
+
+### 8a.1 Account and region, checked first and fatally
+
+`staging-preflight.sh` now begins there, before it looks at anything else: a
+plan that looks perfect applied to the wrong account is the worst available
+outcome. It prints only the last four digits, so a shared log carries no
+account id.
+
+```
+==> 0. Account and region
+  ok   account ends …1110
+  ok   region is us-east-1
+```
+
+Either mismatch exits immediately without running the remaining checks.
+`region == "us-east-1"` is also a hard `precondition`, so a tfvars override is
+refused.
+
+### 8a.2 The validated plan is the plan that applies
+
+Preflight writes `Infrastructure/terraform/staging.tfplan` and a receipt
+recording its SHA-256, the account, the region and the resource count.
+`Scripts/staging-apply.sh` applies **that file** — `terraform apply
+staging.tfplan`, with no `-var-file`, because a saved plan already carries its
+variables — and refuses unless the hash still matches.
+
+All four refusal paths were tested:
+
+| Tampered with | Result |
+|---|---|
+| one byte appended to the plan | refused, both hashes printed |
+| receipt removed | refused: "run preflight first" |
+| receipt edited to `verdict=NO-GO` | refused |
+| wrong confirmation phrase | cancelled, nothing applied |
+
+After a successful apply both the plan and the receipt are deleted, because a
+saved plan is single-use and a stale one must not invite a second go.
+
+### 8a.3 Enforcement independent of Terraform
+
+Three layers, since safeguard 3 asks not to rely on Terraform alone:
+
+1. **`precondition` blocks** — error and stop. Terraform checking itself.
+2. **tfvars inspection** — preflight greps `staging.tfvars` directly for
+   `environment = "staging"`, `create_dns = false`, `create_cdn = false`,
+   `allow_priyankahomes_read = false`, and that `outbound_enabled` is either
+   absent or false.
+3. **Saved-plan inspection** — preflight reads the plan JSON and asserts: 58
+   AWS resources, nothing to update or destroy, **zero** Route 53/ACM/
+   CloudFront resources, **zero** DynamoDB actions, zero PriyankaHomes
+   references, both schedules `DISABLED`, engine 16.15, Data API on, private,
+   encrypted, and no secret values present.
+
+Layer 3 is what catches a plan file edited or swapped after review — which is
+the case neither Terraform layer can see.
+
+Preflight additionally **proves the refusals still refuse**, by attempting
+`outbound_enabled=true`, `create_dns=true` and `allow_priyankahomes_read=true`
+and requiring each to exit non-zero. A guard that has silently stopped working
+is worse than no guard, and this is the only way to know.
+
+### 8a.4 GitHub stays public
+
+Settled. Nothing in the deployment path reads or changes repository visibility.
+`Scripts/check-no-secrets.sh` is the standing guard, and it reports clean.
+
+### 8a.5 Stop on anything other than GO
+
+Preflight exits non-zero on any failure **and removes the receipt**, so
+`staging-apply.sh` independently refuses afterwards. Stopping is not a matter
+of remembering to read the output.
+
+That was demonstrated accidentally and usefully: adding the precondition
+carrier changed the resource count from 60 to 61, the count check failed, the
+verdict went NO-GO and the receipt was removed. The gate caught its own
+author's change. The count is now split into AWS resources (58) and local-only
+helpers (3), so it tracks what matters instead of drifting.
+
 ## 9. Authorisation requested
 
 Everything above is prepared. Nothing is applied.
 
-**To proceed I need explicit authorisation to run
-`terraform apply -var-file=staging.tfvars`** — 60 resources, roughly
-**$2.12/month**, in the `us-east-1` account ending `…1110`.
+All five safeguards are in place and tested. Nothing is applied.
 
-I will run `./Scripts/staging-preflight.sh` immediately beforehand and stop if
-it does not report **GO**.
+**To proceed I need explicit authorisation to run `./Scripts/staging-apply.sh`**
+— applying the already-validated plan: **58 AWS resources**, roughly
+**$2.12/month**, in the `us-east-1` account ending **…1110**.
 
-Repository visibility is settled as public and is not a blocker.
+Phase A1 (preflight) has been run and reports **GO**. A2 is the apply and has
+not been run. I will re-run preflight immediately beforehand and stop unless it
+reports GO again.
+
+I will then work through A3–A5 and the Phase B smoke tests, and **report the
+first successful Mac-to-AWS connection (B3) before touching any schedule.**
+Phase D — schedules and the 24 h/48 h observations — waits for that report.
+
+Repository visibility stays public.
