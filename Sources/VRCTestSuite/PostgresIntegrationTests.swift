@@ -226,6 +226,56 @@ public enum PostgresIntegrationTests {
             && ProcessInfo.processInfo.environment["VRC_DB_SECRET_ARN"] != nil
     }
 
+    /// Every table the setup empties, in dependency order so foreign keys do
+    /// not block the clean-up.
+    ///
+    /// `app_settings` is deliberately absent: it carries the disposable marker
+    /// that authorizes this truncation, and emptying it would revoke the
+    /// permission on the way through.
+    static let truncatedTables = [
+        "published_feed_entries", "feed_publications", "feed_snapshots",
+        "conflicts", "holds", "reservations", "availability_audit",
+        "availability_decisions", "classifications", "events",
+        "listing_connection_events", "sync_runs", "platform_listings",
+        "properties", "conflict_acknowledgements", "feed_tokens",
+        "idempotency_keys",
+    ]
+
+    /// **The only place in this suite that deletes rows.**
+    ///
+    /// `DestructiveTestIsolation` is checked *inside* this function rather than
+    /// left as a precondition each caller must remember, because a guard you
+    /// can forget to call is a guard that will eventually be forgotten. There
+    /// is no path to the DELETEs that does not pass through here, which is the
+    /// actual fix for 2026-11-09 — the tests of the guard itself prove only
+    /// that it answers correctly when asked.
+    ///
+    /// Reading the marker first is safe: it is a SELECT, and it happens before
+    /// anything is deleted.
+    static func truncateForTest(
+        _ store: DataAPIStore,
+        target: DestructiveTestIsolation.Target,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws {
+        try DestructiveTestIsolation.assertDisposable(
+            target, environment: environment,
+            marker: {
+                try store.queryOne(
+                    "SELECT value FROM app_settings WHERE key = ?",
+                    [.text(DestructiveTestIsolation.markerKey)])?.string("value")
+            })
+        for table in truncatedTables {
+            _ = try? store.run("DELETE FROM \(table)")
+        }
+    }
+
+    /// The cluster identifier — the last component of the ARN. A missing or
+    /// unparseable ARN yields an empty identifier, which the guard refuses.
+    static func clusterIdentifier(_ environment: [String: String]) -> String {
+        guard let arn = environment["VRC_CLUSTER_ARN"] else { return "" }
+        return arn.split(separator: ":").last.map(String.init) ?? ""
+    }
+
     /// A store over the real Data API. Rows are cleaned between cases the same
     /// way the psql path does, so the two produce comparable results.
     static func auroraStore() throws -> RentalStore {
@@ -235,15 +285,9 @@ public enum PostgresIntegrationTests {
         let store = DataAPIStore(
             transport: try URLSessionDataAPITransport.fromEnvironment(environment),
             configuration: configuration)
-        // Dependency order, so foreign keys do not block the clean-up.
-        for table in ["published_feed_entries", "feed_publications", "feed_snapshots",
-                      "conflicts", "holds", "reservations", "availability_audit",
-                      "availability_decisions", "classifications", "events",
-                      "listing_connection_events", "sync_runs", "platform_listings",
-                      "properties", "conflict_acknowledgements", "feed_tokens",
-                      "idempotency_keys"] {
-            _ = try? store.run("DELETE FROM \(table)")
-        }
+        try truncateForTest(
+            store, target: .cluster(identifier: clusterIdentifier(environment)),
+            environment: environment)
         return try RentalStore(database: store, credentials: InMemoryFeedCredentialStore(),
                                skipMigration: true)
     }
@@ -251,20 +295,15 @@ public enum PostgresIntegrationTests {
     static func freshStore() throws -> (RentalStore, PsqlTransport)? {
         guard let port else { return nil }
         let transport = try PsqlTransport(port: port)
-        // A clean slate, in dependency order.
-        for table in ["published_feed_entries", "feed_publications", "feed_snapshots",
-                      "conflicts", "holds", "reservations", "availability_audit",
-                      "availability_decisions", "classifications", "events",
-                      "listing_connection_events", "sync_runs", "platform_listings",
-                      "properties", "conflict_acknowledgements", "feed_tokens"] {
-            _ = try? transport.send(DataAPICall(
-                action: .execute, body: ["sql": "DELETE FROM \(table)"]))
-        }
         let store = DataAPIStore(
             transport: transport,
             configuration: .init(resourceArn: "arn:local", secretArn: "arn:local",
                                  database: "vrc", actor: "owner"),
             sleeper: { _ in })
+        // Through the same single door as the Aurora path. A local port is not
+        // a safe harbour: a tunnel can put a shared cluster behind 127.0.0.1,
+        // so the label is deny-listed and the marker is required here too.
+        try truncateForTest(store, target: .local(label: "127.0.0.1:\(port)/vrc"))
         return (try RentalStore(database: store, credentials: InMemoryFeedCredentialStore()),
                 transport)
     }
