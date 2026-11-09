@@ -99,6 +99,7 @@ public enum TestRegistry {
     public static var all: [TestCase] {
         MigrationTests.cases
             + ICalParsingTests.cases
+            + SemanticHashTests.cases
             + ClassifierTests.cases
             + ImportTests.cases
             + ConflictTests.cases
