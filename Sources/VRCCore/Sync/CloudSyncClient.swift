@@ -215,6 +215,8 @@ public struct CloudSyncClient: Sendable {
     ) throws -> WriteOutcome {
         var attempt = 0
         var lastReason = ""
+        var reconciliationWorked = false
+
         while attempt < max(1, attempts) {
             attempt += 1
             let outcome = try submit(decision: decision)
@@ -223,20 +225,42 @@ public struct CloudSyncClient: Sendable {
                 return outcome
             case .uncertain(let reason):
                 lastReason = reason
-                // Reconcile. If the write did land, report it as applied
-                // rather than trying again.
-                if let recorded = try? isRecorded(
-                    publicationUID: decision.publicationUID), recorded {
-                    return .alreadyApplied(id: decision.publicationUID)
+                // Reconcile. If the write did land, report that rather than
+                // trying again and creating a second decision.
+                do {
+                    if try isRecorded(publicationUID: decision.publicationUID) {
+                        return .alreadyApplied(id: decision.publicationUID)
+                    }
+                    // Reconciliation answered, and answered "not there", so
+                    // another attempt under the same key is safe.
+                    reconciliationWorked = true
+                } catch {
+                    // Reconciliation itself failed. We now know less than
+                    // before, not more: retrying is still safe because of the
+                    // idempotency key, but we must not later claim anything
+                    // about what happened.
+                    reconciliationWorked = false
                 }
-                // Not recorded, so the write genuinely did not apply and the
-                // idempotency key makes another attempt safe.
                 continue
             }
         }
+
+        // The honest ending, and it is deliberately NOT "nothing was applied".
+        //
+        // Even when the last reconciliation said the decision was absent, the
+        // final submission was uncertain — it may have landed after that
+        // check. And if reconciliation never answered at all, we know nothing.
+        // Telling the owner it did not apply would invite them to redo it by
+        // hand, which is exactly how a date gets blocked twice.
+        let settled = reconciliationWorked
+            ? "the last check found no such decision, but the final attempt was still "
+              + "unconfirmed, so it may have landed afterwards"
+            : "and it was not possible to check whether it landed"
         return .uncertain(reason:
-            "after \(attempt) attempt(s) the service never confirmed, and the decision is "
-            + "not recorded: \(lastReason). It has NOT been applied — nothing was published.")
+            "after \(attempt) attempt(s) the outcome is UNKNOWN: \(settled). "
+            + "Last error: \(lastReason). Do not resubmit by hand — reconcile first, "
+            + "because resubmitting could create a second decision. Nothing was published "
+            + "either way: publication is a separate, gated step.")
     }
 
     // MARK: Plumbing

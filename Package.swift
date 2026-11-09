@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "vrc-test", targets: ["vrc-test"]),
         .executable(name: "vrc", targets: ["vrc"]),
         .executable(name: "vrc-parity", targets: ["vrc-parity"]),
+        .executable(name: "vrc-schema-dump", targets: ["vrc-schema-dump"]),
         .library(name: "VRCLambda", targets: ["VRCLambda"]),
         .executable(name: "vrc-lambda-fetch", targets: ["vrc-lambda-fetch"]),
         .executable(name: "vrc-lambda-process", targets: ["vrc-lambda-process"]),
@@ -92,6 +93,7 @@ let package = Package(
             dependencies: ["VRCCore", "VRCLambda"],
             path: "Sources/vrc-lambda-sweeper"
         ),
+        .executableTarget(name: "vrc-schema-dump", dependencies: ["VRCCore"], path: "Sources/vrc-schema-dump"),
         // Cross-platform parity harness. Builds on Linux as well as macOS,
         // which is the whole point: it proves the business rules agree.
         .executableTarget(

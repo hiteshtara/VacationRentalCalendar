@@ -1,122 +1,132 @@
 #!/bin/bash
 #
-# Builds the Swift Lambda handlers for AWS and replaces each function's code.
+# Builds and packages the five Swift Lambda handlers for provided.al2023.
 #
-#   ./Scripts/build-lambda.sh --build          compile only
-#   ./Scripts/build-lambda.sh --deploy         compile and update the functions
+#   ./Scripts/build-lambda.sh            build and package
+#   ./Scripts/build-lambda.sh --deploy   also replace the function code
 #
-# Cross-compiles with the Swift Static Linux SDK, so it needs neither Docker
-# nor Xcode -- which matters, because this machine has Command Line Tools only.
+# WHY THIS USES DOCKER AND NOT THE STATIC LINUX SDK
 #
-# The same VRCCore that the Mac application uses is linked in. Output parity
-# between macOS and Linux is proved by `swift run vrc-parity --digest`, which
-# must print the same digest on both; that check runs below before any deploy.
+# The official Static Linux SDK (swift-6.3.3-RELEASE_static-linux-0.1.0,
+# checksum verified against swift.org) installs cleanly, and would be the
+# tidier answer: a fully static musl binary with no shared objects at all.
+# Two things stop it being usable here, both verified rather than assumed:
+#
+#   1. Its prebuilt Foundation was compiled by the open-source swift.org
+#      6.3.3 toolchain. This machine has Apple's 6.3.3 from Command Line
+#      Tools, and the module formats differ:
+#        "compiled module was created by an older version of the compiler;
+#         rebuild 'Foundation' and try again"
+#      Using it from the host needs the swift.org toolchain installed
+#      alongside Xcode's, which is a system change.
+#
+#   2. The musl SDK ships no sqlite3 headers, so the CSQLite target cannot
+#      build. VRCCore needs SQLite for the Mac path even though the handlers
+#      never touch it, so the whole module fails. Fixing that means either
+#      vendoring the SQLite amalgamation (~9 MB of C in the repository) or
+#      splitting VRCCore in two.
+#
+# Building inside swift:6.3.3-amazonlinux2023 avoids both. The container's
+# toolchain matches the SDK, and its OS is exactly the Lambda runtime --
+# Amazon Linux 2023, glibc 2.34 -- so the binary's ABI matches by
+# construction rather than by luck. The Swift runtime is bundled into lib/,
+# which Lambda already has on LD_LIBRARY_PATH (/var/task/lib), so no wrapper
+# script is needed.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-SDK="aarch64-swift-linux-musl"
-FUNCTIONS=(fetch process publish sweeper api)
+IMAGE="swift:6.3.3-amazonlinux2023"
+FUNCTIONS=(fetch process publish api sweeper)
 OUT=".build/lambda"
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 bad()  { printf '  \033[31mfail\033[0m %s\n' "$*"; }
 
-step "1. Checking the Static Linux SDK"
-say "  The SDK is not a convenience here, it is a requirement."
-say ""
-say "  A Swift binary built against glibc -- in a Docker image, say --"
-say "  dynamically links 13 Swift and Foundation shared objects out of"
-say "  /usr/lib/swift/linux, plus libsqlite3. None of those exist on the"
-say "  provided.al2023 runtime, so such a binary fails at startup with a"
-say "  missing-library error. Verified, not assumed."
-say ""
-say "  The Static Linux SDK produces a fully static musl binary with no"
-say "  shared-object dependencies at all, which is what provided.al2023"
-say "  needs. The alternative -- bundling those libraries and a wrapper that"
-say "  sets LD_LIBRARY_PATH -- works but triples the package size and adds a"
-say "  runtime search path to get wrong."
-say ""
-if ! swift sdk list 2>/dev/null | grep -q "${SDK}"; then
-    bad "SDK '${SDK}' is not installed."
-    say ""
-    say "  Install it once with the exact checksum from swift.org for your"
-    say "  toolchain version:"
-    say ""
-    say "    swift sdk install \\"
-    say "      https://download.swift.org/swift-<version>-release/static-sdk/<...>.artifactbundle.tar.gz \\"
-    say "      --checksum <sha256>"
-    say ""
-    say "  Then re-run this script."
-    exit 1
-fi
-ok "SDK present"
-
-step "2. Parity gate"
-say "  The server must agree with the Mac on every rule. If these digests"
-say "  differ, the deploy is refused."
+step "1. Parity gate"
+say "  The server must agree with the Mac on every business rule. If these"
+say "  digests differ the rules have diverged and nothing should ship."
 MAC_DIGEST="$(swift run vrc-parity --digest 2>/dev/null | tail -1)"
-if [ -z "${MAC_DIGEST}" ]; then bad "could not compute the macOS digest"; exit 1; fi
-ok "macOS digest: ${MAC_DIGEST}"
-say "  (the Linux digest is checked in CI and by Scripts/check-parity.sh)"
+[ -n "${MAC_DIGEST}" ] || { bad "could not compute the macOS digest"; exit 1; }
+ok "macOS:  ${MAC_DIGEST}"
 
-# Verifies the packaging is actually deployable rather than merely present.
-assert_static() {
-    local binary="$1"
-    if command -v ldd >/dev/null 2>&1; then
-        if ldd "${binary}" 2>&1 | grep -qiE "libswiftCore|libFoundation\.so|not a dynamic"; then
-            if ldd "${binary}" 2>&1 | grep -qi "libswiftCore"; then
-                bad "${binary} links the Swift runtime dynamically — it will not start on"
-                say "       provided.al2023. Build with the Static Linux SDK."
-                return 1
-            fi
-        fi
-    fi
-    return 0
-}
+step "2. Building in ${IMAGE}"
+command -v docker >/dev/null 2>&1 || { bad "docker is required"; exit 1; }
+rsync -a --exclude='.build' --exclude='.git' Package.swift Sources "${WORK}/"
 
-step "3. Building for Linux"
+docker run --rm --platform linux/arm64 -v "${WORK}:/src" -w /src "${IMAGE}" bash -lc '
+set -e
+dnf install -y -q sqlite-devel zip binutils >/dev/null 2>&1
+
+echo "LINUX_DIGEST=$(swift run vrc-parity --digest 2>/dev/null | tail -1)"
+swift run vrc-test 2>&1 | grep -E "tests passed|tests failed" | sed "s/^/TESTS /"
+
+for f in fetch process publish api sweeper; do
+  swift build -c release --product "vrc-lambda-$f" >/tmp/b.log 2>&1 || {
+    echo "BUILD_FAILED $f"; grep -E "error:" /tmp/b.log | head -3; exit 1; }
+done
+
+mkdir -p /src/pkg && rm -rf /src/pkg/*
+for f in fetch process publish api sweeper; do
+  d="/src/pkg/$f"; mkdir -p "$d/lib"
+  cp ".build/release/vrc-lambda-$f" "$d/bootstrap"; chmod +x "$d/bootstrap"
+  ldd "$d/bootstrap" 2>/dev/null | awk "{print \$3}" | grep -E "^/" | while read -r so; do
+    case "$so" in
+      /usr/lib/swift/*|*/libsqlite3*|*/libcurl*|*/libxml2*|*/libz.*|*/libcrypto*|*/libssl*|*/libnghttp*|*/libidn*|*/liblber*|*/libldap*|*/libsasl*|*/libssh*|*/libbrotli*|*/libzstd*|*/liblzma*|*/libpsl*|*/libunistring*|*/libgssapi*|*/libkrb5*|*/libk5crypto*|*/libcom_err*|*/libkeyutils*|*/libselinux*|*/libpcre*|*/libresolv*)
+        cp -n "$so" "$d/lib/" 2>/dev/null || true ;;
+    esac
+  done
+  # Refuse to ship a package whose dependencies do not all resolve.
+  unresolved=$(LD_LIBRARY_PATH="$d/lib" ldd "$d/bootstrap" 2>/dev/null | grep -c "not found" || true)
+  arch=$(readelf -h "$d/bootstrap" | awk "/Machine/ {print \$NF}")
+  [ "$unresolved" = "0" ] || { echo "UNRESOLVED $f $unresolved"; exit 1; }
+  [ "$arch" = "AArch64" ] || { echo "WRONG_ARCH $f $arch"; exit 1; }
+  (cd "$d" && zip -qr "../$f.zip" bootstrap lib)
+  echo "PACKAGED $f $(du -h /src/pkg/$f.zip | cut -f1) libs=$(ls $d/lib | wc -l) arch=$arch unresolved=$unresolved"
+done
+' 2>&1 | while read -r line; do
+    case "${line}" in
+        LINUX_DIGEST=*)
+            LINUX="${line#LINUX_DIGEST=}"
+            if [ "${LINUX}" = "${MAC_DIGEST}" ]; then ok "Linux:  ${LINUX} (identical)"
+            else bad "Linux:  ${LINUX} — DIVERGED from macOS"; exit 1; fi ;;
+        TESTS*)        ok "${line#TESTS }" ;;
+        PACKAGED*)     ok "${line#PACKAGED }" ;;
+        BUILD_FAILED*) bad "${line}"; exit 1 ;;
+        UNRESOLVED*)   bad "${line} — missing shared objects, would fail at startup"; exit 1 ;;
+        WRONG_ARCH*)   bad "${line}"; exit 1 ;;
+        *)             say "  ${line}" ;;
+    esac
+done
+
 mkdir -p "${OUT}"
-for fn in "${FUNCTIONS[@]}"; do
-    target="vrc-lambda-${fn}"
-    if ! swift build --swift-sdk "${SDK}" -c release --product "${target}" \
-            > "/tmp/vrc-lambda-${fn}.log" 2>&1; then
-        bad "${target} failed to build, see /tmp/vrc-lambda-${fn}.log"
-        exit 1
-    fi
-    binary=".build/${SDK}/release/${target}"
-    [ -f "${binary}" ] || { bad "no binary at ${binary}"; exit 1; }
-    # The provided.al2023 runtime executes a file called `bootstrap`.
-    rm -rf "${OUT}/${fn}"; mkdir -p "${OUT}/${fn}"
-    cp "${binary}" "${OUT}/${fn}/bootstrap"
-    chmod +x "${OUT}/${fn}/bootstrap"
-    assert_static "${OUT}/${fn}/bootstrap" || exit 1
-    (cd "${OUT}/${fn}" && zip -q "../${fn}.zip" bootstrap)
-    ok "${fn}: $(du -h "${OUT}/${fn}.zip" | cut -f1), statically linked"
+cp "${WORK}"/pkg/*.zip "${OUT}/" 2>/dev/null || { bad "no packages produced"; exit 1; }
+step "3. Packages"
+for f in "${FUNCTIONS[@]}"; do
+    [ -f "${OUT}/${f}.zip" ] && ok "${OUT}/${f}.zip ($(du -h "${OUT}/${f}.zip" | cut -f1))"
 done
 
 if [ "${1:-}" != "--deploy" ]; then
     step "Done (build only)"
-    say "Pass --deploy to update the functions."
+    say "Pass --deploy to replace the function code. Nothing was deployed."
     exit 0
 fi
 
-step "4. Deploying"
-say "  This replaces function code only. It creates nothing, changes no"
-say "  schedule, and does not enable outbound publication."
-for fn in "${FUNCTIONS[@]}"; do
-    if aws lambda update-function-code \
-            --function-name "vrc-${fn}" \
-            --zip-file "fileb://${OUT}/${fn}.zip" \
-            --query 'LastUpdateStatus' --output text > /dev/null 2>&1; then
-        ok "vrc-${fn} updated"
+step "4. Deploying function code"
+say "  This replaces code only. It creates nothing, enables no schedule, and"
+say "  does not turn on outbound publication."
+for f in "${FUNCTIONS[@]}"; do
+    if aws lambda update-function-code --function-name "vrc-${f}" \
+            --zip-file "fileb://${OUT}/${f}.zip" --query 'LastUpdateStatus' \
+            --output text >/dev/null 2>&1; then
+        ok "vrc-${f} updated"
     else
-        bad "vrc-${fn} not updated (does the function exist yet?)"
+        bad "vrc-${f} not updated (does the function exist yet?)"
     fi
 done
-
 step "Done"
-say "Outbound publication is still governed by VRC_OUTBOUND_ENABLED=false and"
-say "by OutboundSyncGate in the code. Neither was changed."
+say "OutboundSyncGate and VRC_OUTBOUND_ENABLED are unchanged — both still off."

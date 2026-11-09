@@ -18,12 +18,17 @@ public struct ApiHandler {
         public var path: String
         public var principal: String?
         public var body: [String: Any]
+        public var idempotencyKey: String?
 
-        public init(method: String, path: String, principal: String?, body: [String: Any]) {
+        public init(
+            method: String, path: String, principal: String?,
+            body: [String: Any], idempotencyKey: String? = nil
+        ) {
             self.method = method
             self.path = path
             self.principal = principal
             self.body = body
+            self.idempotencyKey = idempotencyKey
         }
 
         /// API Gateway HTTP API v2 payload.
@@ -42,6 +47,42 @@ public struct ApiHandler {
             } else {
                 self.body = [:]
             }
+            // Header names arrive lower-cased from the HTTP API.
+            let headers = (event["headers"] as? [String: Any]) ?? [:]
+            self.idempotencyKey = (headers["idempotency-key"] as? String)
+                ?? (headers["Idempotency-Key"] as? String)
+        }
+    }
+
+    /// Routes against the repository layer, so validation, the audit row and
+    /// the conflict check are the same code the Mac application runs.
+    public func handle(_ request: Request, rental: RentalStore) -> Data {
+        guard let principal = request.principal, !principal.isEmpty else {
+            return LambdaJSON.httpResponse(401, [
+                "error": "unauthenticated",
+                "detail": "this endpoint requires a SigV4-signed request",
+            ])
+        }
+
+        // The actor is the authenticated principal's role, never anything the
+        // body claims. A client cannot promote itself by sending a field.
+        let actor = context.actor
+        let routes = DecisionRoutes(context: context)
+
+        switch (request.method, request.path) {
+        case ("POST", "/decisions"):
+            return routes.submit(
+                body: request.body, idempotencyKey: request.idempotencyKey,
+                actor: actor, store: rental)
+        case ("GET", let path) where path.hasPrefix("/decisions/"):
+            let uid = String(path.dropFirst("/decisions/".count))
+            guard !uid.isEmpty else {
+                return LambdaJSON.httpResponse(400, ["error": "no publication UID"])
+            }
+            return routes.lookup(
+                publicationUID: uid.removingPercentEncoding ?? uid, store: rental)
+        default:
+            return handle(request, store: rental.database)
         }
     }
 

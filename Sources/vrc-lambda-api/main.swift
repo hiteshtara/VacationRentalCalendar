@@ -10,7 +10,10 @@ LambdaRuntime.run { invocation in
     let event = LambdaJSON.object(invocation.payload)
     let request = ApiHandler.Request(event: event)
     do {
-        return ApiHandler(context: context).handle(request, store: try context.store())
+        // Assembled over the repositories, so the handler runs tested
+        // operations rather than its own SQL.
+        let rental = try RentalStore.makeCloud(store: try context.store())
+        return ApiHandler(context: context).handle(request, rental: rental)
     } catch {
         // Fail closed: an unconfigured or unreachable database is 503, never an
         // empty-but-successful answer that the Mac would read as "all clear".

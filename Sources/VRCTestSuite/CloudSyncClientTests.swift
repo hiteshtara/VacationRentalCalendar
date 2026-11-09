@@ -226,9 +226,33 @@ public enum CloudSyncClientTests {
             guard case .uncertain(let reason) = outcome else {
                 expect.fail("got \(outcome)"); return
             }
-            expect.ok(reason.contains("NOT been applied"),
-                      "says plainly that nothing was applied")
-            expect.ok(reason.contains("nothing was published"))
+            // It must NOT claim the write did not apply: the last attempt was
+            // unconfirmed, so it may have landed after the final check.
+            expect.ok(reason.contains("UNKNOWN"), "the outcome is reported as unknown")
+            expect.ok(!reason.lowercased().contains("not been applied"),
+                      "must not tell the owner it did not apply")
+            expect.ok(reason.contains("Do not resubmit by hand"),
+                      "and must warn against a manual retry that could duplicate it")
+            expect.ok(reason.contains("Nothing was published"),
+                      "while still being clear that publication is separate and gated")
+        },
+
+        TestCase(group: "Cloud client",
+                 name: "when reconciliation itself fails the outcome stays unknown") { expect in
+            // The client timing out tells us nothing about the server. Saying
+            // "not applied" here would invite the owner to redo it by hand.
+            let transport = FakeTransport([
+                (500, [:]), (503, ["detail": "cannot check"]),
+                (500, [:]), (503, ["detail": "cannot check"]),
+            ])
+            let outcome = try client(transport).submitReconciling(decision: approved(), attempts: 2)
+            guard case .uncertain(let reason) = outcome else {
+                expect.fail("got \(outcome)"); return
+            }
+            expect.ok(reason.contains("UNKNOWN"))
+            expect.ok(reason.contains("not possible to check"),
+                      "and says that it could not be checked")
+            expect.ok(!reason.lowercased().contains("not been applied"))
         },
 
         TestCase(group: "Cloud client", name: "a 409 is already-applied, not an error") { expect in

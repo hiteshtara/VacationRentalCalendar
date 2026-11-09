@@ -201,11 +201,53 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
 
     @discardableResult
     public func run(_ sql: String, _ parameters: [SQLValue] = []) throws -> Int {
-        let result = try perform(sql, parameters, expecting: .write)
+        let result = try perform(
+            Self.withGeneratedIDReturned(sql), parameters, expecting: .write)
         if let generated = result.generatedID {
             lock.lock(); lastGeneratedID = generated; lock.unlock()
         }
         return result.rowsAffected
+    }
+
+    /// Tables whose primary key is a generated `bigint` identity column.
+    ///
+    /// Derived from `Migrations/postgres/010_repository_schema.sql`. The other
+    /// tables the repositories write -- `app_settings`, `classifications`,
+    /// `conflict_acknowledgements`, `feed_tokens` -- have natural text keys and
+    /// no `id` column at all, so asking for one back would make the statement
+    /// fail.
+    static let identityTables: Set<String> = [
+        "properties", "platform_listings", "events", "availability_decisions",
+        "availability_audit", "sync_runs", "feed_snapshots", "feed_publications",
+        "published_feed_entries", "listing_connection_events",
+        "reservations", "holds", "conflicts",
+    ]
+
+    /// Appends `RETURNING id` to an INSERT so the generated key comes back.
+    ///
+    /// This is a dialect mapping, not an optimisation. The RDS Data API
+    /// populates `generatedFields` for MySQL's auto-increment but **not** for
+    /// PostgreSQL identity columns, so `lastInsertRowID` would silently stay 0
+    /// and every repository that reads it back -- properties, listings,
+    /// events, decisions, the audit log -- would hand out id 0 for every row.
+    /// The SQLite path is untouched: it has a real `last_insert_rowid()`.
+    static func withGeneratedIDReturned(_ sql: String) -> String {
+        let trimmed = sql.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.uppercased().hasPrefix("INSERT INTO"),
+              !trimmed.uppercased().contains("RETURNING") else { return sql }
+
+        // The table name is the token after INSERT INTO, before a paren or
+        // whitespace.
+        let afterInto = trimmed.dropFirst("INSERT INTO".count)
+            .drop(while: { $0 == " " || $0 == "\n" })
+        let table = String(afterInto.prefix(while: {
+            $0.isLetter || $0.isNumber || $0 == "_"
+        })).lowercased()
+        guard identityTables.contains(table) else { return sql }
+
+        let withoutTrailingSemicolon = trimmed.hasSuffix(";")
+            ? String(trimmed.dropLast()) : trimmed
+        return withoutTrailingSemicolon + " RETURNING id"
     }
 
     public func query(_ sql: String, _ parameters: [SQLValue] = []) throws -> [Row] {
@@ -622,6 +664,29 @@ public final class DataAPIStore: DataStore, @unchecked Sendable {
            let first = generated.first {
             outcome.generatedID = (first["longValue"] as? Int64)
                 ?? (first["longValue"] as? NSNumber)?.int64Value
+        }
+
+        // A `RETURNING id` row. PostgreSQL does not fill generatedFields, so
+        // this is where the key actually arrives.
+        if outcome.generatedID == nil,
+           let names = payload["columnMetadata"] as? [[String: Any]],
+           names.count == 1,
+           ((names[0]["name"] as? String) ?? (names[0]["label"] as? String)) == "id",
+           let records = payload["records"] as? [[[String: Any]]],
+           let row = records.first, let field = row.first {
+            switch decodeField(field) {
+            case .integer(let value): outcome.generatedID = value
+            case .real(let value): outcome.generatedID = Int64(value)
+            // A bigint can arrive as a string: the Data API renders some
+            // numeric types as stringValue, and so does any transport that
+            // reads rows as text. Refusing it here would leave every
+            // repository handing out id 0.
+            case .text(let value): outcome.generatedID = Int64(value)
+            default: break
+            }
+            // An INSERT ... RETURNING reports no updated-row count, but it did
+            // insert exactly the rows it returned.
+            if outcome.rowsAffected == 0 { outcome.rowsAffected = records.count }
         }
 
         guard let records = payload["records"] as? [[[String: Any]]] else {

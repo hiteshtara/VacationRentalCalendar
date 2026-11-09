@@ -1,0 +1,473 @@
+import Foundation
+import VRCCore
+
+/// Runs the real repository layer against a real PostgreSQL cluster.
+///
+/// Enabled by `VRC_PG_PORT`; skipped, with a note, when it is absent, so the
+/// ordinary suite still runs on a machine with no database.
+///
+/// The transport below drives a **persistent** `psql` session over pipes, so
+/// `BEGIN`/`COMMIT` actually span statements. A fresh `psql -c` per statement
+/// would make every transaction test silently meaningless, which is worse than
+/// not having them.
+///
+/// What this does not exercise is the Data API's own parameter transport —
+/// values are rendered as properly-escaped PostgreSQL literals here, because
+/// `psql` has no bind-parameter interface. That half is covered by the
+/// DataStore tests, which assert the real path sends typed parameters and
+/// never interpolates.
+public enum PostgresIntegrationTests {
+
+    static var port: String? {
+        ProcessInfo.processInfo.environment["VRC_PG_PORT"]
+    }
+
+    // MARK: A persistent psql session
+
+    public final class PsqlTransport: DataAPITransport, @unchecked Sendable {
+        private let lock = NSLock()
+        private let process = Process()
+        private let input = Pipe()
+        private let output = Pipe()
+        // A String accumulator rather than Data: Data's indices do not
+        // re-base after removeFirst, which made the obvious implementation
+        // crash on the second statement.
+        private var pending = ""
+        private static let marker = "__VRC_END__"
+        var statements: [String] = []
+
+        public init(port: String, database: String = "vrc", user: String = "vrctest") throws {
+            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/opt/postgresql@17/bin/psql")
+            process.arguments = [
+                "-h", "127.0.0.1", "-p", port, "-U", user, "-d", database,
+                "-X",            // no .psqlrc
+                "-q",            // no chatter
+                "--csv",         // parseable rows, with a header
+                "-v", "ON_ERROR_STOP=off",
+            ]
+            process.standardInput = input
+            // One pipe for both, so an ERROR cannot be read out of order with
+            // the rows it belongs to.
+            process.standardOutput = output
+            process.standardError = output
+            try process.run()
+        }
+
+        deinit {
+            input.fileHandleForWriting.write(Data("\\q\n".utf8))
+            try? input.fileHandleForWriting.close()
+            process.waitUntilExit()
+        }
+
+        private func run(_ sql: String) -> [String] {
+            let statement = sql.trimmingCharacters(in: .whitespacesAndNewlines)
+            let terminated = statement.hasSuffix(";") ? statement : statement + ";"
+            input.fileHandleForWriting.write(
+                Data((terminated + "\n\\echo " + Self.marker + "\n").utf8))
+
+            let sentinel = Self.marker + "\n"
+            while pending.range(of: sentinel) == nil {
+                let more = output.fileHandleForReading.availableData
+                if more.isEmpty { break }
+                pending += String(data: more, encoding: .utf8) ?? ""
+            }
+            guard let found = pending.range(of: sentinel) else {
+                let all = pending; pending = ""
+                return all.split(separator: "\n").map(String.init)
+            }
+            let chunk = String(pending[pending.startIndex..<found.lowerBound])
+            pending = String(pending[found.upperBound...])
+            return chunk.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        }
+
+        public func send(_ call: DataAPICall) throws -> DataAPIResult {
+            lock.lock(); defer { lock.unlock() }
+
+            switch call.action {
+            case .beginTransaction:
+                _ = run("BEGIN")
+                return DataAPIResult(statusCode: 200, payload: ["transactionId": "psql"])
+            case .commitTransaction:
+                let lines = run("COMMIT")
+                if lines.contains(where: { $0.hasPrefix("ERROR:") }) {
+                    return DataAPIResult(statusCode: 400,
+                                         payload: ["message": lines.joined(separator: " ")])
+                }
+                return DataAPIResult(statusCode: 200, payload: [:])
+            case .rollbackTransaction:
+                _ = run("ROLLBACK")
+                return DataAPIResult(statusCode: 200, payload: [:])
+            case .execute:
+                guard let named = call.body["sql"] as? String else {
+                    return DataAPIResult(statusCode: 400, payload: ["message": "no sql"])
+                }
+                let sql = Self.inline(named, call.body["parameters"])
+                statements.append(sql)
+
+                let upper = sql.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                let producesRows = upper.hasPrefix("SELECT") || upper.hasPrefix("WITH")
+                    || upper.contains("RETURNING")
+
+                let lines: [String]
+                if producesRows {
+                    lines = run(sql)
+                } else if upper.hasPrefix("UPDATE") || upper.hasPrefix("DELETE")
+                            || upper.hasPrefix("INSERT") {
+                    // A data-modifying CTE turns the row count into a result
+                    // row, which is the only way to read it back over psql.
+                    lines = run("WITH _vrc AS (\(sql.hasSuffix(";") ? String(sql.dropLast()) : sql)"
+                        + " RETURNING 1) SELECT count(*) AS numberOfRecordsUpdated FROM _vrc")
+                } else {
+                    lines = run(sql)
+                }
+
+                if let error = lines.first(where: { $0.hasPrefix("ERROR:") }) {
+                    return DataAPIResult(statusCode: 400, payload: ["message": error])
+                }
+                return DataAPIResult(statusCode: 200, payload: Self.decode(lines))
+            }
+        }
+
+        /// CSV with a header, back into the Data API's record shape.
+        static func decode(_ lines: [String]) -> [String: Any] {
+            guard let header = lines.first else { return ["numberOfRecordsUpdated": 0] }
+            let names = splitCSV(header)
+            let records = lines.dropFirst().map { line in
+                splitCSV(line).map { value -> [String: Any] in
+                    value == "" ? ["isNull": true] : ["stringValue": value]
+                }
+            }
+            if names.count == 1, names[0].lowercased() == "numberofrecordsupdated" {
+                let count = records.first?.first?["stringValue"] as? String ?? "0"
+                return ["numberOfRecordsUpdated": Int(count) ?? 0]
+            }
+            return [
+                "columnMetadata": names.map { ["name": $0] },
+                "records": records,
+                "numberOfRecordsUpdated": records.count,
+            ]
+        }
+
+        static func splitCSV(_ line: String) -> [String] {
+            var fields: [String] = []
+            var current = ""
+            var quoted = false
+            var index = line.startIndex
+            while index < line.endIndex {
+                let character = line[index]
+                if quoted {
+                    if character == "\"" {
+                        let next = line.index(after: index)
+                        if next < line.endIndex, line[next] == "\"" {
+                            current.append("\""); index = line.index(after: next); continue
+                        }
+                        quoted = false
+                    } else { current.append(character) }
+                } else if character == "\"" {
+                    quoted = true
+                } else if character == "," {
+                    fields.append(current); current = ""
+                } else {
+                    current.append(character)
+                }
+                index = line.index(after: index)
+            }
+            fields.append(current)
+            return fields
+        }
+
+        /// Renders `:pN` as escaped PostgreSQL literals. `psql` offers no bind
+        /// interface; the typed-parameter path is asserted in DataStoreTests.
+        static func inline(_ sql: String, _ raw: Any?) -> String {
+            let parameters = (raw as? [[String: Any]]) ?? []
+            var byName: [String: String] = [:]
+            for parameter in parameters {
+                guard let name = parameter["name"] as? String,
+                      let value = parameter["value"] as? [String: Any] else { continue }
+                byName[name] = literal(DataAPIStore.decodeField(value))
+            }
+            var output = ""
+            var index = sql.startIndex
+            while index < sql.endIndex {
+                if sql[index] == ":" {
+                    var scan = sql.index(after: index)
+                    var name = ""
+                    while scan < sql.endIndex,
+                          sql[scan].isLetter || sql[scan].isNumber || sql[scan] == "_" {
+                        name.append(sql[scan]); scan = sql.index(after: scan)
+                    }
+                    if let value = byName[name] {
+                        output += value; index = scan; continue
+                    }
+                }
+                output.append(sql[index]); index = sql.index(after: index)
+            }
+            return output
+        }
+
+        static func literal(_ value: SQLValue) -> String {
+            switch value {
+            case .null: return "NULL"
+            case .integer(let v): return String(v)
+            case .real(let v): return String(v)
+            case .text(let v): return "'" + v.replacingOccurrences(of: "'", with: "''") + "'"
+            case .blob(let v): return "'\\x" + v.map { String(format: "%02x", $0) }.joined() + "'"
+            }
+        }
+    }
+
+    // MARK: Fixtures
+
+    static func freshStore() throws -> (RentalStore, PsqlTransport)? {
+        guard let port else { return nil }
+        let transport = try PsqlTransport(port: port)
+        // A clean slate, in dependency order.
+        for table in ["published_feed_entries", "feed_publications", "feed_snapshots",
+                      "conflicts", "holds", "reservations", "availability_audit",
+                      "availability_decisions", "classifications", "events",
+                      "listing_connection_events", "sync_runs", "platform_listings",
+                      "properties", "conflict_acknowledgements", "feed_tokens"] {
+            _ = try? transport.send(DataAPICall(
+                action: .execute, body: ["sql": "DELETE FROM \(table)"]))
+        }
+        let store = DataAPIStore(
+            transport: transport,
+            configuration: .init(resourceArn: "arn:local", secretArn: "arn:local",
+                                 database: "vrc", actor: "owner"),
+            sleeper: { _ in })
+        return (try RentalStore(database: store, credentials: InMemoryFeedCredentialStore()),
+                transport)
+    }
+
+    static func skipped(_ expect: Expect) -> Bool {
+        if port == nil {
+            expect.ok(true, "skipped: set VRC_PG_PORT to run against PostgreSQL")
+            return true
+        }
+        return false
+    }
+
+    /// The business outcomes, as a canonical report. Deliberately excludes ids
+    /// and anything dialect-specific: what must match is the decision the
+    /// business rules reach, not the serialisation.
+    static func outcomes(_ store: RentalStore) throws -> String {
+        var report = ""
+        for item in try store.classifiedEvents()
+            .sorted(by: { $0.event.eventKey < $1.event.eventKey }) {
+            report += "event \(item.event.eventKey) "
+                + "\(DayMath.icalDateString(item.event.checkIn))→"
+                + "\(DayMath.icalDateString(item.event.checkOut)) "
+                + "nights=\(item.event.nights) "
+                + "kind=\(item.classification.kind.rawValue) "
+                + "review=\(item.classification.needsReview) "
+                + "genuine=\(item.classification.kind.describesGenuineUnavailability)\n"
+        }
+        for decision in try store.availability.all()
+            .sorted(by: { $0.publicationUID < $1.publicationUID }) {
+            report += "decision \(decision.publicationUID) "
+                + "\(decision.destination.rawValue)/\(decision.action.rawValue)/"
+                + "\(decision.status.rawValue) "
+                + "\(DayMath.icalDateString(decision.startDay))→"
+                + "\(DayMath.icalDateString(decision.endDay)) "
+                + "nights=\(decision.nights)\n"
+        }
+        for entry in try store.auditLog.recent(limit: 50)
+            .sorted(by: { $0.detail < $1.detail }) {
+            report += "audit \(entry.actor)/\(entry.event) "
+                + "to=\(entry.toStatus?.rawValue ?? "-") detail=\(entry.detail)\n"
+        }
+        return report
+    }
+
+    /// The workflow under test: the December decisions, the protected nights,
+    /// a cancellation block that must stay unexportable, and an audit trail.
+    static func workflow(_ store: RentalStore) throws {
+        let property = try store.properties.insert(
+            Property(name: "39 G Street", address: "South Boston, MA"))
+        let listing = try store.listings.insert(PlatformListing(
+            propertyID: property.id!, platform: .airbnb, label: "Airbnb — 39 G Street",
+            icalURL: "https://example.test/a.ics", urlStorage: .database,
+            connectionState: .connected))
+
+        for (key, kind, from, to, summary) in [
+            ("pg-res", BlockKind.confirmedReservation, (2027, 3, 1), (2027, 3, 5), "Reserved"),
+            ("pg-cancel", BlockKind.cancellationBlock, (2026, 12, 17), (2026, 12, 19),
+             "Airbnb (Not available)"),
+            ("pg-owner", BlockKind.ownerBlock, (2027, 4, 1), (2027, 4, 4), "Blocked"),
+        ] {
+            _ = try store.events.upsert(CalendarEvent(
+                listingID: listing.id!, eventKey: key, uid: key, platform: .airbnb,
+                summary: summary, details: "",
+                checkIn: DayMath.day(from.0, from.1, from.2),
+                checkOut: DayMath.day(to.0, to.1, to.2)))
+            try store.classifications.save(EventClassification(
+                eventKey: key, kind: kind, confidence: .high, source: .manual,
+                needsReview: false, exportApproved: kind != .confirmedReservation))
+        }
+
+        for (index, range) in [((2026, 12, 10), (2026, 12, 17)),
+                               ((2026, 12, 19), (2026, 12, 20))].enumerated() {
+            let decision = try store.availability.insert(AvailabilityDecision(
+                propertyID: property.id!, destination: .vrbo, action: .block,
+                startDay: DayMath.day(range.0.0, range.0.1, range.0.2),
+                endDay: DayMath.day(range.1.0, range.1.1, range.1.2),
+                status: .approved, publicationUID: "vrc-pg-\(index)",
+                approvedAt: Date(timeIntervalSince1970: 1_764_000_000),
+                approvedBy: "owner"))
+            _ = try store.auditLog.record(AuditEntry(
+                decisionID: decision.id, at: Date(timeIntervalSince1970: 1_764_000_000),
+                actor: "owner", fromStatus: nil, toStatus: AvailabilityStatus.approved,
+                event: "approved", detail: "approved decision \(index)"))
+        }
+    }
+
+    public static var cases: [TestCase] { [
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "the same repository workflow reaches the same business outcomes") { expect in
+            if skipped(expect) { return }
+            // SQLite, through the repositories.
+            let sqlite = try RentalStore.makeInMemory()
+            try workflow(sqlite)
+            let sqliteOutcomes = try outcomes(sqlite)
+
+            // PostgreSQL, through the same repositories.
+            guard let (postgres, _) = try freshStore() else { return }
+            try workflow(postgres)
+            let postgresOutcomes = try outcomes(postgres)
+
+            if sqliteOutcomes != postgresOutcomes {
+                let a = sqliteOutcomes.split(separator: "\n").map(String.init)
+                let b = postgresOutcomes.split(separator: "\n").map(String.init)
+                for (index, line) in a.enumerated() where index >= b.count || b[index] != line {
+                    expect.fail("line \(index + 1):\n  SQLite:   \(line)\n  Postgres: "
+                        + (index < b.count ? b[index] : "<missing>"))
+                }
+                for extra in b.dropFirst(a.count) {
+                    expect.fail("extra from Postgres: \(extra)")
+                }
+            }
+            expect.equal(postgresOutcomes, sqliteOutcomes,
+                         "business outcomes must be identical across dialects")
+            expect.ok(sqliteOutcomes.contains("nights=7"), "the December block is 7 nights")
+            expect.ok(sqliteOutcomes.contains("genuine=false"),
+                      "the cancellation block is not genuine unavailability")
+        },
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "the generated daterange matches the repository's own night count") { expect in
+            if skipped(expect) { return }
+            guard let (store, transport) = try freshStore() else { return }
+            try workflow(store)
+
+            // The repositories write epoch doubles; the constraints read a
+            // daterange generated from them. If those ever disagreed, the
+            // exclusion constraint would be protecting the wrong nights.
+            let rows = try store.database.query("""
+                SELECT event_key, upper(stay) - lower(stay) AS generated_nights
+                  FROM events ORDER BY event_key
+                """)
+            expect.equal(rows.count, 3)
+            var byKey: [String: Int] = [:]
+            for row in rows { byKey[row.stringValue("event_key")] = row.intValue("generated_nights") }
+            for item in try store.classifiedEvents() {
+                expect.equal(byKey[item.event.eventKey], item.event.nights,
+                             "generated nights must equal the repository's nights for "
+                             + item.event.eventKey)
+            }
+            _ = transport
+        },
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "December 17 and 18 are excluded by the decisions") { expect in
+            if skipped(expect) { return }
+            guard let (store, _) = try freshStore() else { return }
+            try workflow(store)
+            let decisions = try store.availability.all()
+            for night in [DayMath.day(2026, 12, 17), DayMath.day(2026, 12, 18)] {
+                let covered = decisions.contains { night >= $0.startDay && night < $0.endDay }
+                expect.ok(!covered,
+                          "\(DayMath.icalDateString(night)) must not be covered by any decision")
+            }
+            expect.equal(decisions.count, 2)
+        },
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "a rolled-back transaction leaves no rows") { expect in
+            if skipped(expect) { return }
+            struct Nope: Error {}
+            guard let (store, _) = try freshStore() else { return }
+            let before = try store.properties.all().count
+            do {
+                try store.database.transaction {
+                    _ = try store.properties.insert(Property(name: "Doomed"))
+                    _ = try store.properties.insert(Property(name: "Also doomed"))
+                    throw Nope()
+                }
+                expect.fail("must throw")
+            } catch is Nope { }
+            expect.equal(try store.properties.all().count, before,
+                         "a real PostgreSQL ROLLBACK undid both inserts")
+        },
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "a committed transaction persists every row") { expect in
+            if skipped(expect) { return }
+            guard let (store, _) = try freshStore() else { return }
+            try store.database.transaction {
+                _ = try store.properties.insert(Property(name: "Kept one"))
+                _ = try store.properties.insert(Property(name: "Kept two"))
+            }
+            expect.equal(try store.properties.all().count, 2)
+        },
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "generated identifiers come back from RETURNING") { expect in
+            if skipped(expect) { return }
+            // PostgreSQL does not fill the Data API's generatedFields, so
+            // without the RETURNING mapping every row would get id 0.
+            guard let (store, _) = try freshStore() else { return }
+            let first = try store.properties.insert(Property(name: "One"))
+            let second = try store.properties.insert(Property(name: "Two"))
+            expect.ok(first.id != nil && first.id != 0, "an id came back")
+            expect.ok(second.id! > first.id!, "and they increase")
+        },
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "the database allow-list agrees with BlockKind, case by case") { expect in
+            if skipped(expect) { return }
+            // The check that would have caught the camelCase bug immediately:
+            // ask the database about every BlockKind and compare with Swift.
+            guard let (store, _) = try freshStore() else { return }
+            for kind in BlockKind.allCases {
+                let row = try store.database.queryOne(
+                    "SELECT describes_genuine_unavailability(?) AS genuine", [.text(kind.rawValue)])
+                let fromDatabase = (row?.string("genuine") ?? "").lowercased()
+                let databaseSaysYes = fromDatabase == "t" || fromDatabase == "true"
+                expect.equal(databaseSaysYes, kind.describesGenuineUnavailability,
+                             "\(kind.rawValue): database=\(fromDatabase) "
+                             + "swift=\(kind.describesGenuineUnavailability)")
+            }
+        },
+
+        TestCase(group: "PostgreSQL integration",
+                 name: "the export gate still excludes cancellation blocks") { expect in
+            if skipped(expect) { return }
+            guard let (store, _) = try freshStore() else { return }
+            try workflow(store)
+            // Read through the database's own allow-list, not the Swift one,
+            // so both layers are checked to agree.
+            let blocking = try store.database.query("""
+                SELECT source, basis FROM blocking_intervals ORDER BY basis, source
+                """)
+            let classified = try store.classifiedEvents()
+            let genuine = classified.filter {
+                $0.classification.kind.describesGenuineUnavailability
+            }
+            expect.equal(blocking.count, genuine.count,
+                         "the database view and the Swift rule agree on what blocks")
+            expect.ok(genuine.allSatisfy { $0.classification.kind != .cancellationBlock },
+                      "and a cancellation block is not among them")
+        },
+    ] }
+}

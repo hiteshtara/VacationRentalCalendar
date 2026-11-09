@@ -103,6 +103,8 @@ public enum TestRegistry {
             + DataStoreTests.cases
             + TransactionLifecycleTests.cases
             + DataStoreParityTests.cases
+            + PostgresIntegrationTests.cases
+            + DecisionRouteTests.cases
             + CloudSyncClientTests.cases
             + LambdaHandlerTests.cases
             + ClassifierTests.cases

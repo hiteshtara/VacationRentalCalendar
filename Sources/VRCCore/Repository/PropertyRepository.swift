@@ -48,7 +48,11 @@ public struct PropertyRepository: Sendable {
     }
 
     public func all() throws -> [Property] {
-        try database.query("SELECT * FROM properties ORDER BY name COLLATE NOCASE;")
+        // lower(name) rather than COLLATE NOCASE: the collation is a SQLite
+        // name that PostgreSQL does not have, and lower() gives the same
+        // case-insensitive ordering on both. One code path beats a dialect
+        // branch for something this small.
+        try database.query("SELECT * FROM properties ORDER BY lower(name);")
             .map(decode)
     }
 
