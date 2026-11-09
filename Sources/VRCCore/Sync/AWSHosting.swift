@@ -1,5 +1,16 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+// swift-crypto provides the same API surface under a different module name.
+// SHA256, HMAC and SymmetricKey are source-compatible, so nothing below
+// changes shape -- which matters, because an AWS SigV4 signature that differs
+// by a byte is simply rejected, and the iCal event keys are persisted.
+import Crypto
+#endif
 
 /// AWS SigV4, shared by the R2 and S3 clients — R2's API is S3-compatible, so
 /// the signing is identical apart from the region and service names.

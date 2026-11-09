@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(Security)
 import Security
+#endif
 
 /// A platform iCal export URL is a credential, not a setting.
 ///
@@ -66,6 +68,7 @@ public enum FeedCredentialError: Error, LocalizedError {
 ///    hash, which changes on every rebuild, so every rebuild asks again. Signed
 ///    with a real or self-signed certificate, the requirement is tied to the
 ///    certificate instead and survives rebuilds. See `Scripts/setup-signing.sh`.
+#if canImport(Security)
 public struct KeychainFeedCredentialStore: FeedCredentialStore {
     public let service: String
     /// Extra executables added to each new item's ACL, so one grant covers both
@@ -248,6 +251,7 @@ public struct CodeSignatureInfo: Sendable {
         return CodeSignatureInfo(kind: .certificate, identifier: identifier, authority: authority)
     }
 }
+#endif // canImport(Security)
 
 // MARK: - In memory (tests)
 

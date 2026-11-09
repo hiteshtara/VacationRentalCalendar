@@ -1,5 +1,13 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+// swift-crypto provides the same API surface under a different module name.
+// SHA256, HMAC and SymmetricKey are source-compatible, so nothing below
+// changes shape -- which matters, because an AWS SigV4 signature that differs
+// by a byte is simply rejected, and the iCal event keys are persisted.
+import Crypto
+#endif
 
 /// Stable identity for an imported event.
 ///
@@ -13,7 +21,7 @@ public enum EventKey {
     }
 
     public static func sha256(_ string: String) -> String {
-        let digest = CryptoKit.SHA256.hash(data: Data(string.utf8))
+        let digest = SHA256.hash(data: Data(string.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }

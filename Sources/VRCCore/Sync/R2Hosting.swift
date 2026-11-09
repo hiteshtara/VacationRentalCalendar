@@ -1,5 +1,21 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+// swift-crypto provides the same API surface under a different module name.
+// SHA256, HMAC and SymmetricKey are source-compatible, so nothing below
+// changes shape -- which matters, because an AWS SigV4 signature that differs
+// by a byte is simply rejected, and the iCal event keys are persisted.
+import Crypto
+#endif
 
 /// Everything needed to serve the filtered feeds from Cloudflare R2.
 ///
@@ -159,8 +175,15 @@ public struct R2HostingClient: FeedHostingClient {
         do {
             let (data, response) = try await session.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            let succeeded = (body?["success"] as? Bool) ?? false
+            // Spelled out in three steps rather than one expression: on Linux
+            // the single-expression form (optional subscript, then a double
+            // conditional cast, then a nil-coalesce) defeats the type checker
+            // outright -- it fails to even produce a diagnostic. The behaviour
+            // is identical; only the inference burden differs.
+            let parsedBody = try? JSONSerialization.jsonObject(with: data)
+            let bodyObject = parsedBody as? [String: Any]
+            let successField: Any? = bodyObject?["success"]
+            let succeeded: Bool = (successField as? Bool) ?? false
             guard (200...299).contains(status), succeeded else {
                 throw HostingError.cacheInvalidationFailed(
                     "HTTP \(status) " + (String(data: data.prefix(300), encoding: .utf8) ?? "")
@@ -294,7 +317,25 @@ public actor LocalDirectoryHostingClient: FeedHostingClient {
         let destination = path(originDirectory, key)
         let temporary = destination.appendingPathExtension("partial")
         try Data(body.utf8).write(to: temporary, options: [.atomic])
-        _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+
+        // rename(2) rather than FileManager.replaceItemAt.
+        //
+        // replaceItemAt is not portable here: on swift-corelibs-foundation it
+        // requires the destination to already exist, and when it does exist it
+        // can unlink the destination and then fail -- leaving no file at all.
+        // That would have broken the first publish of every feed, and then
+        // corrupted later ones, on the server only.
+        //
+        // rename(2) atomically replaces the destination whether or not it
+        // exists, within a single directory, on both platforms. A reader sees
+        // the old bytes or the new ones, never a partial calendar and never
+        // nothing.
+        guard rename(temporary.path, destination.path) == 0 else {
+            let code = errno
+            try? FileManager.default.removeItem(at: temporary)
+            throw HostingError.uploadFailed(
+                "could not place the feed at its final name (errno \(code))")
+        }
         uploadCount += 1
     }
 

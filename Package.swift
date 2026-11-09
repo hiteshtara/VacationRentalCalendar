@@ -8,12 +8,30 @@ let package = Package(
         .executable(name: "VacationRentalCalendar", targets: ["VacationRentalCalendar"]),
         .executable(name: "vrc-test", targets: ["vrc-test"]),
         .executable(name: "vrc", targets: ["vrc"]),
+        .executable(name: "vrc-parity", targets: ["vrc-parity"]),
         .library(name: "VRCCore", targets: ["VRCCore"]),
+    ],
+    dependencies: [
+        // Used only on platforms without CryptoKit. The API is
+        // source-compatible, so the signing and hashing code is identical on
+        // both: an AWS SigV4 signature that differs by one byte is rejected,
+        // and the iCal event keys are persisted, so "equivalent" is not good
+        // enough -- it has to be the same algorithm, same encoding.
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
     ],
     targets: [
         // Everything testable. No UI, no third-party dependencies.
+        // Surfaces the system SQLite to Linux, which has no SQLite3 Swift
+        // module. Not built on Apple platforms.
+        .systemLibrary(name: "CSQLite", path: "Sources/CSQLite"),
+        // Everything testable. No UI.
         .target(
             name: "VRCCore",
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto",
+                         condition: .when(platforms: [.linux])),
+                .target(name: "CSQLite", condition: .when(platforms: [.linux])),
+            ],
             path: "Sources/VRCCore",
             linkerSettings: [.linkedLibrary("sqlite3")]
         ),
@@ -34,6 +52,13 @@ let package = Package(
             name: "vrc",
             dependencies: ["VRCCore"],
             path: "Sources/vrc"
+        ),
+        // Cross-platform parity harness. Builds on Linux as well as macOS,
+        // which is the whole point: it proves the business rules agree.
+        .executableTarget(
+            name: "vrc-parity",
+            dependencies: ["VRCCore"],
+            path: "Sources/vrc-parity"
         ),
         // The SwiftUI application.
         .executableTarget(

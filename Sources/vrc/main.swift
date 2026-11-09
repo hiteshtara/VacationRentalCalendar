@@ -79,35 +79,136 @@ func runHelp() {
 
 /// Reads a feed URL from stdin so the secret never appears in a command line,
 /// a shell history or a process list.
-func runSetURL() {
+/// Replaces a listing's calendar feed URL.
+///
+/// The URL is read with echo suppressed and is **verified before it is
+/// stored**: a credential that is saved and only then discovered to be broken
+/// leaves the app in the state this command exists to repair. So the order is
+/// paste, fetch, parse, show what was found, confirm, and only then save.
+///
+/// Nothing prints the URL. Not on success, not on failure, not truncated.
+func runSetURL() async {
     let store = makeStore()
+    let dryRun = flags.contains("--dry-run")
+
     guard let listingID = value(for: "--listing").flatMap(Int64.init) else {
         bail("--listing <id> is required (see `vrc status`)")
     }
     guard let listing = try? store.listings.find(id: listingID), listing.id != nil else {
         bail("no listing with id \(listingID)")
     }
-    FileHandle.standardError.write(Data("Paste the iCal export URL, then press Return:\n".utf8))
-    guard let line = readLine(strippingNewline: true)?
-        .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
+
+    print("Replacing the calendar feed URL for \(listing.label)")
+    print("")
+    print("  Where to find it:")
+    switch listing.platform {
+    case .airbnb:
+        print("    Airbnb → Calendar → Availability → Connect to another website")
+        print("            → Export calendar")
+    case .vrbo:
+        print("    Vrbo → Calendar → Import/Export → Export calendar")
+    case .bookingCom:
+        print("    Booking.com → Rates & Availability → Sync calendars")
+        print("            → Add calendar connection → \"Skip this step\" → Export Calendar")
+    case .other:
+        print("    Use the platform's calendar export (not import) URL.")
+    }
+    print("")
+    print("  Your typing will not be shown. The URL is never printed, never")
+    print("  written to the database, and never stored in this project.")
+    if !SecureInput.standardInputIsTerminal {
+        print("")
+        print("  NOTE: standard input is not a terminal, so echo cannot be")
+        print("        suppressed. Saving is refused in this mode — run this")
+        print("        command directly in Terminal.")
+    }
+    print("")
+
+    guard let pasted = SecureInput.readLine(prompt: "  Paste the iCal export URL, then press Return: ") else {
         bail("no URL supplied")
     }
-    guard line.lowercased().hasPrefix("https://") || line.lowercased().hasPrefix("webcal://") else {
-        bail("the URL must use https (or webcal) — a plain http feed would leak your calendar token")
+    let url = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !url.isEmpty else { bail("no URL supplied") }
+
+    let lowered = url.lowercased()
+    let allowFile = flags.contains("--allow-file")
+    guard lowered.hasPrefix("https://") || lowered.hasPrefix("webcal://")
+            || (allowFile && lowered.hasPrefix("file://")) else {
+        bail("the URL must use https (or webcal) — a plain http feed would leak "
+            + "your calendar token to anyone on the network")
     }
+
+    print("  Received: \(SecureInput.redact(url))")
+    print("")
+    print("── Verifying before saving")
+
+    let fetcher = URLSessionFeedFetcher(allowFileURLs: flags.contains("--allow-file"))
+    let parsed: ICalParseResult
+    do {
+        let response = try await fetcher.fetch(urlString: url)
+        let status = response.httpStatus.map(String.init) ?? "(no status)"
+        print("   HTTP \(status)")
+        parsed = try ICalParser.parse(response.text)
+        print("   parsed \(parsed.events.count) event(s), producer "
+            + (parsed.productID.isEmpty ? "(unstated)" : parsed.productID))
+        for warning in parsed.warnings.prefix(3) { print("   note: \(warning)") }
+    } catch {
+        let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        print("   FAILED: \(detail)")
+        print("")
+        bail("not saved — the URL was not stored, and your existing entry is untouched")
+    }
+
+    if dryRun {
+        print("")
+        print("   --dry-run: verified but NOT saved. Nothing was written.")
+        return
+    }
+
+    guard SecureInput.standardInputIsTerminal else {
+        bail("refusing to save a credential read without echo suppression — "
+            + "run this in Terminal")
+    }
+
+    print("")
+    FileHandle.standardError.write(Data("  Save this URL to the Keychain? [y/N] ".utf8))
+    let answer = (readLine(strippingNewline: true) ?? "").lowercased()
+    guard answer.hasPrefix("y") else {
+        print("  Not saved. Your existing entry is untouched.")
+        return
+    }
+
     var updated = listing
-    updated.icalURL = line
+    updated.icalURL = url
     updated.urlStorage = .keychain
     if updated.credentialRef.isEmpty {
         updated.credentialRef = ListingRepository.credentialReference(
             platform: listing.platform, listingLabel: listing.label
         )
     }
+    let previousRef = listing.credentialRef
+
     do {
         try store.listings.update(updated)
-        print("Stored for \(listing.label) in \(store.credentials.storageDescription).")
-        print("Reference: \(updated.credentialRef)")
-        print("The URL is not written to the database or to any file in the project.")
+        let saved = try store.listings.find(id: listingID)
+        print("")
+        print("  Stored in \(store.credentials.storageDescription).")
+        if let saved, saved.credentialRef != previousRef {
+            print("  New Keychain reference: \(saved.credentialRef)")
+            print("  The previous entry (\(previousRef)) was left in place and not deleted.")
+        } else {
+            print("  Keychain reference: \(previousRef)")
+        }
+        print("  The URL is not written to the database or to any file in the project.")
+
+        // Clear the unreadable state only after a verified, saved credential.
+        if listing.connectionState == .credentialUnreadable {
+            try store.listings.setConnectionState(
+                listingID: listingID, to: .connected,
+                detail: "URL re-entered and verified", actor: "owner", at: Date()
+            )
+            print("  Connection state: credential_unreadable → connected")
+        }
     } catch {
         bail("could not store the URL: \(error)")
     }
@@ -831,7 +932,7 @@ func runDoctor() {
 
 switch command {
 case "seed": runSeed()
-case "set-url": runSetURL()
+case "set-url": await runSetURL()
 case "status": runStatus()
 case "import": await runImport()
 case "review": runReview()
