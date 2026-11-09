@@ -16,6 +16,11 @@ public enum FeedConnectionState: String, CaseIterable, Sendable, Identifiable {
     case revoked
     /// The owner switched it off deliberately.
     case disconnectedByOwner = "disconnected_by_owner"
+    /// A Keychain item exists but this build cannot read it, because its
+    /// access list names an earlier build by code hash. macOS does not prompt
+    /// in this case, it simply refuses — and an abandoned read holds the
+    /// keychain for the rest of the process, so no further attempt is made.
+    case credentialUnreadable = "credential_unreadable"
     /// A URL is present but the last fetch failed in a way that may be
     /// temporary. Still retried.
     case failing
@@ -26,6 +31,7 @@ public enum FeedConnectionState: String, CaseIterable, Sendable, Identifiable {
 
     public var displayName: String {
         switch self {
+        case .credentialUnreadable: return "Needs the URL entered again"
         case .notConfigured: return "Not set up"
         case .connected: return "Connected"
         case .revoked: return "Disconnected by the platform"
@@ -43,7 +49,10 @@ public enum FeedConnectionState: String, CaseIterable, Sendable, Identifiable {
     public var shouldAttemptImport: Bool {
         switch self {
         case .connected, .failing, .unknown: return true
-        case .notConfigured, .revoked, .disconnectedByOwner: return false
+        // Deliberately never retried: the read cannot succeed, and attempting
+        // it blocks every later Keychain operation in this process.
+        case .notConfigured, .revoked, .disconnectedByOwner, .credentialUnreadable:
+            return false
         }
     }
 
@@ -55,6 +64,11 @@ public enum FeedConnectionState: String, CaseIterable, Sendable, Identifiable {
 
     public var explanation: String {
         switch self {
+        case .credentialUnreadable:
+            return "The saved URL cannot be read by this build of the app. Its Keychain entry "
+                + "was created by an earlier, differently-signed build, and macOS will not "
+                + "transfer that permission or offer a prompt. Enter the URL again and it will "
+                + "be saved to a fresh entry this build owns. Nothing is deleted."
         case .notConfigured:
             return "No calendar URL has been added for this listing yet."
         case .connected:
@@ -75,6 +89,8 @@ public enum FeedConnectionState: String, CaseIterable, Sendable, Identifiable {
     /// What the owner should do, if anything.
     public var nextStep: String? {
         switch self {
+        case .credentialUnreadable:
+            return "Quit and reopen the app, then enter this listing's URL again under Feeds."
         case .revoked:
             return "Generate a fresh export URL on the platform and add it here."
         case .notConfigured:

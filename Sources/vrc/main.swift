@@ -51,6 +51,9 @@ func runHelp() {
       vrc feed --property <id> --to <platform> [--raw]
                                    Show the feed a destination would receive
       vrc availability             List availability decisions and audit history
+      vrc preview --property <id> --from YYYY-MM-DD --to YYYY-MM-DD
+                  --actions vrbo=block,airbnb=block,booking_com=block
+                                   Dry run an availability plan; writes nothing
       vrc connection [--listing <id>] [--state <state>] [--detail "..."]
                                    Show or change a feed's connection state
       vrc doctor                   Check the database, Keychain and outbound gate
@@ -392,6 +395,92 @@ func runConnection() {
     }
 }
 
+/// Dry run of an availability plan. Writes nothing and contacts nobody.
+func runPreview() {
+    let store = makeStore()
+    guard let propertyID = value(for: "--property").flatMap(Int64.init) else {
+        bail("--property <id> is required")
+    }
+    func parseDay(_ flag: String) -> Date? {
+        guard let raw = value(for: flag) else { return nil }
+        let parts = raw.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return DayMath.day(parts[0], parts[1], parts[2])
+    }
+    guard let start = parseDay("--from"), let end = parseDay("--to") else {
+        bail("--from and --to are required as YYYY-MM-DD (check-out exclusive)")
+    }
+
+    var actions: [RentalPlatform: AvailabilityAction] = [:]
+    for pair in (value(for: "--actions") ?? "").split(separator: ",") {
+        let bits = pair.split(separator: "=")
+        guard bits.count == 2,
+              let platform = RentalPlatform(rawValue: String(bits[0])),
+              let action = AvailabilityAction(rawValue: String(bits[1])) else {
+            bail("--actions must look like vrbo=block,airbnb=block,booking_com=block")
+        }
+        actions[platform] = action
+    }
+    guard !actions.isEmpty else { bail("--actions is required") }
+
+    do {
+        let plan = AvailabilityPlan(
+            propertyID: propertyID, startDay: start, endDay: end,
+            reason: value(for: "--reason") ?? "", actions: actions
+        )
+        let preview = try store.availabilityManager.preview(plan)
+
+        print("PREVIEW — nothing is saved, nothing is sent")
+        print("Property: \(preview.propertyName)")
+        print(preview.nightsDescription)
+        print("")
+
+        // What already occupies these nights, per the brief's pre-checks.
+        let overlapping = try store.classifiedEvents().filter {
+            $0.propertyID == propertyID && $0.event.isActive
+                && $0.event.checkIn < plan.endDay && plan.startDay < $0.event.checkOut
+        }
+        print("EXISTING EVENTS OVERLAPPING THIS RANGE (\(overlapping.count))")
+        if overlapping.isEmpty { print("  none") }
+        for item in overlapping {
+            print("  \(item.event.platform.shortTag)  "
+                + "\(DayMath.icalDateString(item.event.checkIn))–"
+                + "\(DayMath.icalDateString(item.event.checkOut))  "
+                + "\(item.classification.kind.displayName)"
+                + (item.classification.needsReview ? "  [needs review]" : ""))
+        }
+        let confirmed = overlapping.filter {
+            $0.classification.kind == .confirmedReservation && !$0.classification.needsReview
+        }
+        let unknown = overlapping.filter {
+            $0.classification.needsReview || $0.classification.kind == .unknownUnavailable
+        }
+        let restrictions = overlapping.filter {
+            $0.classification.kind == .platformRestriction
+        }
+        print("")
+        print("  confirmed reservations: \(confirmed.count)")
+        print("  unknown / unreviewed:   \(unknown.count)")
+        print("  platform restrictions:  \(restrictions.count)")
+        print("")
+
+        for line in preview.lines {
+            print("── \(line.destination.displayName): \(line.action.displayName)")
+            print("   verdict: \(line.canProceed ? "may proceed" : "REFUSED")"
+                + (line.validation.needsReview ? " (check first)" : ""))
+            for violation in line.validation.violations {
+                print("   [\(violation.severity.rawValue)] \(violation.rule.rawValue) "
+                    + "\(violation.message)")
+            }
+            for note in line.validation.notes { print("   note: \(note)") }
+        }
+        print("")
+        print("Outbound publishing: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
+    } catch {
+        bail("preview failed: \(error)")
+    }
+}
+
 func runDoctor() {
     let store = makeStore()
     var problems = 0
@@ -446,6 +535,7 @@ case "conflicts": runConflicts()
 case "feed": runFeed()
 case "availability": runAvailability()
 case "connection": runConnection()
+case "preview": runPreview()
 case "export": runExport()
 case "doctor": runDoctor()
 case "help", "--help", "-h": runHelp()
