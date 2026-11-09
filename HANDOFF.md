@@ -8,33 +8,54 @@ traps; this file is "where things stand and exactly what to do".
 
 ---
 
-## ⚠️ STOP — the integration suite TRUNCATES the database it is pointed at
+## The integration suite truncates — and is now prevented from truncating anything shared
 
-**`swift run vrc-test "PostgreSQL integration"` deletes rows. It must only
-ever be pointed at a disposable, isolated database.**
+**This is enforced in code as of `096d0ba`. It is no longer a rule to remember.**
 
-Its setup — `auroraStore()` and `freshStore()` in
-[Sources/VRCTestSuite/PostgresIntegrationTests.swift](Sources/VRCTestSuite/PostgresIntegrationTests.swift)
-— empties `properties`, `reservations`, `holds`, `events`, `classifications`,
-`availability_decisions`, `platform_listings`, `sync_runs`,
-`feed_publications`, `published_feed_entries` and more before each case, so it
-can compare a known workflow against a known starting point. That is correct
-for a scratch database and destructive anywhere else.
+`swift run vrc-test "PostgreSQL integration"` deletes rows: its setup empties
+`properties`, `reservations`, `holds`, `events`, `classifications`,
+`availability_decisions`, `platform_listings`, `sync_runs` and more before each
+case, so it can compare a known workflow against a known starting point. That is
+correct for a scratch database and destructive anywhere else.
 
-**This already happened.** On 2026-11-09 the suite was pointed at the shared
-staging cluster to validate B6. It destroyed staging's synthetic demo rows, its
-**2 synthetic approved decisions**, and its Airbnb `platform_listings` row.
-Only the demo property, reservation and hold were recoverable, because
-`Scripts/seed-staging-demo.sql` restores only those three.
+**What went wrong.** On 2026-11-09 the suite was pointed at the shared staging
+cluster to validate B6 and emptied it, destroying the synthetic demo rows, 2
+synthetic approved decisions and the Airbnb `platform_listings` row.
+`Scripts/seed-staging-demo.sql` restores only the property, one reservation and
+one hold, so the rest was gone. No real data was lost — the 7 events, 7
+classifications and 2 approved Vrbo decisions live in local SQLite, were never a
+target, and are re-verified in §9.
 
-**No real data was lost.** The 7 events, 7 classifications and 2 approved Vrbo
-decisions live in local SQLite and were never touched (re-verified below). The
-loss was synthetic, and avoidable.
+**What now prevents it.**
+[`DestructiveTestIsolation`](Sources/VRCCore/Database/DestructiveTestIsolation.swift)
+fails closed: a target is refused unless it proves itself disposable, and all
+four of these must hold.
 
-**Before any future run against a cluster:** create a throwaway one — the
-Phase C PITR procedure in docs/STAGING-DEPLOYMENT.md §6 produces exactly such
-a cluster — run against that, then delete it. Never against `vrc-staging-main`
-again. `RehearsalIsolation` exists for this same reason.
+| | Requirement | Refused if |
+|---|---|---|
+| 1 | `VRC_DESTRUCTIVE_TESTS=i-understand-this-truncates` | unset, or any other value — `1`, `true`, `yes` are all refused |
+| 2 | Not on the deny-list: `vrc-staging-main`, `prod`, `production`, `priyanka`, `vrc-live` | matched case-insensitively as a substring, checked **first** and overriding everything else, so `vrc-staging-main-scratch` is still refused |
+| 3 | A cluster identifier containing `scratch`, `throwaway`, `disposable`, `pitr`, `ephemeral` or `sandbox` | any other name, including one nobody has considered — allow-list, not deny-list |
+| 4 | `app_settings.disposable_database = 'true'` **in the target database** | absent, not `true`, or **unreadable** — an unknown answer is a refusal |
+
+Requirement 4 is the strongest, because it travels with the database rather than
+with the invocation: a shared cluster does not have the marker and cannot acquire
+one by accident. `app_settings` is deliberately excluded from the truncation list
+so the marker survives the operation it authorizes.
+
+The guard sits **inside** `truncateForTest`, the only function in the suite that
+deletes rows, rather than being a precondition each caller must remember. The
+local `psql` path goes through the same door — a port is no safe harbour, since a
+tunnel can put a shared cluster behind `127.0.0.1`.
+
+**Verified against the real cluster, not only in unit tests.** Pointed at
+`vrc-staging-main` with full consent *and* a marker, every case refuses, and
+staging's row counts are identical before and after (`properties=2`,
+`reservations=1`, `holds=3`, `availability_audit=41`). On a marked local sandbox
+the group still runs 10/10 — which is the half no refusal test can prove.
+
+Compare `RehearsalIsolation`, which solves the same shape of problem for
+publication rehearsals against the local SQLite database.
 
 ---
 
@@ -43,12 +64,11 @@ again. `RehearsalIsolation` exists for this same reason.
 The Mac app is installed and working, and it shows **live data from the deployed
 AWS staging backend**. Staging is up and validated through smoke tests **B5 and
 B6**. Scheduled imports and outbound publishing are **off**. No real feeds import
-yet. The project is **paused**.
+yet.
 
-Two things need the next person's attention, neither urgent and neither a
-correctness risk: staging still carries **two leftover test-litter holds** that
-need one DELETE to remove (§4), and the suite's truncating setup needs isolating
-before it is ever run against a cluster again (warning above).
+Both loose ends from the previous round are closed: the truncating setup is now
+**guarded in code** (above), and staging's leftover test litter has been
+**removed** after confirming each row individually (§4).
 
 ---
 
@@ -59,14 +79,26 @@ before it is ever run against a cluster again (warning above).
 | macOS app | built, signed, installed at `/Applications/VacationRentalCalendar.app` |
 | Cloud integration | **working** — the app reads live status/availability from AWS staging via the bundled `vrc` helper |
 | AWS staging | **deployed** in account …1110, us-east-1; cluster + 5 Lambdas + API Gateway + 3 buckets + 4 secrets |
-| Tests | **352 tests / 1185 assertions**, passing on macOS; 350/1164 last verified on Linux (the 2 new tests have not been run there — see §5) |
+| Tests | **369 tests / 1242 assertions**, passing on macOS; 350/1164 last verified on Linux (the 19 newer tests have not been run there — see §5) |
 | Cross-platform parity | byte-identical digest `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` |
 | Staging smoke tests | **A1–A5, B1–B6 done and passing.** B7, B8 and Phase C (PITR) remain; B9 is 3 of 4 layers verified |
 | Outbound publishing | **off** — code gate, function env and database setting all verified `false` 2026-11-09; Terraform precondition not re-checked (§4) |
 | Scheduled imports | **disabled** (both EventBridge schedules DISABLED) |
 
 Completed milestones, newest first:
-1. **Smoke test B6 — concurrency over the Data API** (commit `7e9a99a`). Two
+1. **Destructive-test isolation, enforced in code** (commit `096d0ba`). The fix
+   for the 2026-11-09 truncation: `DestructiveTestIsolation` refuses any target
+   that does not prove itself disposable, on four independent grounds, failing
+   closed on each. It lives inside the only function that deletes rows, so there
+   is no path to the DELETEs that skips it. 17 tests, 57 assertions, including
+   the one that matters — pointed at the real `vrc-staging-main` with full
+   consent, the suite refuses and staging's row counts do not move. Full detail
+   at the top of this file.
+2. **Staging test litter removed** (no commit — a database operation). The two
+   leftover `channel='race'` holds and their property were deleted by explicit
+   primary key after confirming every dependent row count was zero. Staging now
+   reports exactly the two documented demo intervals. See §4.
+3. **Smoke test B6 — concurrency over the Data API** (commit `7e9a99a`). Two
    `RentalStore`s on independent transports race to claim the same nights on one
    property; the `no_overlapping_live_holds` exclusion constraint is the only
    arbiter. Exactly one is accepted, the loser's refusal must name that
@@ -77,18 +109,18 @@ Completed milestones, newest first:
    all four assertions, including `expected 1, got 2` live holds — a real double
    booking. Passed against local PostgreSQL 17.10 **and** live Aurora over the
    RDS Data API (10/10, 29 assertions in the group). Parity digest unchanged.
-2. **Daterange Data API fix** (found by B5 against real Aurora) — `SELECT *` on
+4. **Daterange Data API fix** (found by B5 against real Aurora) — `SELECT *` on
    tables with generated `daterange` columns 400s over the RDS Data API;
    replaced with explicit column lists. Lambdas redeployed.
-3. **GUI keychain fix via helper delegation** — the SwiftUI app could not read
+5. **GUI keychain fix via helper delegation** — the SwiftUI app could not read
    the AWS credential (macOS pins each keychain item to the creating binary's
    code hash; the GUI and `vrc` are different code objects). The GUI now calls
    the bundled `vrc cloud check --json` helper, which returns only sanitized
    JSON. See [docs/KEYCHAIN.md](docs/KEYCHAIN.md).
-4. **Cloud integration in the Mac app** — Cloud pane, AWS status-bar indicator,
+6. **Cloud integration in the Mac app** — Cloud pane, AWS status-bar indicator,
    Refresh from AWS, build-provenance tab.
-5. **Staging deployed and validated** (A1–A5, B1–B5).
-6. **Minimal AWS backend** — DataStore over the RDS Data API, 5 Lambda handlers,
+7. **Staging deployed and validated** (A1–A5, B1–B5).
+8. **Minimal AWS backend** — DataStore over the RDS Data API, 5 Lambda handlers,
    restricted DB role, Postgres schema generated from the SQLite migrator.
 
 ---
@@ -124,14 +156,16 @@ Completed milestones, newest first:
 | | Value |
 |---|---|
 | Branch | `backend/aws-backend` |
-| HEAD | `7e9a99a` (Add staging smoke test B6: concurrent overlapping holds) |
+| HEAD | `096d0ba` (Make it impossible to truncate a database that is not disposable) |
 | PR | **#10 OPEN** (not draft): "Backend implementation: DataStore, five handlers, restricted role" — **do not merge without review** |
 | Installed Mac app | commit `217f668`, build 1, clean tree, built 2026-11-09 17:05Z |
 
-**Why the installed app is three commits behind HEAD**, and why that is fine:
+**Why the installed app is five commits behind HEAD**, and why that is fine:
 
 | Commit | Touches | Affects the Mac app? |
 |---|---|---|
+| `096d0ba` destructive-test isolation | a new `VRCCore` type used only by the test suite, plus tests | no — nothing in the app or the Lambdas calls it |
+| `76425c9` handoff rewrite | `HANDOFF.md` only | no |
 | `7e9a99a` B6 concurrency tests | `Sources/VRCTestSuite` only | no |
 | `f672cf9` handoff rewrite | `HANDOFF.md` only | no |
 | `08c3bc1` daterange Data API fix | the Lambda/Data-API path and tests | no — the app uses local SQLite, where `SELECT *` is fine |
@@ -176,37 +210,29 @@ build**, or from the bundle:
 
 `app_settings.feed_publication_scope` is `approved_manual_blocks_only`.
 
-### Staging database contents, as left on 2026-11-09
-
-The B6 run truncated staging (see the warning at the top). What is there now:
+### Staging database contents, verified 2026-11-09 after clean-up
 
 | Table | Rows | Note |
 |---|---|---|
-| `properties` | 2 | the demo property (id 112) **and one litter row** (id 111) |
-| `reservations` | 1 | demo, 2027-07-01→07-08, restored |
-| `holds` | 3 | demo 2027-09-01→09-04 restored, **plus 2 litter holds** |
-| `availability_audit` | 41 | append-only; the runtime role cannot delete from it, by design |
-| `events`, `classifications`, `availability_decisions`, `platform_listings`, `sync_runs`, `feed_publications`, `published_feed_entries`, `idempotency_keys` | 0 | emptied by the run; the seed script does not restore these |
+| `properties` | 1 | `Staging Demo — 39 G Street`, id 112 |
+| `reservations` | 1 | id 67, `direct`, `demo-res-1`, confirmed, 2027-07-01→07-08 |
+| `holds` | 1 | id 71, `direct`, `demo-hold-1`, 2027-09-01→09-04, expires 2099 |
+| `availability_audit` | 41 | append-only and untouched; the runtime role cannot delete from it, by design |
+| `events`, `classifications`, `availability_decisions`, `platform_listings`, `sync_runs`, `feed_publications`, `published_feed_entries`, `idempotency_keys` | 0 | emptied by the B6 run; the seed script restores none of these |
 
-**One manual step is outstanding.** Two leftover holds from the B6 control test
-(`channel = 'race'`, property `No race — 39 G Street`, 2027-06-01→05 and
-2027-06-05→09) are still present, so `vrc cloud check` currently reports **four**
-intervals rather than the documented two. They are synthetic and harmless — they
-block nothing real and expire on their own — but they are misleading. Removing
-them needs the master secret and the §9 helper:
+`vrc cloud check` reports exactly these two intervals, `health: healthy`.
 
-```sql
-DELETE FROM holds WHERE channel = 'race';
-DELETE FROM properties WHERE name IN ('Race — 39 G Street', 'No race — 39 G Street');
-```
-
-This was attempted and refused by the session's permission policy, which
-authorized only `Scripts/seed-staging-demo.sql`. It is a one-liner for whoever
-has the access.
+**The test litter is gone.** The two `channel='race'` holds (ids 69 and 70) and
+their property (`No race — 39 G Street`, id 111) were deleted by **explicit
+primary key**, not by predicate, after confirming each row individually: both
+holds had `reservation_id IS NULL`, and property 111 had 0 reservations, 0
+decisions, 0 conflicts and 0 listings, so nothing depended on either. The demo
+rows and all 41 audit rows were verified present afterwards.
 
 Staging's 2 synthetic approved decisions and its Airbnb `platform_listings` row
-were also destroyed and are **not** restored by the seed script. Nothing depends
-on them; re-create them only if a future test needs them.
+were destroyed by the B6 run and are **not** restored by the seed script. Nothing
+depends on them; re-create them only if a future test needs them. This is why
+`approvedDecisions` reads 0 where earlier notes said 2.
 
 ### Connection verification (read-only)
 
@@ -215,8 +241,8 @@ on them; re-create them only if a future test needs them.
 /Applications/VacationRentalCalendar.app/Contents/MacOS/vrc cloud check --json
 # Expected: ok:true, and the two demo intervals
 #   (2027-07-01→07-08 reservation, 2027-09-01→09-04 hold).
-# As of 2026-11-09 it ALSO returns two 2027-06 'race' holds — test litter,
-# see the manual DELETE above. approvedDecisions now reads 0, not 2.
+# Verified 2026-11-09 after clean-up: exactly these two, health healthy.
+# approvedDecisions reads 0, not 2 — see the note below.
 ```
 
 The cluster auto-pauses after 5 minutes idle; the first call after a pause can
@@ -238,16 +264,19 @@ so it is safe to re-run and cannot touch anything else.
 ## 5. Test results and parity
 
 ```bash
-swift run vrc-test                      # 352 tests / 1185 assertions — all pass (macOS)
+swift run vrc-test                      # 369 tests / 1223 assertions — all pass (macOS)
 swift run vrc-parity --digest           # b3398471…c604f5
 ./Scripts/build-lambda.sh               # also runs the suite inside Linux; parity must match
 ```
-- macOS: **all 352 pass** (1185 assertions), verified at commit `7e9a99a`.
-- Linux: **350/350 last verified at `08c3bc1`.** The two B6 tests have **not**
-  been run on Linux. They use `DispatchSemaphore` and `DispatchQueue.global()`,
-  which corelibs supports, so they are expected to pass — but expected is not
-  verified. `./Scripts/build-lambda.sh` runs the suite in the container and will
-  settle it. Do that before trusting the Linux number.
+- macOS: **all 369 pass**, verified at commit `096d0ba`. Two assertion counts are
+  both correct: **1223** for a plain `swift run vrc-test`, where the PostgreSQL
+  group skips, and **1242** with that group live (see the gate below).
+- Linux: **350/350 last verified at `08c3bc1`.** The 19 newer tests — 2 from B6,
+  17 from the isolation guard — have **not** been run on Linux. They use
+  `DispatchSemaphore`, `DispatchQueue.global()` and plain enums, all of which
+  corelibs supports, so they are expected to pass — but expected is not verified.
+  `./Scripts/build-lambda.sh` runs the suite in the container and will settle it.
+  Do that before trusting the Linux number.
 - Parity digest **unchanged**: `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5`.
   B6 is test-only, so parity could not move; it was re-checked anyway.
 
@@ -283,9 +312,10 @@ properties **against the deployed system**. `vrc-verify-sigv4 --mac-api <url>`
 already exercises part of B8's shape end to end.
 
 **To run B5/B6 against a cluster** (credentials read from the AWS CLI config into
-the process env, never printed). ⚠️ **This truncates the target database — point
-it at a disposable cluster, never at `vrc-staging-main`.** See the warning at the
-top of this file.
+the process env, never printed). This truncates the target, so the guard will
+refuse unless the cluster is disposable, named disposable, consented to, and
+marked — `vrc-staging-main` is refused outright and cannot be argued with. The
+ARN below is therefore a placeholder for a throwaway cluster, not staging:
 ```bash
 VRC_CLUSTER_ARN="arn:aws:rds:us-east-1:589744711110:cluster:vrc-staging-main" \
 VRC_DB_SECRET_ARN="$(aws secretsmanager describe-secret --secret-id vrc-staging/database/runtime --query ARN --output text)" \
@@ -298,7 +328,8 @@ The suite clears far more than it restores: `reservations`, `holds`,
 `properties`, `events`, `classifications`, `availability_decisions`,
 `platform_listings` and `sync_runs` all go, while
 `Scripts/seed-staging-demo.sql` puts back only the property, one reservation and
-one hold. On a disposable cluster that does not matter, which is the point.
+one hold. On a disposable cluster that does not matter, which is the point — and
+the guard now makes a disposable cluster the only thing it can be.
 
 ---
 
@@ -320,13 +351,14 @@ one hold. On a disposable cluster that does not matter, which is the point.
 
 **Outstanding limitations / not done:**
 - **B7, B8 and Phase C not started; B9 is 3 of 4 layers.** B6 is done (§5).
-- **The integration suite truncates whatever database it is pointed at**, and
-  has no isolation guard. It should grow one — a refusal to run against a
-  cluster not explicitly marked disposable — before it is used this way again.
-  See the warning at the top. This is the single most valuable small change
-  left in the test suite.
-- **Two litter holds remain in staging** from the B6 control test; one DELETE
-  removes them (§4).
+- ~~The integration suite truncates whatever database it is pointed at, and has
+  no isolation guard.~~ **Fixed in `096d0ba`** — see the top of this file.
+- ~~Two litter holds remain in staging.~~ **Removed**, verified row by row (§4).
+- The guard's deny-list is a substring list in Swift
+  (`DestructiveTestIsolation.protectedFragments`). If a future cluster is named
+  something protected-but-unlisted, add it there. The allow-list requirement
+  means an unlisted name is refused by default, so the failure mode of
+  forgetting is a refusal, not a deletion.
 - No real feeds import yet (the feed-diff experiment and the schedule decision
   are pending — see §10).
 - The `vrc_runtime` role cannot `DELETE` from `events`/`availability_audit` (by
@@ -374,9 +406,21 @@ pg_ctl -D "$PGDIR" -o "-p 54407 -c unix_socket_directories=" -l "$PGDIR/pg.log" 
 createdb -h 127.0.0.1 -p 54407 -U vrctest vrc
 psql -h 127.0.0.1 -p 54407 -U vrctest -d vrc -f Migrations/postgres/010_repository_schema.sql
 psql -h 127.0.0.1 -p 54407 -U vrctest -d vrc -f Migrations/postgres/011_safety.sql
+
+# Mark it disposable, or the guard refuses — this is the sandbox saying
+# "my rows may be deleted", and it is required on every target.
+psql -h 127.0.0.1 -p 54407 -U vrctest -d vrc \
+  -c "INSERT INTO app_settings (key, value) VALUES ('disposable_database','true') \
+      ON CONFLICT (key) DO UPDATE SET value='true';"
+
+VRC_DESTRUCTIVE_TESTS=i-understand-this-truncates \
 VRC_PG_PORT=54407 swift run vrc-test "PostgreSQL integration"
 pg_ctl -D "$PGDIR" stop            # and throw the cluster away
 ```
+
+Forget either the variable or the marker and the group **fails loudly** rather
+than skipping — the refusal names exactly what is missing and what to do. That
+is deliberate: a silent skip would let someone believe these tests had run.
 
 ---
 
@@ -465,14 +509,24 @@ Teardown (reversible, staging only): `./Scripts/staging-teardown.sh --destroy`.
 
 Ordered. **Each of these is a new task; the project is paused here.**
 
-0. **First, two small clean-ups left by the B6 round:** remove the two litter
-   holds from staging (one DELETE, §4), and give the integration suite an
-   isolation guard so it cannot truncate a shared cluster again (§6). Neither is
-   urgent; both are quick, and the second prevents a repeat of a real mistake.
-1. **Finish staging validation:** ~~B6 (concurrency / no double booking)~~ **done**;
-   B7 (idempotency), B8 (interrupted write → UNKNOWN), B9 (layer 3 of 4 still
-   unverified), Phase C (PITR drill into a temporary cluster, then delete it).
-   Run B7/B8 against a disposable cluster, not `vrc-staging-main`.
+1. **Finish staging validation.** ~~B6 (concurrency / no double booking)~~
+   **done**; ~~isolation guard~~ **done**; ~~staging litter~~ **done**.
+   Remaining: **B7** (idempotency), **B8** (interrupted write → UNKNOWN),
+   **B9 layer 3** (the Terraform `precondition`, the one layer of four still
+   unverified), **Phase C** (PITR drill into a temporary cluster, then delete
+   it), and **the Linux suite run** for the 19 newer tests.
+
+   Two decisions to make before starting B7/B8, neither of which should be made
+   silently:
+   - **Where do they run?** They do not truncate, so the guard does not block
+     them against staging — but B7 writes a decision row and `idempotency_keys`
+     cannot be cleaned by the runtime role, so every run leaves a permanent key
+     behind. Use a fresh `publicationUID` per run, or run them on a disposable
+     cluster, which is cleaner but needs one created.
+   - **Phase C creates a real AWS cluster.** `restore-db-cluster-to-point-in-time`
+     is a resource-creating operation and needs explicit owner approval before it
+     is run, per CLAUDE.md. It also happens to produce exactly the disposable,
+     `pitr`-named cluster the guard accepts, so it is the natural host for B7/B8.
 2. **Prepare real imports (read-only):** confirm the Airbnb/Vrbo feed URLs read
    from the Keychain via the `vrc` helper; run the live feed-diff to measure the
    change-detection hit rate (decides the ~$5.76 vs ~$19.95/mo import cadence);
