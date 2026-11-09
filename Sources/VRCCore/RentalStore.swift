@@ -91,6 +91,11 @@ public final class RentalStore: @unchecked Sendable {
     /// fallback: a feed URL is a bearer credential for the owner's whole
     /// booking calendar, and silently downgrading its protection would be worse
     /// than failing visibly.
+    /// The real, on-disk store. Keychain-backed, so Apple platforms only.
+    /// Linux builds use `makeInMemory()` or construct a store with their own
+    /// credential source: on the server the credentials come from Secrets
+    /// Manager, not from a Keychain.
+    #if canImport(Security)
     public static func makeDefault() throws -> RentalStore {
         AppPaths.ensureDirectories()
         let keychain = KeychainFeedCredentialStore(
@@ -101,6 +106,7 @@ public final class RentalStore: @unchecked Sendable {
             credentials: DeadlineFeedCredentialStore(wrapping: keychain)
         )
     }
+    #endif
 
     /// A throwaway store for tests.
     public static func makeInMemory() throws -> RentalStore {
