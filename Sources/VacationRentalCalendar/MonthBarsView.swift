@@ -100,9 +100,11 @@ private struct WeekBarRow: View {
                         DayBackground(
                             day: day,
                             isInMonth: DayMath.utcCalendar.component(.month, from: day) == monthNumber,
+                            isSelected: state.isDayInSelection(day),
                             height: rowHeight
                         )
                         .frame(width: columnWidth)
+                        .onTapGesture { state.selectDay(day) }
                     }
                 }
 
@@ -145,6 +147,7 @@ private struct WeekBarRow: View {
 private struct DayBackground: View {
     let day: Date
     let isInMonth: Bool
+    var isSelected = false
     let height: CGFloat
 
     private var isToday: Bool {
@@ -171,10 +174,16 @@ private struct DayBackground: View {
             Spacer(minLength: 0)
         }
         .frame(height: height, alignment: .top)
-        .background(isInMonth
-                    ? Color(nsColor: .controlBackgroundColor)
-                    : Color(nsColor: .windowBackgroundColor))
-        .overlay(Rectangle().strokeBorder(.quaternary, lineWidth: 0.5))
+        .background(isSelected
+                    ? Color.accentColor.opacity(0.14)
+                    : (isInMonth
+                       ? Color(nsColor: .controlBackgroundColor)
+                       : Color(nsColor: .windowBackgroundColor)))
+        .overlay(Rectangle().strokeBorder(
+            isSelected ? Color.accentColor.opacity(0.55) : Color.secondary.opacity(0.18),
+            lineWidth: isSelected ? 1 : 0.5
+        ))
+        .contentShape(Rectangle())
     }
 
     private var numberColor: Color {
@@ -244,5 +253,71 @@ struct FeedWarningBanner: View {
         let feeds = warnings.map { $0.platform.displayName }.joined(separator: " and ")
         return "\(feeds) sent no detail that identifies a booking — "
             + "\(nights) night\(nights == 1 ? "" : "s") waiting on your decision"
+    }
+}
+
+
+/// Appears over the calendar once nights are selected, offering the one thing
+/// the owner is likely to want next.
+struct RangeSelectionBar: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        if state.selectedNights > 0, let range = state.selectedRange {
+            HStack(spacing: 10) {
+                Image(systemName: "calendar.badge.checkmark")
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(state.selectedNights) night"
+                        + "\(state.selectedNights == 1 ? "" : "s") selected")
+                        .font(.caption.weight(.medium))
+                    Text("\(DayMath.mediumString(range.start)) to "
+                        + "\(DayMath.mediumString(DayMath.adding(days: -1, to: range.end)))"
+                        + " · \(DayMath.mediumString(range.end)) stays free to arrive")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Clear") { state.clearRange() }
+                    .controlSize(.small)
+                Button("Manage availability") {
+                    state.selectedSection = .availability
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.regularMaterial)
+            .overlay(alignment: .top) { Divider() }
+        }
+    }
+}
+
+/// Holds the editor and the destination status side by side under one heading.
+struct AvailabilityPane: View {
+    @EnvironmentObject var state: AppState
+    @State private var tab: Tab = .editor
+
+    enum Tab: String, CaseIterable, Identifiable {
+        case editor, status
+        var id: String { rawValue }
+        var title: String { self == .editor ? "Plan changes" : "Destination status" }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $tab) {
+                ForEach(Tab.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 320)
+            .padding(10)
+            Divider()
+            switch tab {
+            case .editor: AvailabilityEditorView()
+            case .status: SyncStatusView()
+            }
+        }
     }
 }

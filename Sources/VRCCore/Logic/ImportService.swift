@@ -6,17 +6,21 @@ public struct ImportReport: Sendable {
     /// Keys whose classification the import left alone because the owner had
     /// already decided them.
     public var preservedDecisions: Int
+    /// Decisions kept, but sent back for review because the event changed.
+    public var reReviewed: Int
     public var productID: String
 
     public init(
         run: SyncRun,
         warnings: [String] = [],
         preservedDecisions: Int = 0,
+        reReviewed: Int = 0,
         productID: String = ""
     ) {
         self.run = run
         self.warnings = warnings
         self.preservedDecisions = preservedDecisions
+        self.reReviewed = reReviewed
         self.productID = productID
     }
 }
@@ -151,6 +155,8 @@ public struct ImportService: Sendable {
             )
 
             do {
+                // Captured before the upsert so a material change can be seen.
+                let previous = try events.find(eventKey: key)
                 let result = try events.upsert(event, seenAt: now)
                 switch result {
                 case .inserted: report.run.eventsInserted += 1
@@ -165,7 +171,28 @@ public struct ImportService: Sendable {
                 let existing = try classifications.find(eventKey: key)
                 if let existing, existing.isLocked {
                     report.preservedDecisions += 1
-                    if existing.needsReview { report.run.eventsNeedingReview += 1 }
+
+                    // R5: the decision stands, but if the platform changed the
+                    // event materially it may no longer describe it, so it goes
+                    // back to the queue rather than silently continuing to apply.
+                    var kept = existing
+                    if let previous, result == .updated {
+                        let assessment = MaterialChange.assess(
+                            previous: previous, updated: event, platform: listing.platform
+                        )
+                        if assessment.isMaterial, !existing.needsReview {
+                            kept = MaterialChange.flagForReReview(
+                                existing, assessment: assessment, at: now
+                            )
+                            try classifications.save(kept)
+                            report.reReviewed += 1
+                            report.warnings.append(
+                                "\(listing.platform.displayName): "
+                                    + "\(assessment.explanation) Sent back for review."
+                            )
+                        }
+                    }
+                    if kept.needsReview { report.run.eventsNeedingReview += 1 }
                 } else {
                     let proposal = classifier.classify(
                         event: icalEvent,

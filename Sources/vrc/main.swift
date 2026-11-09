@@ -48,6 +48,9 @@ func runHelp() {
       vrc conflicts                Show overlapping ranges
       vrc export --property <id> [--to airbnb|vrbo|booking_com] [--write <path>]
                                    Build a filtered feed and show what was excluded
+      vrc feed --property <id> --to <platform> [--raw]
+                                   Show the feed a destination would receive
+      vrc availability             List availability decisions and audit history
       vrc doctor                   Check the database, Keychain and outbound gate
 
     KINDS
@@ -282,6 +285,53 @@ func runExport() {
     }
 }
 
+/// Shows the feed a destination would receive, entry by entry, with reasons.
+func runFeed() {
+    let store = makeStore()
+    guard let propertyID = value(for: "--property").flatMap(Int64.init) else {
+        bail("--property <id> is required")
+    }
+    guard let raw = value(for: "--to"), let destination = RentalPlatform(rawValue: raw) else {
+        bail("--to must be one of: airbnb, vrbo, booking_com")
+    }
+    do {
+        let feed = try store.outbound.generateFeed(propertyID: propertyID, destination: destination)
+        print(CalendarFeedGenerator().auditText(feed))
+        print("")
+        print("Outbound publishing: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
+        if flags.contains("--raw") {
+            print("")
+            print(CalendarFeedGenerator().makeICS(feed))
+        }
+    } catch {
+        bail("feed generation failed: \(error)")
+    }
+}
+
+func runAvailability() {
+    let store = makeStore()
+    do {
+        let decisions = try store.availability.all()
+        if decisions.isEmpty {
+            print("No availability decisions recorded.")
+        } else {
+            for decision in decisions {
+                print("[\(decision.id ?? 0)] \(decision.summaryLine)")
+                print("     status: \(decision.status.rawValue) — \(decision.status.explanation)")
+                if let reason = decision.failureReason { print("     refused: \(reason)") }
+            }
+        }
+        print("")
+        let audit = try store.auditLog.recent(limit: 20)
+        if !audit.isEmpty {
+            print("Recent audit entries:")
+            for entry in audit.reversed() { print("  \(entry.line)") }
+        }
+    } catch {
+        bail("availability listing failed: \(error)")
+    }
+}
+
 func runDoctor() {
     let store = makeStore()
     var problems = 0
@@ -328,6 +378,8 @@ case "import": await runImport()
 case "review": runReview()
 case "classify": runClassify()
 case "conflicts": runConflicts()
+case "feed": runFeed()
+case "availability": runAvailability()
 case "export": runExport()
 case "doctor": runDoctor()
 case "help", "--help", "-h": runHelp()

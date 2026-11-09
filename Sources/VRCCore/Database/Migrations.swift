@@ -127,6 +127,94 @@ public enum Migrator {
         ALTER TABLE platform_listings
             ADD COLUMN credential_ref TEXT NOT NULL DEFAULT '';
         """),
+
+        // Versions 5-9 are reserved for the in-flight iOS/CloudKit branch, which
+        // already claims 5. Availability starts at 10 so the two can merge
+        // without renumbering either one.
+        Migration(version: 10, name: "availability_decisions", sql: """
+        -- A property's nights are counted in its own time zone, so a decision
+        -- made for "10-15 December" means the same nights wherever the owner is.
+        ALTER TABLE properties ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'UTC';
+
+        -- An availability decision is the owner's intent. It is deliberately a
+        -- separate table from `events`: imported source events are a record of
+        -- what a platform said, and must never be edited to express something
+        -- the owner wants.
+        CREATE TABLE availability_decisions (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id           INTEGER NOT NULL
+                                  REFERENCES properties(id) ON DELETE CASCADE,
+            destination           TEXT NOT NULL,
+            action                TEXT NOT NULL,
+            start_day             REAL NOT NULL,
+            end_day               REAL NOT NULL,
+            status                TEXT NOT NULL,
+            reason                TEXT NOT NULL DEFAULT '',
+            publication_uid       TEXT NOT NULL,
+            created_at            REAL NOT NULL,
+            updated_at            REAL NOT NULL,
+            validated_at          REAL,
+            approved_at           REAL,
+            approved_by           TEXT,
+            published_at          REAL,
+            refresh_expected_by   REAL,
+            verified_at           REAL,
+            cancelled_at          REAL,
+            failure_reason        TEXT,
+            supersedes_id         INTEGER,
+            created_by            TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_decisions_property ON availability_decisions(property_id, destination);
+        CREATE INDEX idx_decisions_range    ON availability_decisions(start_day, end_day);
+        CREATE INDEX idx_decisions_status   ON availability_decisions(status);
+        CREATE UNIQUE INDEX idx_decisions_uid ON availability_decisions(publication_uid);
+
+        -- Append-only. Rows are never updated or deleted, so the history of who
+        -- approved what, and when, survives any later change of mind.
+        CREATE TABLE availability_audit (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id  INTEGER,
+            at           REAL NOT NULL,
+            actor        TEXT NOT NULL DEFAULT '',
+            from_status  TEXT,
+            to_status    TEXT,
+            event        TEXT NOT NULL,
+            detail       TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_audit_decision ON availability_audit(decision_id, at);
+
+        -- The third concept: what was actually written into a destination feed.
+        -- Kept so a published entry can be traced back to the decision or source
+        -- event that justified it, and so stable UIDs survive regeneration.
+        CREATE TABLE feed_publications (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            destination   TEXT NOT NULL,
+            property_id   INTEGER NOT NULL,
+            revision      INTEGER NOT NULL,
+            generated_at  REAL NOT NULL,
+            entry_count   INTEGER NOT NULL DEFAULT 0,
+            checksum      TEXT NOT NULL DEFAULT '',
+            status        TEXT NOT NULL DEFAULT 'generated',
+            published_at  REAL,
+            detail        TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_publications_dest
+            ON feed_publications(property_id, destination, revision DESC);
+
+        CREATE TABLE published_feed_entries (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            publication_id  INTEGER NOT NULL
+                            REFERENCES feed_publications(id) ON DELETE CASCADE,
+            entry_uid       TEXT NOT NULL,
+            origin          TEXT NOT NULL,
+            source_event_key TEXT,
+            decision_id     INTEGER,
+            start_day       REAL NOT NULL,
+            end_day         REAL NOT NULL,
+            summary         TEXT NOT NULL
+        );
+        CREATE INDEX idx_entries_publication ON published_feed_entries(publication_id);
+        """),
     ]
 
     public static var latestVersion: Int {
