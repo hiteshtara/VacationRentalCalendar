@@ -1,5 +1,6 @@
 import SwiftUI
 import VRCCore
+import VRCUI
 import AppKit
 
 struct ExportView: View {

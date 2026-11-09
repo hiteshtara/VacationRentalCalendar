@@ -8,8 +8,8 @@ import VRCCore
 /// So a confirmed reservation is a solid block, and an Airbnb cancellation
 /// block — the thing this app exists to protect — is drawn as an outline,
 /// because those nights are still yours to sell.
-enum Theme {
-    static func color(for kind: BlockKind) -> Color {
+public enum Theme {
+    public static func color(for kind: BlockKind) -> Color {
         switch kind {
         case .confirmedReservation: return Color(red: 0.14, green: 0.66, blue: 0.42)
         case .ownerBlock: return Color(red: 0.24, green: 0.43, blue: 0.94)
@@ -20,11 +20,11 @@ enum Theme {
     }
 
     /// True when the dates remain sellable elsewhere, and so are drawn hollow.
-    static func isSellable(_ classification: EventClassification) -> Bool {
+    public static func isSellable(_ classification: EventClassification) -> Bool {
         !classification.kind.describesGenuineUnavailability || classification.needsReview
     }
 
-    static func symbol(for kind: BlockKind) -> String {
+    public static func symbol(for kind: BlockKind) -> String {
         switch kind {
         case .confirmedReservation: return "person.fill.checkmark"
         case .ownerBlock: return "house.fill"
@@ -34,7 +34,7 @@ enum Theme {
         }
     }
 
-    static func color(for platform: RentalPlatform) -> Color {
+    public static func color(for platform: RentalPlatform) -> Color {
         switch platform {
         case .airbnb: return Color(red: 1.0, green: 0.35, blue: 0.37)
         case .vrbo: return Color(red: 0.24, green: 0.43, blue: 0.94)
@@ -45,14 +45,19 @@ enum Theme {
 }
 
 /// A coloured chip for one event, hollow when the dates stay sellable.
-struct EventChip: View {
+public struct EventChip: View {
     let item: ClassifiedEvent
     var compact = false
+
+    public init(item: ClassifiedEvent, compact: Bool = false) {
+        self.item = item
+        self.compact = compact
+    }
 
     private var tint: Color { Theme.color(for: item.classification.kind) }
     private var sellable: Bool { Theme.isSellable(item.classification) }
 
-    var body: some View {
+    public var body: some View {
         HStack(spacing: 4) {
             if !compact {
                 Image(systemName: Theme.symbol(for: item.classification.kind))
@@ -86,8 +91,10 @@ struct EventChip: View {
 }
 
 /// Explains the fill-versus-outline rule wherever the calendar is shown.
-struct LegendBar: View {
-    var body: some View {
+public struct LegendBar: View {
+    public init() {}
+
+    public var body: some View {
         HStack(spacing: 14) {
             ForEach(BlockKind.allCases) { kind in
                 HStack(spacing: 5) {

@@ -118,6 +118,42 @@ public enum Migrator {
             ON events(listing_id, is_tombstoned);
         """),
 
+        Migration(version: 5, name: "cloudkit_sync_metadata", sql: """
+        -- Every synchronised row carries when it last changed and the CloudKit
+        -- change tag it was last seen with, so a merge can tell which side is
+        -- newer and whether the server copy has moved on.
+        ALTER TABLE properties        ADD COLUMN modified_at REAL NOT NULL DEFAULT 0;
+        ALTER TABLE properties        ADD COLUMN cloud_tag TEXT NOT NULL DEFAULT '';
+        ALTER TABLE platform_listings ADD COLUMN modified_at REAL NOT NULL DEFAULT 0;
+        ALTER TABLE platform_listings ADD COLUMN cloud_tag TEXT NOT NULL DEFAULT '';
+        ALTER TABLE events            ADD COLUMN modified_at REAL NOT NULL DEFAULT 0;
+        ALTER TABLE events            ADD COLUMN cloud_tag TEXT NOT NULL DEFAULT '';
+        ALTER TABLE classifications   ADD COLUMN modified_at REAL NOT NULL DEFAULT 0;
+        ALTER TABLE classifications   ADD COLUMN cloud_tag TEXT NOT NULL DEFAULT '';
+        -- Which device made a decision, used only to break an exact timestamp
+        -- tie so that two devices reach the same answer independently.
+        ALTER TABLE classifications   ADD COLUMN device_id TEXT NOT NULL DEFAULT '';
+
+        CREATE TABLE sync_state (
+            zone_name     TEXT PRIMARY KEY,
+            change_token  BLOB,
+            last_sync_at  REAL,
+            last_error    TEXT
+        );
+
+        -- When two devices disagree about what a block is, the merge takes the
+        -- safe option and records the disagreement here rather than silently
+        -- picking a winner the owner never sees.
+        CREATE TABLE sync_conflicts (
+            event_key     TEXT PRIMARY KEY,
+            local_kind    TEXT NOT NULL,
+            remote_kind   TEXT NOT NULL,
+            resolved_kind TEXT NOT NULL,
+            detected_at   REAL NOT NULL,
+            resolved      INTEGER NOT NULL DEFAULT 0
+        );
+        """),
+
         Migration(version: 4, name: "secure_feed_urls", sql: """
         -- A platform iCal export URL is a bearer credential: whoever holds it
         -- can read the listing's whole booking calendar. It therefore moves out

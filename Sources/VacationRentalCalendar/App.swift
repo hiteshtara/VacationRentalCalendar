@@ -1,6 +1,7 @@
 import SwiftUI
 import ServiceManagement
 import VRCCore
+import VRCUI
 
 /// Wraps the Launch at Login service so the UI can offer it only when it will
 /// actually work — it needs a real `.app` bundle, so it is unavailable when the

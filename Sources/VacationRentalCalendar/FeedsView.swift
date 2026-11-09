@@ -1,5 +1,6 @@
 import SwiftUI
 import VRCCore
+import VRCUI
 
 struct FeedsView: View {
     @EnvironmentObject var state: AppState

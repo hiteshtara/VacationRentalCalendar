@@ -66,23 +66,40 @@ public struct KeychainFeedCredentialStore: FeedCredentialStore {
     /// Extra executables added to each new item's ACL, so one grant covers both
     /// the app bundle and the `vrc` command-line tool.
     public let additionalTrustedPaths: [String]
+    /// Whether items are marked for iCloud Keychain.
+    ///
+    /// Off by default, deliberately. Feed URLs are set up once per device so
+    /// that adding the iPhone is an explicit act rather than a side effect of
+    /// being signed into the same Apple Account — and so that a device you no
+    /// longer control does not silently keep working. Turn it on only if you
+    /// would rather type each URL once instead of once per device.
+    public let synchronizable: Bool
 
     public init(
         service: String = "com.vacationrentalcalendar.feed-url",
-        additionalTrustedPaths: [String] = []
+        additionalTrustedPaths: [String] = [],
+        synchronizable: Bool = false
     ) {
         self.service = service
         self.additionalTrustedPaths = additionalTrustedPaths
+        self.synchronizable = synchronizable
     }
 
-    public var storageDescription: String { "macOS Keychain (login)" }
+    public var storageDescription: String {
+        synchronizable ? "macOS Keychain (iCloud, shared with your devices)" : "macOS Keychain (this device)"
+    }
 
     private func baseQuery(_ reference: String) -> [String: Any] {
-        [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: reference,
         ]
+        // Matching must be explicit about synchronizable, or a search finds
+        // only the local items and silently misses the iCloud ones.
+        query[kSecAttrSynchronizable as String] = synchronizable
+            ? kCFBooleanTrue : kSecAttrSynchronizableAny
+        return query
     }
 
     /// Builds an ACL naming this process plus any extra executables. Returns
@@ -128,13 +145,16 @@ public struct KeychainFeedCredentialStore: FeedCredentialStore {
         }
 
         var attributes = query
+        attributes[kSecAttrSynchronizable as String] = synchronizable
         attributes[kSecValueData as String] = data
         attributes[kSecAttrLabel as String] = "Vacation Rental Calendar feed URL"
         attributes[kSecAttrDescription as String] = "Private platform calendar export URL"
         attributes[kSecAttrComment as String] =
             "Read-only iCal export URL. Treat as a password: anyone holding it can read this "
             + "listing's booking calendar."
-        if let access = makeAccess() {
+        // A synchronisable item cannot carry a per-application ACL — iCloud
+        // Keychain items are reachable by the whole app group instead.
+        if !synchronizable, let access = makeAccess() {
             attributes[kSecAttrAccess as String] = access
         }
 
