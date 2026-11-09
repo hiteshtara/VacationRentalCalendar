@@ -1,0 +1,337 @@
+import Foundation
+import VRCCore
+
+// Headless control surface for the same core the SwiftUI app uses. Useful for
+// verifying an import without opening the window, and for scripting.
+
+let arguments = Array(CommandLine.arguments.dropFirst())
+let command = arguments.first ?? "help"
+let flags = Set(arguments.dropFirst().filter { $0.hasPrefix("--") })
+
+func value(for flag: String) -> String? {
+    guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { return nil }
+    return arguments[index + 1]
+}
+
+func bail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data(("error: " + message + "\n").utf8))
+    exit(1)
+}
+
+func makeStore() -> RentalStore {
+    do {
+        if flags.contains("--memory") { return try RentalStore.makeInMemory() }
+        return try RentalStore.makeDefault()
+    } catch {
+        bail("could not open the database: \(error)")
+    }
+}
+
+func pad(_ text: String, _ width: Int) -> String {
+    text.count >= width ? text : text + String(repeating: " ", count: width - text.count)
+}
+
+// MARK: - Commands
+
+func runHelp() {
+    print("""
+    vrc — Vacation Rental Calendar, headless
+
+    USAGE
+      vrc seed                     Insert the configured properties and listings
+      vrc set-url --listing <id>   Store a feed URL (read from stdin, never argv)
+      vrc status                   Show properties, listings, events, review queue
+      vrc import [--listing <id>]  Fetch feeds read-only and reconcile
+      vrc review                   List everything awaiting your decision
+      vrc classify --key <k> --kind <kind> [--approve]
+                                   Record a manual decision
+      vrc conflicts                Show overlapping ranges
+      vrc export --property <id> [--to airbnb|vrbo|booking_com] [--write <path>]
+                                   Build a filtered feed and show what was excluded
+      vrc doctor                   Check the database, Keychain and outbound gate
+
+    KINDS
+      \(BlockKind.allCases.map(\.rawValue).joined(separator: ", "))
+
+    GLOBAL FLAGS
+      --memory                     Throwaway in-memory database
+
+    Feed URLs live in the macOS Keychain. There is no plaintext fallback.
+
+    Database: \(AppPaths.databaseURL.path)
+    """)
+}
+
+/// Reads a feed URL from stdin so the secret never appears in a command line,
+/// a shell history or a process list.
+func runSetURL() {
+    let store = makeStore()
+    guard let listingID = value(for: "--listing").flatMap(Int64.init) else {
+        bail("--listing <id> is required (see `vrc status`)")
+    }
+    guard let listing = try? store.listings.find(id: listingID), listing.id != nil else {
+        bail("no listing with id \(listingID)")
+    }
+    FileHandle.standardError.write(Data("Paste the iCal export URL, then press Return:\n".utf8))
+    guard let line = readLine(strippingNewline: true)?
+        .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
+        bail("no URL supplied")
+    }
+    guard line.lowercased().hasPrefix("https://") || line.lowercased().hasPrefix("webcal://") else {
+        bail("the URL must use https (or webcal) — a plain http feed would leak your calendar token")
+    }
+    var updated = listing
+    updated.icalURL = line
+    updated.urlStorage = .keychain
+    if updated.credentialRef.isEmpty {
+        updated.credentialRef = ListingRepository.credentialReference(
+            platform: listing.platform, listingLabel: listing.label
+        )
+    }
+    do {
+        try store.listings.update(updated)
+        print("Stored for \(listing.label) in \(store.credentials.storageDescription).")
+        print("Reference: \(updated.credentialRef)")
+        print("The URL is not written to the database or to any file in the project.")
+    } catch {
+        bail("could not store the URL: \(error)")
+    }
+}
+
+func runSeed() {
+    let store = makeStore()
+    do {
+        let created = try SeedData.apply(to: store)
+        if created.isEmpty {
+            print("Nothing to do — the configured properties already exist.")
+        } else {
+            print("Created:")
+            for line in created { print("  \(line)") }
+        }
+    } catch {
+        bail("seeding failed: \(error)")
+    }
+}
+
+func runStatus() {
+    let store = makeStore()
+    do {
+        let properties = try store.properties.all()
+        let listings = try store.listings.all()
+        let classified = try store.classifiedEvents()
+        let review = try store.needsReview()
+        let conflicts = try store.conflicts()
+
+        print("Schema version: \(try Migrator.currentVersion(store.database)) "
+            + "of \(Migrator.latestVersion)")
+        print("Database:       \(store.database.path)")
+        print("Feed URLs:      \(store.credentials.storageDescription)")
+        print("Outbound sync:  \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
+        print("")
+
+        for property in properties {
+            guard let propertyID = property.id else { continue }
+            print("\(property.name)  —  \(property.address)")
+            for listing in listings where listing.propertyID == propertyID {
+                let events = try store.events.countForListing(listing.id ?? 0)
+                let urlState = store.listings.hasCredential(for: listing)
+                    ? "URL in Keychain" : "no URL"
+                print("  \(pad(listing.platform.displayName, 12)) "
+                    + "\(pad(urlState, 18)) "
+                    + "\(events) events  "
+                    + "\(listing.lastSyncSummary.isEmpty ? "never synced" : listing.lastSyncSummary)")
+            }
+        }
+
+        print("")
+        print("Events:        \(classified.count) active")
+        var byKind: [BlockKind: Int] = [:]
+        for item in classified { byKind[item.classification.kind, default: 0] += 1 }
+        for kind in BlockKind.allCases where (byKind[kind] ?? 0) > 0 {
+            let nights = classified
+                .filter { $0.classification.kind == kind }
+                .reduce(0) { $0 + $1.event.nights }
+            print("  \(pad(kind.displayName, 24)) \(byKind[kind] ?? 0) events, \(nights) nights")
+        }
+        print("Needs review:  \(review.count)")
+        print("Double bookings: \(conflicts.filter { $0.severity == .doubleBooking }.count)")
+        print("Other overlaps:  \(conflicts.filter { $0.severity == .overlappingBlocks }.count)")
+    } catch {
+        bail("status failed: \(error)")
+    }
+}
+
+func runImport() async {
+    let store = makeStore()
+    do {
+        var listings = try store.listings.all()
+        if let wanted = value(for: "--listing").flatMap(Int64.init) {
+            listings = listings.filter { $0.id == wanted }
+        }
+        guard !listings.isEmpty else { bail("no listings configured — run `vrc seed` first") }
+
+        let service = store.makeImportService(
+            fetcher: URLSessionFeedFetcher(allowFileURLs: flags.contains("--allow-file"))
+        )
+
+        for listing in listings {
+            print("── \(listing.label)")
+            let report = await service.importFeed(for: listing)
+            print("   outcome:   \(report.run.outcome.rawValue)"
+                + (report.run.httpStatus.map { " (HTTP \($0))" } ?? ""))
+            if let error = report.run.errorMessage { print("   error:     \(error)") }
+            if !report.productID.isEmpty { print("   producer:  \(report.productID)") }
+            print("   in feed:   \(report.run.eventsSeen)")
+            print("   new:       \(report.run.eventsInserted)")
+            print("   changed:   \(report.run.eventsUpdated)")
+            print("   removed:   \(report.run.eventsTombstoned)")
+            print("   to review: \(report.run.eventsNeedingReview)")
+            if report.preservedDecisions > 0 {
+                print("   your prior decisions kept: \(report.preservedDecisions)")
+            }
+            for warning in report.warnings.prefix(5) { print("   note:      \(warning)") }
+        }
+    } catch {
+        bail("import failed: \(error)")
+    }
+}
+
+func runReview() {
+    let store = makeStore()
+    do {
+        let review = try store.needsReview()
+        guard !review.isEmpty else { print("Nothing is waiting for review."); return }
+        print("\(review.count) item(s) awaiting your decision:\n")
+        for item in review {
+            print("\(item.event.platform.displayName) · \(item.propertyName)")
+            print("  \(DayMath.mediumString(item.event.checkIn)) → "
+                + "\(DayMath.mediumString(item.event.checkOut))  (\(item.event.nights) nights)")
+            print("  feed says:  \"\(item.event.summary)\"")
+            print("  app thinks: \(item.classification.kind.displayName) "
+                + "(\(item.classification.confidence.displayName) confidence)")
+            print("  why:        \(item.classification.rationale)")
+            print("  key:        \(item.event.eventKey)")
+            print("")
+        }
+    } catch {
+        bail("review failed: \(error)")
+    }
+}
+
+func runClassify() {
+    let store = makeStore()
+    guard let key = value(for: "--key") else { bail("--key is required") }
+    guard let kindRaw = value(for: "--kind"), let kind = BlockKind(rawValue: kindRaw) else {
+        bail("--kind must be one of: \(BlockKind.allCases.map(\.rawValue).joined(separator: ", "))")
+    }
+    do {
+        try store.classifyManually(
+            eventKey: key,
+            kind: kind,
+            note: value(for: "--note") ?? "",
+            approveForExport: flags.contains("--approve") ? true : nil
+        )
+        print("Recorded: \(kind.displayName)"
+            + (flags.contains("--approve") ? ", approved for export" : ""))
+        if !kind.describesGenuineUnavailability {
+            print("These dates will never be exported, which keeps them sellable elsewhere.")
+        }
+    } catch {
+        bail("classify failed: \(error)")
+    }
+}
+
+func runConflicts() {
+    let store = makeStore()
+    do {
+        let conflicts = try store.conflicts()
+        guard !conflicts.isEmpty else { print("No overlapping ranges found."); return }
+        for conflict in conflicts {
+            let marker = conflict.severity.isUrgent ? "!! " : "   "
+            print("\(marker)\(conflict.severity.displayName) · \(conflict.propertyName)")
+            print("   \(conflict.dateRangeDescription)  (\(conflict.overlapNights) nights)")
+            print("   A: \(conflict.sideA.platform.displayName) \"\(conflict.sideA.summary)\" "
+                + "\(DayMath.mediumString(conflict.sideA.checkIn))→"
+                + "\(DayMath.mediumString(conflict.sideA.checkOut))")
+            print("   B: \(conflict.sideB.platform.displayName) \"\(conflict.sideB.summary)\" "
+                + "\(DayMath.mediumString(conflict.sideB.checkIn))→"
+                + "\(DayMath.mediumString(conflict.sideB.checkOut))")
+            print("")
+        }
+    } catch {
+        bail("conflict check failed: \(error)")
+    }
+}
+
+func runExport() {
+    let store = makeStore()
+    guard let propertyID = value(for: "--property").flatMap(Int64.init) else {
+        bail("--property <id> is required")
+    }
+    let destination = value(for: "--to").flatMap { RentalPlatform(rawValue: $0) }
+    do {
+        let plan = try store.exportPlan(propertyID: propertyID, destination: destination)
+        print(store.exporter.auditText(for: plan))
+        if let path = value(for: "--write") {
+            let url = URL(fileURLWithPath: path)
+            try store.exporter.write(plan: plan, to: url)
+            print("\nWrote \(plan.included.count) event(s) to \(url.path)")
+        }
+    } catch {
+        bail("export failed: \(error)")
+    }
+}
+
+func runDoctor() {
+    let store = makeStore()
+    var problems = 0
+    func check(_ label: String, _ ok: Bool, _ detail: String = "") {
+        print("\(ok ? "ok  " : "FAIL") \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+        if !ok { problems += 1 }
+    }
+    do {
+        let version = try Migrator.currentVersion(store.database)
+        check("schema at latest version", version == Migrator.latestVersion,
+              "at \(version), latest \(Migrator.latestVersion)")
+        check("outbound sync disabled", !OutboundSyncGate.isEnabled)
+        check("no feed URL stored in the database",
+              !(try store.listings.databaseLeaksAnyKeychainURL()))
+
+        for listing in try store.listings.all() {
+            let stored = store.listings.hasCredential(for: listing)
+            check("feed URL stored for \(listing.label)", stored,
+                  stored ? "Keychain: \(listing.credentialRef)"
+                         : "nothing under \(listing.credentialRef)")
+        }
+        print("")
+        let signature = CodeSignatureInfo.current()
+        check("code signature survives a rebuild", signature.kind.survivesRebuild,
+              signature.kind.rawValue)
+        print("")
+        print("Credential store: \(store.credentials.storageDescription)")
+        print("Code signature:   \(signature.kind.rawValue)"
+            + (signature.authority.map { " — \($0)" } ?? ""))
+        print(signature.explanation)
+    } catch {
+        bail("doctor failed: \(error)")
+    }
+    exit(problems == 0 ? 0 : 1)
+}
+
+// MARK: - Dispatch
+
+switch command {
+case "seed": runSeed()
+case "set-url": runSetURL()
+case "status": runStatus()
+case "import": await runImport()
+case "review": runReview()
+case "classify": runClassify()
+case "conflicts": runConflicts()
+case "export": runExport()
+case "doctor": runDoctor()
+case "help", "--help", "-h": runHelp()
+default:
+    runHelp()
+    exit(1)
+}

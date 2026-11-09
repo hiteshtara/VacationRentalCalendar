@@ -1,0 +1,44 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+*.xcuserdatad
+Package.resolved
+
+# Build output
+dist/
+build/
+*.app/
+
+# macOS
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Never commit any of the following.
+# ---------------------------------------------------------------------------
+
+# Private platform calendar URLs. These are bearer credentials: anyone holding
+# one can read the listing's entire booking calendar. They belong in the
+# Keychain and nowhere else.
+feed-credentials.json
+*.feedurl
+secrets/
+Samples/private/
+
+# Local databases — these contain guest-adjacent reservation data.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Real calendar exports pulled from the platforms.
+*.ics
+!Samples/*.ics
+
+# Code-signing material.
+*.p12
+*.pem
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.keychain
+*.keychain-db

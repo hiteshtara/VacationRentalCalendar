@@ -1,0 +1,215 @@
+import Foundation
+
+public struct ImportReport: Sendable {
+    public var run: SyncRun
+    public var warnings: [String]
+    /// Keys whose classification the import left alone because the owner had
+    /// already decided them.
+    public var preservedDecisions: Int
+    public var productID: String
+
+    public init(
+        run: SyncRun,
+        warnings: [String] = [],
+        preservedDecisions: Int = 0,
+        productID: String = ""
+    ) {
+        self.run = run
+        self.warnings = warnings
+        self.preservedDecisions = preservedDecisions
+        self.productID = productID
+    }
+}
+
+/// Fetches a feed and reconciles it into the database.
+///
+/// Reconciliation is by stable key, which gives three properties the brief asks
+/// for: re-importing an unchanged feed changes nothing, an edited event updates
+/// its existing row, and an event that disappears is tombstoned rather than
+/// deleted so the owner's decision about it survives.
+public struct ImportService: Sendable {
+    let events: EventRepository
+    let classifications: ClassificationRepository
+    let listings: ListingRepository
+    let syncRuns: SyncRunRepository
+    let fetcher: FeedFetching
+    let classifier: BlockClassifier
+
+    public init(
+        events: EventRepository,
+        classifications: ClassificationRepository,
+        listings: ListingRepository,
+        syncRuns: SyncRunRepository,
+        fetcher: FeedFetching,
+        classifier: BlockClassifier = BlockClassifier()
+    ) {
+        self.events = events
+        self.classifications = classifications
+        self.listings = listings
+        self.syncRuns = syncRuns
+        self.fetcher = fetcher
+        self.classifier = classifier
+    }
+
+    @discardableResult
+    public func importFeed(for listing: PlatformListing, now: Date = Date()) async -> ImportReport {
+        guard let listingID = listing.id else {
+            return ImportReport(run: SyncRun(
+                listingID: 0, startedAt: now, finishedAt: now,
+                outcome: .failure, errorMessage: "The listing has not been saved yet."
+            ))
+        }
+
+        var run = SyncRun(listingID: listingID, startedAt: now)
+
+        // Resolved here, at the one moment it is needed, rather than on every
+        // listing read. A Keychain prompt is tolerable when the owner just asked
+        // for a refresh; it is not tolerable while drawing a calendar.
+        var feedURL = ""
+        var resolveError: String?
+        do {
+            feedURL = try listings.resolveURL(for: listing)
+        } catch {
+            resolveError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+
+        guard !feedURL.isEmpty else {
+            run.outcome = .skipped
+            run.finishedAt = Date()
+            run.errorMessage = resolveError ?? "No calendar URL configured."
+            try? syncRuns.record(run)
+            try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
+            return ImportReport(run: run)
+        }
+
+        let response: FeedResponse
+        do {
+            response = try await fetcher.fetch(urlString: feedURL)
+        } catch {
+            run.outcome = .failure
+            run.finishedAt = Date()
+            run.errorMessage = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            try? syncRuns.record(run)
+            try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
+            return ImportReport(run: run)
+        }
+
+        run.httpStatus = response.httpStatus
+
+        let parsed: ICalParseResult
+        do {
+            parsed = try ICalParser.parse(response.text)
+        } catch {
+            run.outcome = .failure
+            run.finishedAt = Date()
+            run.errorMessage = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            try? syncRuns.record(run)
+            try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
+            return ImportReport(run: run)
+        }
+
+        var report = ImportReport(run: run, warnings: parsed.warnings, productID: parsed.productID)
+        var keysSeen: Set<String> = []
+
+        for icalEvent in parsed.events {
+            guard let checkIn = icalEvent.resolvedCheckIn,
+                  let checkOut = icalEvent.resolvedCheckOut else { continue }
+
+            let key = EventKey.make(
+                listingID: listingID,
+                uid: icalEvent.uid,
+                recurrenceID: icalEvent.recurrenceID
+            )
+            // A feed repeating the same UID twice is one event, not two.
+            if keysSeen.contains(key) { continue }
+            keysSeen.insert(key)
+
+            let feedStatus = FeedEventStatus.parse(icalEvent.status)
+            let event = CalendarEvent(
+                listingID: listingID,
+                eventKey: key,
+                uid: icalEvent.uid,
+                recurrenceID: icalEvent.recurrenceID,
+                platform: listing.platform,
+                summary: icalEvent.summary,
+                details: icalEvent.description,
+                location: icalEvent.location,
+                checkIn: checkIn,
+                checkOut: checkOut,
+                isAllDay: icalEvent.isAllDay,
+                feedStatus: feedStatus,
+                sequence: icalEvent.sequence,
+                lastModified: icalEvent.lastModified ?? icalEvent.dtStamp,
+                contentHash: icalEvent.contentHash(),
+                firstSeenAt: now,
+                lastSeenAt: now,
+                // An event the feed itself marks cancelled is withdrawn, not a block.
+                isTombstoned: feedStatus == .cancelled,
+                hasUnsupportedRecurrence: icalEvent.hasRecurrenceRule
+            )
+
+            do {
+                let result = try events.upsert(event, seenAt: now)
+                switch result {
+                case .inserted: report.run.eventsInserted += 1
+                case .updated: report.run.eventsUpdated += 1
+                case .unchanged: break
+                }
+                report.run.eventsSeen += 1
+
+                // Classification. A decision the owner already made is never
+                // recomputed — that is the guarantee behind "previously
+                // reviewed classifications survive".
+                let existing = try classifications.find(eventKey: key)
+                if let existing, existing.isLocked {
+                    report.preservedDecisions += 1
+                    if existing.needsReview { report.run.eventsNeedingReview += 1 }
+                } else {
+                    let proposal = classifier.classify(
+                        event: icalEvent,
+                        platform: listing.platform,
+                        nights: event.nights
+                    )
+                    let stored = try classifications.saveAutomaticIfNotDecided(
+                        eventKey: key, proposal: proposal
+                    )
+                    if stored.needsReview { report.run.eventsNeedingReview += 1 }
+                }
+            } catch {
+                report.warnings.append("Could not store an event: \(error)")
+            }
+        }
+
+        do {
+            report.run.eventsTombstoned = try events.tombstoneMissing(
+                listingID: listingID, keysStillPresent: keysSeen, at: now
+            )
+        } catch {
+            report.warnings.append("Could not tombstone removed events: \(error)")
+        }
+
+        report.run.outcome = .success
+        report.run.finishedAt = Date()
+        if let recorded = try? syncRuns.record(report.run) { report.run = recorded }
+        try? listings.recordSync(
+            listingID: listingID, at: now, summary: report.run.summaryLine
+        )
+        return report
+    }
+
+    /// Imports every listing that has a URL. Returns one report per listing.
+    public func importAll(
+        listings listingsToImport: [PlatformListing],
+        autoRefreshOnly: Bool = false,
+        now: Date = Date()
+    ) async -> [ImportReport] {
+        var reports: [ImportReport] = []
+        for listing in listingsToImport {
+            if autoRefreshOnly && !listing.autoRefreshEnabled { continue }
+            reports.append(await importFeed(for: listing, now: now))
+        }
+        return reports
+    }
+}

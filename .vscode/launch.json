@@ -1,0 +1,64 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug VacationRentalCalendar",
+            "target": "VacationRentalCalendar",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug VacationRentalCalendar"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release VacationRentalCalendar",
+            "target": "VacationRentalCalendar",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release VacationRentalCalendar"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-test",
+            "target": "vrc-test",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-test"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-test",
+            "target": "vrc-test",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-test"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc",
+            "target": "vrc",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc",
+            "target": "vrc",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc"
+        }
+    ]
+}
