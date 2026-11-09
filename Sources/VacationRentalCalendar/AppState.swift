@@ -31,6 +31,12 @@ final class AppState: ObservableObject {
     @Published private(set) var decisions: [AvailabilityDecision] = []
     @Published private(set) var auditEntries: [AuditEntry] = []
     @Published private(set) var syncStates: [DestinationSyncState] = []
+    @Published private(set) var findings: [ConflictFinding] = []
+
+    /// Presentation only. Hiding restrictions declutters the calendar and
+    /// changes nothing about export eligibility, conflict detection or the
+    /// review queue — a test asserts exactly that.
+    @Published var showPlatformRestrictions = false
 
     // Status
     @Published private(set) var isRefreshing = false
@@ -52,30 +58,26 @@ final class AppState: ObservableObject {
     private var refreshTask: Task<Void, Never>?
 
     enum Section: String, CaseIterable, Identifiable, Hashable {
-        case calendar, review, availability, conflicts, export, feeds, history
+        case calendar, reservations, availability, review, settings
         var id: String { rawValue }
 
         var title: String {
             switch self {
             case .calendar: return "Calendar"
-            case .review: return "Needs Review"
+            case .reservations: return "Reservations"
             case .availability: return "Availability"
-            case .conflicts: return "Conflicts"
-            case .export: return "Filtered Export"
-            case .feeds: return "Feeds"
-            case .history: return "Sync History"
+            case .review: return "Needs Review"
+            case .settings: return "Settings"
             }
         }
 
         var symbol: String {
             switch self {
             case .calendar: return "calendar"
-            case .review: return "questionmark.circle"
+            case .reservations: return "bed.double"
             case .availability: return "slider.horizontal.3"
-            case .conflicts: return "exclamationmark.triangle"
-            case .export: return "square.and.arrow.up"
-            case .feeds: return "antenna.radiowaves.left.and.right"
-            case .history: return "clock.arrow.circlepath"
+            case .review: return "questionmark.circle"
+            case .settings: return "gearshape"
             }
         }
     }
@@ -150,6 +152,11 @@ final class AppState: ObservableObject {
             events = try store.classifiedEvents()
             conflicts = try store.conflicts()
             syncRuns = try store.syncRuns.recent(limit: 100)
+            findings = ConflictAnalyzer().analyse(
+                events: events,
+                listings: listings,
+                acknowledgedIDs: try store.conflictAcks.acknowledgedIDs()
+            )
             decisions = try store.availability.all()
             auditEntries = try store.auditLog.recent(limit: 200)
             if let propertyID = selectedPropertyID {
@@ -181,9 +188,67 @@ final class AppState: ObservableObject {
         properties.first { $0.id == selectedPropertyID }
     }
 
+    /// Everything for the selected property. The authority for exports,
+    /// conflicts and review — never filtered by a display toggle.
     var visibleEvents: [ClassifiedEvent] {
         guard let id = selectedPropertyID else { return events }
         return events.filter { $0.propertyID == id }
+    }
+
+    /// What the calendar draws. Restrictions and undecided blocks are hidden
+    /// by default so reservations and real conflicts stand out; confirmed
+    /// reservations and owner blocks are never hidden.
+    var calendarEvents: [ClassifiedEvent] {
+        guard !showPlatformRestrictions else { return visibleEvents }
+        return visibleEvents.filter { item in
+            switch item.displayStatus {
+            case .confirmed, .ownerBlock, .maintenance:
+                return true
+            case .cancellationBlock, .platformRestriction, .needsReview, .unknown:
+                return false
+            }
+        }
+    }
+
+    /// How many the toggle is currently hiding.
+    var hiddenRestrictionCount: Int {
+        showPlatformRestrictions ? 0 : visibleEvents.count - calendarEvents.count
+    }
+
+    var reservations: [ClassifiedEvent] {
+        visibleEvents
+            .filter { $0.classification.kind == .confirmedReservation }
+            .sorted { $0.event.checkIn < $1.event.checkIn }
+    }
+
+    // MARK: - Conflict categories
+
+    var visibleFindings: [ConflictFinding] {
+        guard let id = selectedPropertyID else { return findings }
+        return findings.filter { $0.propertyID == id }
+    }
+
+    func findings(_ category: ConflictCategory) -> [ConflictFinding] {
+        visibleFindings.filter { $0.category == category }
+    }
+
+    var bookingConflictCount: Int {
+        findings(.bookingConflict).filter { !$0.acknowledged }.count
+    }
+
+    var availabilityDifferences: [AvailabilityDifference] {
+        guard let id = selectedPropertyID else { return [] }
+        return AvailabilityOverview().differences(
+            from: DayMath.utcMidnight(Date()), days: 120, propertyID: id,
+            events: visibleEvents, listings: listingsForSelectedProperty
+        )
+    }
+
+    func availability(on day: Date) -> DayAvailability? {
+        guard let id = selectedPropertyID else { return nil }
+        return AvailabilityOverview().day(
+            day, propertyID: id, events: visibleEvents, listings: listingsForSelectedProperty
+        )
     }
 
     var reviewQueue: [ClassifiedEvent] {
@@ -392,6 +457,18 @@ final class AppState: ObservableObject {
     func setExportSuppressed(eventKey: String, suppressed: Bool) {
         guard let store else { return }
         try? store.setExportSuppressed(eventKey: eventKey, suppressed: suppressed)
+        reload()
+    }
+
+    func acknowledge(finding: ConflictFinding) {
+        guard let store else { return }
+        try? store.conflictAcks.acknowledge(conflictID: finding.id)
+        reload()
+    }
+
+    func unacknowledge(finding: ConflictFinding) {
+        guard let store else { return }
+        try? store.conflictAcks.unacknowledge(conflictID: finding.id)
         reload()
     }
 

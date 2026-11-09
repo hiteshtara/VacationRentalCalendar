@@ -31,6 +31,7 @@ public struct DestinationFeed: Sendable {
     public var entries: [FeedEntryDecision]
     public var generatedAt: Date
     public var revision: Int
+    public var scope: FeedPublicationScope = .reservationsAndApprovedBlocks
 
     public var included: [FeedEntryDecision] { entries.filter(\.included) }
     public var excluded: [FeedEntryDecision] { entries.filter { !$0.included } }
@@ -47,6 +48,51 @@ public struct DestinationFeed: Sendable {
     public var calendarName: String {
         "\(propertyName) → \(destination.displayName)"
     }
+}
+
+/// What a published feed is allowed to carry.
+///
+/// Reservation-driven publication is the automatic half of this system: a
+/// booking appears on one platform, and the filtered feed blocks those nights
+/// everywhere else without anyone deciding anything. That is the useful
+/// behaviour eventually, and exactly the wrong thing for a first live test,
+/// where the point is to watch a small number of nights you chose by hand.
+///
+/// The distinction is enforced here rather than left to the shape of the data.
+/// Today the owner has no confirmed reservations, so a feed happens to contain
+/// only manual blocks — but a booking arriving mid-test would silently widen
+/// the experiment.
+public enum FeedPublicationScope: String, CaseIterable, Sendable {
+    /// Only availability decisions the owner approved. Reservations imported
+    /// from other platforms are excluded, however well evidenced.
+    case approvedManualBlocksOnly = "approved_manual_blocks_only"
+    /// Approved blocks plus confirmed reservations from other platforms.
+    case reservationsAndApprovedBlocks = "reservations_and_approved_blocks"
+
+    public var includesReservations: Bool { self == .reservationsAndApprovedBlocks }
+
+    public var displayName: String {
+        switch self {
+        case .approvedManualBlocksOnly: return "Approved blocks only"
+        case .reservationsAndApprovedBlocks: return "Approved blocks and reservations"
+        }
+    }
+
+    public var explanation: String {
+        switch self {
+        case .approvedManualBlocksOnly:
+            return "Only dates you blocked and approved by hand are published. Reservations "
+                + "imported from other platforms are held back, so a booking arriving during "
+                + "the test cannot widen what is being published."
+        case .reservationsAndApprovedBlocks:
+            return "Confirmed reservations from your other platforms are published alongside "
+                + "the blocks you approved, so a booking anywhere takes those nights off sale "
+                + "here too."
+        }
+    }
+
+    /// Recorded against the setting key so the choice survives a restart.
+    public static let settingKey = "feed_publication_scope"
 }
 
 /// Builds one destination's filtered calendar.
@@ -74,6 +120,7 @@ public struct CalendarFeedGenerator: Sendable {
         propertyName: String,
         sourceEvents: [ClassifiedEvent],
         decisions: [AvailabilityDecision],
+        scope: FeedPublicationScope = .reservationsAndApprovedBlocks,
         revision: Int = 1,
         now: Date = Date()
     ) -> DestinationFeed {
@@ -102,9 +149,17 @@ public struct CalendarFeedGenerator: Sendable {
                 continue
             }
 
-            let verdict = policy.decide(
+            var verdict = policy.decide(
                 event: event, classification: item.classification, destination: destination
             )
+            // The scope narrows what the export policy already allowed; it can
+            // never widen it. An entry the policy refused stays refused.
+            if verdict.isIncluded, !scope.includesReservations {
+                verdict = .exclude(
+                    reason: "This test publishes only the blocks you approved by hand. "
+                        + "Reservation-driven publication is switched off, so this is held back."
+                )
+            }
             entries.append(FeedEntryDecision(
                 origin: .sourceEvent,
                 uid: stableUID(forSourceKey: event.eventKey, destination: destination),
@@ -171,7 +226,8 @@ public struct CalendarFeedGenerator: Sendable {
             propertyName: propertyName,
             entries: entries.sorted { $0.startDay < $1.startDay },
             generatedAt: now,
-            revision: revision
+            revision: revision,
+            scope: scope
         )
     }
 
@@ -207,6 +263,7 @@ public struct CalendarFeedGenerator: Sendable {
         var lines = [
             "Feed for \(feed.destination.displayName) — \(feed.propertyName)",
             "Revision \(feed.revision), generated \(DayMath.mediumString(feed.generatedAt))",
+            "Scope: \(feed.scope.displayName) — \(feed.scope.explanation)",
             "",
             "INCLUDED (\(feed.included.count) entries, \(feed.includedNights) nights)",
         ]

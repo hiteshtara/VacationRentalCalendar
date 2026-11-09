@@ -93,7 +93,7 @@ public struct AvailabilityPreview: Sendable {
 public final class AvailabilityManager: @unchecked Sendable {
     let decisions: AvailabilityRepository
     let audit: AvailabilityAuditLog
-    let detector: AvailabilityConflictDetector
+    public let detector: AvailabilityConflictDetector
     let properties: PropertyRepository
     let listings: ListingRepository
     private let eventsProvider: @Sendable () throws -> [ClassifiedEvent]
@@ -231,6 +231,62 @@ public final class AvailabilityManager: @unchecked Sendable {
         }
 
         return stored
+    }
+
+    /// Walks an existing draft through validation to awaiting approval.
+    ///
+    /// Separate from `submit`, which creates decisions from a plan. A draft
+    /// recorded earlier still has to pass the same checks, against the world as
+    /// it is now rather than as it was when the draft was written.
+    @discardableResult
+    public func validateDraft(
+        decisionID: Int64, actor: String = "owner", now: Date = Date()
+    ) throws -> (decision: AvailabilityDecision, validation: ValidationResult) {
+        guard var decision = try decisions.find(id: decisionID) else {
+            throw AvailabilityError.notFound(decisionID)
+        }
+        guard decision.status == .draft else {
+            // Already past draft; report where it is without moving it.
+            let validation = detector.validate(
+                decision,
+                in: try context(
+                    propertyID: decision.propertyID, destination: decision.destination, now: now
+                )
+            )
+            return (decision, validation)
+        }
+
+        let validation = detector.validate(
+            decision,
+            in: try context(
+                propertyID: decision.propertyID, destination: decision.destination, now: now
+            )
+        )
+
+        if validation.isRefused {
+            var failed = try transition(
+                decision, to: .failed, actor: actor, now: now,
+                detail: validation.blocking.map(\.message).joined(separator: " ")
+            )
+            failed.failureReason = validation.blocking.first?.message
+            try decisions.update(failed)
+            return (failed, validation)
+        }
+
+        decision = try transition(
+            decision, to: .validated, actor: actor, now: now,
+            detail: validation.needsReview
+                ? validation.needingReview.map(\.message).joined(separator: " ")
+                : "No conflicts found."
+        )
+        decision.validatedAt = now
+        try decisions.update(decision)
+
+        decision = try transition(
+            decision, to: .awaitingApproval, actor: actor, now: now,
+            detail: "Waiting for approval. Nothing is published until then."
+        )
+        return (decision, validation)
     }
 
     // MARK: - Approving

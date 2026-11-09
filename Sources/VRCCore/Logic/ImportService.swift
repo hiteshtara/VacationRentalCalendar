@@ -93,11 +93,30 @@ public struct ImportService: Sendable {
         }
 
         guard !feedURL.isEmpty else {
-            run.outcome = .skipped
             run.finishedAt = Date()
-            run.errorMessage = resolveError ?? "No calendar URL configured."
+            if let resolveError {
+                // The read did not merely fail, it blocked — which means the
+                // item's access list names an earlier build. Recorded so no
+                // further attempt is made, because each one holds the keychain
+                // for the rest of the process.
+                run.outcome = .disconnected
+                run.errorMessage = resolveError
+                try? listings.setConnectionState(
+                    listingID: listingID, to: .credentialUnreadable,
+                    detail: resolveError, actor: "import", at: now
+                )
+                try? listings.recordSync(
+                    listingID: listingID, at: now,
+                    summary: "Enter this listing's URL again — the saved one cannot be read"
+                )
+            } else {
+                run.outcome = .skipped
+                run.errorMessage = "No calendar URL configured."
+                try? listings.recordSync(
+                    listingID: listingID, at: now, summary: run.summaryLine
+                )
+            }
             try? syncRuns.record(run)
-            try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
             return ImportReport(run: run)
         }
 

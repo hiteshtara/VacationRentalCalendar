@@ -72,13 +72,13 @@ private struct WeekBarRow: View {
 
     private var layout: WeekLayout {
         CalendarLayout.layout(
-            weekStart: weekStart, events: state.visibleEvents, maxLanes: maxLanes
+            weekStart: weekStart, events: state.calendarEvents, maxLanes: maxLanes
         )
     }
 
     private var overflow: Int {
         CalendarLayout.overflowCount(
-            weekStart: weekStart, events: state.visibleEvents, maxLanes: maxLanes
+            weekStart: weekStart, events: state.calendarEvents, maxLanes: maxLanes
         )
     }
 

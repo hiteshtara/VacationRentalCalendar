@@ -237,6 +237,87 @@ public enum ConnectionStateTests {
                       "a transient problem keeps being retried")
         },
 
+        // --- Recovering from a stale access list -----------------------------
+
+        TestCase(group: "Connection state",
+                 name: "a reference suffix advances rather than colliding") { expect in
+            expect.equal(ListingRepository.nextReference(after: "vrbo-5550554"), "vrbo-5550554-v2")
+            expect.equal(ListingRepository.nextReference(after: "vrbo-5550554-v2"),
+                         "vrbo-5550554-v3")
+            expect.equal(ListingRepository.nextReference(after: "a-v9"), "a-v10")
+        },
+
+        TestCase(group: "Connection state",
+                 name: "an unreadable Keychain item is replaced, not preserved or deleted") { expect in
+            // Models the real failure: the item exists, but its access list
+            // names an older build, so reads fail while writes succeed.
+            final class StaleStore: FeedCredentialStore, @unchecked Sendable {
+                var stored: [String: String] = [:]
+                let unreadable: String
+                init(unreadable: String) {
+                    self.unreadable = unreadable
+                    stored[unreadable] = "<<locked by an older build>>"
+                }
+                var storageDescription: String { "test" }
+                func save(url: String, reference: String) throws { stored[reference] = url }
+                func url(reference: String) throws -> String? {
+                    // The old item reads as nil, exactly as a mismatched ACL does.
+                    reference == unreadable ? nil : stored[reference]
+                }
+                private(set) var deleteWasCalled = false
+                func delete(reference: String) throws { deleteWasCalled = true }
+                func exists(reference: String) -> Bool { stored[reference] != nil }
+            }
+
+            let credentials = StaleStore(unreadable: "vrbo-5550554")
+            let database = try Database.inMemory()
+            try Migrator.migrate(database)
+            let properties = PropertyRepository(database: database)
+            let listings = ListingRepository(database: database, credentials: credentials)
+            let property = try properties.insert(Property(name: "P"))
+
+            var listing = try listings.insert(PlatformListing(
+                propertyID: property.id!, platform: .vrbo, label: "Vrbo",
+                urlStorage: .keychain, credentialRef: "vrbo-5550554",
+                connectionState: .credentialUnreadable
+            ))
+
+            // The owner re-enters the same URL.
+            listing.icalURL = "https://www.vrbo.com/icalendar/TOKEN.ics?nonTentative"
+            listing.connectionState = .credentialUnreadable
+            try listings.update(listing)
+
+            let reloaded = try listings.find(id: listing.id!)
+            expect.equal(reloaded?.credentialRef, "vrbo-5550554-v2",
+                         "a fresh entry, owned by the current app")
+            expect.equal(try listings.resolveURL(for: reloaded!),
+                         "https://www.vrbo.com/icalendar/TOKEN.ics?nonTentative",
+                         "and it reads back")
+            expect.equal(credentials.stored["vrbo-5550554"], "<<locked by an older build>>",
+                         "the old item is left exactly as it was")
+            expect.equal(credentials.stored.count, 2, "added, never replaced")
+            expect.ok(!credentials.deleteWasCalled, "nothing may be deleted")
+        },
+
+        TestCase(group: "Connection state",
+                 name: "a readable item keeps its reference and its grant") { expect in
+            let credentials = InMemoryFeedCredentialStore()
+            try credentials.save(url: "https://example.test/a.ics", reference: "vrbo-1")
+            let database = try Database.inMemory()
+            try Migrator.migrate(database)
+            let properties = PropertyRepository(database: database)
+            let listings = ListingRepository(database: database, credentials: credentials)
+            let property = try properties.insert(Property(name: "P"))
+            var listing = try listings.insert(PlatformListing(
+                propertyID: property.id!, platform: .vrbo, label: "V",
+                urlStorage: .keychain, credentialRef: "vrbo-1"
+            ))
+            listing.icalURL = "https://example.test/b.ics"
+            try listings.update(listing)
+            expect.equal(try listings.find(id: listing.id!)?.credentialRef, "vrbo-1",
+                         "a working item must not be churned")
+        },
+
         // --- Existing data is untouched -------------------------------------
 
         TestCase(group: "Connection state",

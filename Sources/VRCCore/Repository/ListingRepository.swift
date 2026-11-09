@@ -26,6 +26,17 @@ public struct ListingRepository: Sendable {
     /// Keychain call, and on an unsigned local build each of those can block on
     /// an authorisation prompt. URLs are therefore resolved lazily, only when an
     /// import or the settings screen actually needs one — see `resolveURL`.
+    /// Adds or advances a `-vN` suffix, so a replacement entry is obviously
+    /// related to the one it supersedes.
+    public static func nextReference(after reference: String) -> String {
+        guard let range = reference.range(of: #"-v(\d+)$"#, options: .regularExpression) else {
+            return reference + "-v2"
+        }
+        let digits = reference[range].dropFirst(2)
+        let next = (Int(digits) ?? 1) + 1
+        return String(reference[reference.startIndex..<range.lowerBound]) + "-v\(next)"
+    }
+
     private func decode(_ row: Row) -> PlatformListing {
         let storage = FeedURLStorage(rawValue: row.stringValue("url_storage")) ?? .database
         let reference = row.stringValue("credential_ref")
@@ -58,10 +69,32 @@ public struct ListingRepository: Sendable {
         case .database:
             return (listing.icalURL, listing.credentialRef)
         case .keychain:
-            let reference = listing.credentialRef.isEmpty
+            var reference = listing.credentialRef.isEmpty
                 ? Self.credentialReference(platform: listing.platform, listingLabel: listing.label)
                 : listing.credentialRef
+
             if listing.hasURL {
+                // If an item already sits at this reference, write to a fresh
+                // one instead of updating in place.
+                //
+                // Updating would preserve the existing access list, which is
+                // the one case where preserving the owner's grant is exactly
+                // wrong: a list naming an earlier build makes the item
+                // permanently unreadable. Note this uses `exists`, which reads
+                // attributes only — testing readability by actually reading
+                // would block, and an abandoned read holds the keychain for
+                // the rest of the process, breaking this very save.
+                //
+                // The old item is left untouched. Nothing is deleted and no
+                // credential is regenerated.
+                //
+                // Scoped to listings already known to be unreadable, so a
+                // working entry keeps its reference and the grant the owner
+                // gave it. Readability is never tested by reading.
+                if listing.connectionState == .credentialUnreadable,
+                   credentials.exists(reference: reference) {
+                    reference = Self.nextReference(after: reference)
+                }
                 try credentials.save(url: listing.icalURL, reference: reference)
             }
             // Deliberately store nothing in the database column.
@@ -95,6 +128,13 @@ public struct ListingRepository: Sendable {
     public func update(_ listing: PlatformListing) throws {
         guard let id = listing.id else { return }
         let (column, reference) = try persistURL(listing)
+        // A freshly entered URL supersedes whatever was wrong before.
+        if listing.hasURL, listing.connectionState == .credentialUnreadable {
+            try? setConnectionState(
+                listingID: id, to: .unknown,
+                detail: "A new URL was entered.", actor: "owner"
+            )
+        }
         try database.run("""
             UPDATE platform_listings
             SET property_id = ?, platform = ?, label = ?, ical_url = ?,

@@ -124,6 +124,48 @@ public actor StubHostingClient: FeedHostingClient {
     public func wasInvalidated(_ key: String) -> Bool { invalidatedKeys.contains(key) }
 }
 
+/// Guards the rehearsal against ever running on the real database.
+///
+/// The isolation used to rest on remembering to pass a sandbox path. That is
+/// not a guarantee, and an earlier rehearsal did write publication rows into
+/// the production database — rows describing publications that never happened,
+/// which would have corrupted the next genuine publish, because the safety
+/// diff compares against the last known good feed. This makes the mistake
+/// impossible to repeat silently.
+public enum RehearsalIsolation {
+    public enum Violation: Error, LocalizedError {
+        case wouldUseProductionDatabase(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .wouldUseProductionDatabase(let path):
+                return "Refusing to rehearse against the production database at \(path). "
+                    + "A rehearsal writes publication rows and snapshots describing "
+                    + "publications that never happened; leaving those in the real database "
+                    + "would corrupt the next genuine publish."
+            }
+        }
+    }
+
+    /// Throws unless `path` is demonstrably not the production database.
+    public static func assertIsolated(
+        databasePath: String,
+        productionPath: String = AppPaths.databaseURL.path
+    ) throws {
+        let candidate = URL(fileURLWithPath: databasePath).standardizedFileURL.path
+        let production = URL(fileURLWithPath: productionPath).standardizedFileURL.path
+        guard candidate != production else {
+            throw Violation.wouldUseProductionDatabase(candidate)
+        }
+        // Also refuse anything inside the application support directory, so a
+        // sibling file there cannot be mistaken for a sandbox.
+        let supportDirectory = AppPaths.supportDirectory.standardizedFileURL.path
+        guard !candidate.hasPrefix(supportDirectory + "/") else {
+            throw Violation.wouldUseProductionDatabase(candidate)
+        }
+    }
+}
+
 /// The outcome of attempting one destination's publication.
 public struct PublicationAttempt: Sendable, Identifiable {
     public var destination: RentalPlatform
