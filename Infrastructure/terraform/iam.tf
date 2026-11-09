@@ -84,10 +84,10 @@ resource "aws_iam_role_policy" "processor" {
         Resource = [aws_rds_cluster.main.arn]
       },
       {
-        Sid      = "ReadDatabaseCredential"
+        Sid      = "ReadRestrictedDatabaseCredential"
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = [aws_secretsmanager_secret.db_master.arn]
+        Resource = [aws_secretsmanager_secret.db_runtime.arn]
       },
       {
         Sid      = "ReadRawPayloads"
@@ -127,7 +127,7 @@ resource "aws_iam_role_policy" "publisher" {
         Effect = "Allow"
         Action = ["secretsmanager:GetSecretValue"]
         Resource = [
-          aws_secretsmanager_secret.db_master.arn,
+          aws_secretsmanager_secret.db_runtime.arn,
           aws_secretsmanager_secret.outbound_feed_tokens.arn,
         ]
       },
@@ -178,7 +178,7 @@ resource "aws_iam_role_policy" "api" {
       {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = [aws_secretsmanager_secret.db_master.arn]
+        Resource = [aws_secretsmanager_secret.db_runtime.arn]
       },
       {
         Effect   = "Allow"

@@ -24,8 +24,15 @@ resource "aws_rds_cluster" "main" {
   cluster_identifier = "vrc-main"
   engine             = "aurora-postgresql"
   engine_mode        = "provisioned"
-  # 16.4: minimum capacity 0 requires Aurora PostgreSQL 16.3 or later.
-  engine_version = "16.4"
+  # Verified against `aws rds describe-db-engine-versions` in us-east-1 on
+  # 2026-11-09, not taken from documentation: the 16 line now starts at 16.8,
+  # and 16.4 -- which an earlier revision of this file pinned -- no longer
+  # exists. An apply would have failed.
+  #
+  # 16.15 is the current 16.x release and clears both floors: minimum capacity
+  # 0 ACU needs >= 16.3, and the RDS Data API needs >= 15.3 on the 15 line and
+  # any 16.x.
+  engine_version = "16.15"
   database_name  = "vrc"
 
   master_username                     = "vrc_admin"
@@ -78,6 +85,19 @@ resource "aws_rds_cluster_instance" "writer" {
 # An abandoned open transaction would both block concurrent bookings on the
 # exclusion constraint and hold the cluster awake, so this is a correctness
 # control and a cost control at once.
+# The application never connects as the master account. This secret holds the
+# restricted `vrc_runtime` login created by migration 003, which has no DDL
+# rights, cannot rewrite the audit trail, and cannot delete source
+# observations. The Data API is given THIS ARN, not the master one.
+#
+# No secret_version resource: the password is generated and written once, out
+# of band, so it never enters Terraform state.
+resource "aws_secretsmanager_secret" "db_runtime" {
+  name                    = "vrc/database/runtime"
+  description             = "Restricted vrc_runtime login. Used by every Lambda via the Data API."
+  recovery_window_in_days = 30
+}
+
 resource "aws_rds_cluster_parameter_group" "main" {
   name   = "vrc-main-pg16"
   family = "aurora-postgresql16"

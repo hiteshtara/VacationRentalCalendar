@@ -80,7 +80,7 @@ resource "aws_lambda_function" "functions" {
   environment {
     variables = {
       VRC_CLUSTER_ARN     = aws_rds_cluster.main.arn
-      VRC_DB_SECRET_ARN   = aws_secretsmanager_secret.db_master.arn
+      VRC_DB_SECRET_ARN   = aws_secretsmanager_secret.db_runtime.arn
       VRC_DB_NAME         = aws_rds_cluster.main.database_name
       VRC_RAW_BUCKET      = aws_s3_bucket.main["raw"].bucket
       VRC_FEEDS_BUCKET    = aws_s3_bucket.main["feeds"].bucket
