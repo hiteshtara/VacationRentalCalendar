@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import VRCCore
+import VRCUI
 
 /// Everything the views read, and the only place that talks to `RentalStore`.
 @MainActor

@@ -1,5 +1,6 @@
 import SwiftUI
 import VRCCore
+import VRCUI
 
 /// The review queue — where the owner turns an ambiguous block into a decision.
 ///

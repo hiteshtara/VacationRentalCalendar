@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Private CloudKit database only. No public or shared scope is used. -->
+    <key>com.apple.developer.icloud-services</key>
+    <array>
+        <string>CloudKit</string>
+    </array>
+    <key>com.apple.developer.icloud-container-identifiers</key>
+    <array>
+        <string>iCloud.com.vacationrentalcalendar.app</string>
+    </array>
+    <!-- Replace $(TeamIdentifierPrefix) handling in Xcode; this is the group the
+         Keychain items belong to on this device. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.vacationrentalcalendar.app</string>
+    </array>
+    <!-- The Mac build is not sandboxed: it writes .ics files wherever you
+         choose and reads the login keychain directly. -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

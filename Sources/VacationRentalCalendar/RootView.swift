@@ -1,5 +1,6 @@
 import SwiftUI
 import VRCCore
+import VRCUI
 
 struct RootView: View {
     @EnvironmentObject var state: AppState
