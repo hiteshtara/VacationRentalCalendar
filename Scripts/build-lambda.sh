@@ -59,14 +59,20 @@ ok "macOS:  ${MAC_DIGEST}"
 
 step "2. Building in ${IMAGE}"
 command -v docker >/dev/null 2>&1 || { bad "docker is required"; exit 1; }
-rsync -a --exclude='.build' --exclude='.git' Package.swift Sources "${WORK}/"
+# Migrations is not optional: SQLScannerTests reads
+# Migrations/postgres/*.sql from the working directory, so without it that
+# test fails inside the container for want of a file. That failure was once
+# written off as "a timing flake"; it was this.
+rsync -a --exclude='.build' --exclude='.git' Package.swift Sources Migrations "${WORK}/"
 
 docker run --rm --platform linux/arm64 -v "${WORK}:/src" -w /src "${IMAGE}" bash -lc '
 set -e
 dnf install -y -q sqlite-devel zip binutils >/dev/null 2>&1
 
 echo "LINUX_DIGEST=$(swift run vrc-parity --digest 2>/dev/null | tail -1)"
-swift run vrc-test 2>&1 | grep -E "tests passed|tests failed" | sed "s/^/TESTS /"
+swift run vrc-test > /tmp/vrc-test.log 2>&1 || true
+grep -E "tests passed|tests failed" /tmp/vrc-test.log | sed "s/^/TESTS /" || true
+grep "FAILED" /tmp/vrc-test.log | sed "s/^/TESTFAIL /" || true
 
 for f in fetch process publish api sweeper; do
   swift build -c release --product "vrc-lambda-$f" >/tmp/b.log 2>&1 || {
@@ -91,20 +97,44 @@ for f in fetch process publish api sweeper; do
   (cd "$d" && zip -qr "../$f.zip" bootstrap lib)
   echo "PACKAGED $f $(du -h /src/pkg/$f.zip | cut -f1) libs=$(ls $d/lib | wc -l) arch=$arch unresolved=$unresolved"
 done
-' 2>&1 | while read -r line; do
+' > "${WORK}/container.log" 2>&1 || true
+
+# The classification loop reads from a FILE, not a pipe.
+#
+# This used to be `docker ... | while read`, which put the loop in a subshell:
+# `exit 1` there left the subshell, and because this script sets -uo pipefail
+# but NOT -e, a non-zero pipeline did not stop it. The script carried on,
+# copied the packages and exited 0 — so a DIVERGED parity digest printed a
+# failure and then shipped anyway, and with --deploy it would have deployed.
+# Verified by reproducing the shell semantics directly before changing this.
+gate_failed=0
+while IFS= read -r line; do
     case "${line}" in
         LINUX_DIGEST=*)
             LINUX="${line#LINUX_DIGEST=}"
             if [ "${LINUX}" = "${MAC_DIGEST}" ]; then ok "Linux:  ${LINUX} (identical)"
-            else bad "Linux:  ${LINUX} — DIVERGED from macOS"; exit 1; fi ;;
-        TESTS*)        ok "${line#TESTS }" ;;
+            else bad "Linux:  ${LINUX} — DIVERGED from macOS"; gate_failed=1; fi ;;
+        TESTS*)
+            # A failing suite is a failing build. This arm printed "ok"
+            # unconditionally, which is how "1 of 369 tests failed" was
+            # displayed in green and shipped.
+            case "${line}" in
+                *"tests failed"*) bad "${line#TESTS }"; gate_failed=1 ;;
+                *)                ok  "${line#TESTS }" ;;
+            esac ;;
+        TESTFAIL*)     bad "${line#TESTFAIL }" ;;
         PACKAGED*)     ok "${line#PACKAGED }" ;;
-        BUILD_FAILED*) bad "${line}"; exit 1 ;;
-        UNRESOLVED*)   bad "${line} — missing shared objects, would fail at startup"; exit 1 ;;
-        WRONG_ARCH*)   bad "${line}"; exit 1 ;;
+        BUILD_FAILED*) bad "${line}"; gate_failed=1 ;;
+        UNRESOLVED*)   bad "${line} — missing shared objects, would fail at startup"; gate_failed=1 ;;
+        WRONG_ARCH*)   bad "${line}"; gate_failed=1 ;;
         *)             say "  ${line}" ;;
     esac
-done
+done < "${WORK}/container.log"
+
+if [ "${gate_failed}" -ne 0 ]; then
+    bad "a gate failed above — not packaging, not deploying"
+    exit 1
+fi
 
 mkdir -p "${OUT}"
 cp "${WORK}"/pkg/*.zip "${OUT}/" 2>/dev/null || { bad "no packages produced"; exit 1; }
