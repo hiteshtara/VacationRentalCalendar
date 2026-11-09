@@ -91,6 +91,7 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
             propertyName: property?.name ?? "Property \(propertyID)",
             sourceEvents: try eventsProvider(),
             decisions: try decisions.forProperty(propertyID),
+            scope: try publicationScope(),
             revision: revision,
             now: now
         )
@@ -282,6 +283,18 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
             sourceEvents: try eventsProvider().filter { $0.propertyID == propertyID },
             now: now
         )
+    }
+
+    /// What the published feed is currently allowed to carry.
+    ///
+    /// Defaults to blocks only. A first live test should publish what the owner
+    /// chose and nothing else; widening it is a deliberate act.
+    public func publicationScope() throws -> FeedPublicationScope {
+        guard let raw = try settingsProvider()(FeedPublicationScope.settingKey),
+              let scope = FeedPublicationScope(rawValue: raw) else {
+            return .approvedManualBlocksOnly
+        }
+        return scope
     }
 
     /// Splits a feed by where each entry came from.

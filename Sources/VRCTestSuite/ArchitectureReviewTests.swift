@@ -90,6 +90,12 @@ public enum ArchitectureReviewTests {
                 status: .approved, publicationUID: "vrc-manual", approvedAt: Date()
             ))
 
+            // The split is only observable when reservations are in scope;
+            // the default now holds them back for the controlled test.
+            try store.settings.set(
+                FeedPublicationScope.settingKey,
+                FeedPublicationScope.reservationsAndApprovedBlocks.rawValue
+            )
             let feed = try store.outbound.generateFeed(propertyID: id, destination: .vrbo)
             let split = store.outbound.originBreakdown(feed)
             expect.equal(split.manualBlocks.count, 1, "one block the owner decided")

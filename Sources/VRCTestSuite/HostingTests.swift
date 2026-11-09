@@ -272,6 +272,88 @@ public enum HostingTests {
             expect.contains(history.first?.detail ?? "", "network down")
         },
 
+        // --- Scope: reservation-driven publication is off for this test -------
+
+        TestCase(group: "Hosting",
+                 name: "a confirmed reservation is held back under blocks-only scope") { expect in
+            let store = try RentalStore.makeInMemory()
+            let property = try store.properties.insert(Property(name: "39 G Street"))
+            let id = property.id!
+            let listing = try store.listings.insert(PlatformListing(
+                propertyID: id, platform: .airbnb, label: "A",
+                urlStorage: .database, connectionState: .connected
+            ))
+            try store.listings.recordSync(listingID: listing.id!, at: Date(), summary: "ok")
+
+            // A booking arriving mid-test: strongly evidenced, exportable under
+            // the ordinary policy.
+            try store.events.upsert(CalendarEvent(
+                listingID: listing.id!, eventKey: "booking", uid: "booking",
+                platform: .airbnb, summary: "Reserved",
+                details: "Reservation URL: https://www.airbnb.com/hosting/reservations/details/X",
+                checkIn: day(2026, 12, 22), checkOut: day(2026, 12, 26)
+            ))
+            try store.classifications.save(EventClassification(
+                eventKey: "booking", kind: .confirmedReservation, confidence: .high,
+                source: .automatic, needsReview: false
+            ))
+            _ = try store.availability.insert(AvailabilityDecision(
+                propertyID: id, destination: .vrbo, action: .block,
+                startDay: day(2026, 12, 10), endDay: day(2026, 12, 17),
+                status: .approved, publicationUID: "vrc-block", approvedAt: Date()
+            ))
+
+            // Default scope is blocks only.
+            expect.equal(try store.outbound.publicationScope(), .approvedManualBlocksOnly)
+
+            let feed = try store.outbound.generateFeed(propertyID: id, destination: .vrbo)
+            expect.equal(feed.included.count, 1, "only the approved block")
+            expect.equal(feed.included.first?.origin, .availabilityDecision)
+            let held = feed.excluded.first { $0.sourceEventKey == "booking" }
+            expect.ok(held != nil, "the reservation is present but held back")
+            expect.contains(held?.reason ?? "", "Reservation-driven publication is switched off")
+
+            // And the generated calendar carries no trace of it.
+            let ics = CalendarFeedGenerator().makeICS(feed)
+            expect.notContains(ics, "20261222")
+            expect.contains(ics, "DTSTART;VALUE=DATE:20261210")
+
+            // Widening the scope is a deliberate act, and then it appears.
+            try store.settings.set(
+                FeedPublicationScope.settingKey,
+                FeedPublicationScope.reservationsAndApprovedBlocks.rawValue
+            )
+            let wider = try store.outbound.generateFeed(propertyID: id, destination: .vrbo)
+            expect.equal(wider.included.count, 2, "now the reservation is published too")
+        },
+
+        TestCase(group: "Hosting",
+                 name: "scope narrows what the policy allows and never widens it") { expect in
+            // A cancellation block is refused by the export policy. No scope
+            // may let it through.
+            let store = try RentalStore.makeInMemory()
+            let property = try store.properties.insert(Property(name: "P"))
+            let id = property.id!
+            let listing = try store.listings.insert(PlatformListing(
+                propertyID: id, platform: .airbnb, label: "A", urlStorage: .database
+            ))
+            try store.events.upsert(CalendarEvent(
+                listingID: listing.id!, eventKey: "c", uid: "c", platform: .airbnb,
+                summary: "Airbnb (Not available)",
+                checkIn: day(2026, 12, 17), checkOut: day(2026, 12, 19)
+            ))
+            try store.classifications.save(EventClassification(
+                eventKey: "c", kind: .cancellationBlock, confidence: .high,
+                source: .manual, needsReview: false, exportApproved: true
+            ))
+            for scope in FeedPublicationScope.allCases {
+                try store.settings.set(FeedPublicationScope.settingKey, scope.rawValue)
+                let feed = try store.outbound.generateFeed(propertyID: id, destination: .vrbo)
+                expect.equal(feed.included.count, 0,
+                             "\(scope.rawValue) must not publish a cancellation block")
+            }
+        },
+
         // --- The gate --------------------------------------------------------
 
         TestCase(group: "Hosting", name: "the real publish entry point still refuses") { expect in
