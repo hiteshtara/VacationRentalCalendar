@@ -297,6 +297,80 @@ public enum ConflictCategoryTests {
             expect.equal(Set(differences[0].knownPlatforms), Set([.airbnb, .vrbo]))
         },
 
+        // --- Hiding restrictions is presentation only ------------------------
+
+        TestCase(group: "Conflict categories",
+                 name: "hiding restrictions changes nothing about exports or conflicts") { expect in
+            // The owner's real shape: cancellation blocks plus a reservation.
+            let all = [
+                event(key: "r", platform: .airbnb, kind: .confirmedReservation,
+                      evidenced: true, from: (2027, 3, 10), to: (2027, 3, 15), listingID: 1),
+                event(key: "c1", platform: .airbnb, kind: .cancellationBlock,
+                      from: (2026, 11, 7), to: (2026, 11, 15), listingID: 1),
+                event(key: "c2", platform: .vrbo, kind: .cancellationBlock,
+                      from: (2026, 11, 1), to: (2026, 11, 30), listingID: 2),
+                event(key: "p", platform: .vrbo, kind: .platformRestriction,
+                      from: (2027, 4, 1), to: (2029, 1, 1), listingID: 2),
+            ]
+
+            // The same filter the calendar applies when the toggle is off.
+            let shown = all.filter {
+                switch $0.displayStatus {
+                case .confirmed, .ownerBlock, .maintenance: return true
+                default: return false
+                }
+            }
+            expect.equal(shown.count, 1, "only the reservation is drawn")
+            expect.equal(shown.first?.event.eventKey, "r")
+
+            // Conflicts are computed from everything, not from what is drawn.
+            let fromAll = ConflictAnalyzer().analyse(events: all)
+            let fromShown = ConflictAnalyzer().analyse(events: shown)
+            expect.ok(fromAll.count > fromShown.count,
+                      "the hidden events still produce findings")
+            expect.ok(!fromAll.isEmpty)
+
+            // Export eligibility is unchanged by what is drawn.
+            let policy = ExportPolicy()
+            for item in all {
+                let decision = policy.decide(
+                    event: item.event, classification: item.classification, destination: .bookingCom
+                )
+                let expectedIncluded = item.classification.kind == .confirmedReservation
+                expect.equal(decision.isIncluded, expectedIncluded,
+                             "\(item.event.eventKey) eligibility must not depend on display")
+            }
+
+            // And the review queue is unaffected.
+            let needingReview = all.filter { $0.classification.needsReview }
+            expect.equal(needingReview.count, 0, "none of these are undecided")
+        },
+
+        TestCase(group: "Conflict categories",
+                 name: "reservations and owner blocks are never hidden") { expect in
+            for kind in [BlockKind.confirmedReservation, .ownerBlock, .maintenanceBlock] {
+                let item = event(key: kind.rawValue, platform: .airbnb, kind: kind,
+                                 evidenced: kind == .confirmedReservation,
+                                 from: (2027, 3, 1), to: (2027, 3, 4), listingID: 1)
+                let visible: Bool
+                switch item.displayStatus {
+                case .confirmed, .ownerBlock, .maintenance: visible = true
+                default: visible = false
+                }
+                expect.ok(visible, "\(kind.displayName) must always be drawn")
+            }
+            for kind in [BlockKind.cancellationBlock, .platformRestriction, .unknownUnavailable] {
+                let item = event(key: kind.rawValue, platform: .airbnb, kind: kind,
+                                 from: (2027, 3, 1), to: (2027, 3, 4), listingID: 1)
+                let hidden: Bool
+                switch item.displayStatus {
+                case .confirmed, .ownerBlock, .maintenance: hidden = false
+                default: hidden = true
+                }
+                expect.ok(hidden, "\(kind.displayName) is hidden by default")
+            }
+        },
+
         TestCase(group: "Conflict categories",
                  name: "a fully readable, fully open day is not a difference") { expect in
             let differences = AvailabilityOverview().differences(
