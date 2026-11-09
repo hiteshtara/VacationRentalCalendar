@@ -79,14 +79,29 @@ Both loose ends from the previous round are closed: the truncating setup is now
 | macOS app | built, signed, installed at `/Applications/VacationRentalCalendar.app` |
 | Cloud integration | **working** — the app reads live status/availability from AWS staging via the bundled `vrc` helper |
 | AWS staging | **deployed** in account …1110, us-east-1; cluster + 5 Lambdas + API Gateway + 3 buckets + 4 secrets |
-| Tests | **369 tests / 1242 assertions**, passing on macOS; 350/1164 last verified on Linux (the 19 newer tests have not been run there — see §5) |
+| Tests | **369 tests**, passing on **macOS and Linux** (1242 assertions with the PostgreSQL group live, 1223 without) |
 | Cross-platform parity | byte-identical digest `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` |
-| Staging smoke tests | **A1–A5, B1–B6 done and passing.** B7, B8 and Phase C (PITR) remain; B9 is 3 of 4 layers verified |
+| Staging smoke tests | **A1–A6, B1–B6, B9 done.** B7 and B8 are **blocked** (§5); Phase C is **partially done and blocked at C2/C3** (§12) |
 | Outbound publishing | **off** — code gate, function env and database setting all verified `false` 2026-11-09; Terraform precondition not re-checked (§4) |
 | Scheduled imports | **disabled** (both EventBridge schedules DISABLED) |
 
 Completed milestones, newest first:
-1. **Destructive-test isolation, enforced in code** (commit `096d0ba`). The fix
+1. **Linux verification, and three faults it exposed in `build-lambda.sh`**
+   (commit `02f6df6`). All **369 tests now pass on Linux**, parity digest
+   identical to macOS. Getting there required fixing the script: it never
+   copied `Migrations/` into the container, so a test that reads those files
+   failed for want of a file — the "1 of 350 failed, not reproducible, likely a
+   timing flake" note in earlier handoffs was this, and it was fully
+   deterministic. It also printed `ok` for a failing suite, and its gates ran
+   inside a piped subshell with no `set -e`, so **a DIVERGED parity digest
+   would have printed a failure and shipped anyway** — contradicting CLAUDE.md's
+   claim that this script refuses to deploy on divergence. All three fixed; the
+   shell semantics were reproduced directly rather than assumed.
+2. **B9 complete — outbound publication is off at all four layers, each
+   verified.** Layer 3, the Terraform `precondition`, was the one still
+   outstanding; all six unsafe configurations are now shown to be rejected
+   plan-only with a non-zero exit (§5).
+3. **Destructive-test isolation, enforced in code** (commit `096d0ba`). The fix
    for the 2026-11-09 truncation: `DestructiveTestIsolation` refuses any target
    that does not prove itself disposable, on four independent grounds, failing
    closed on each. It lives inside the only function that deletes rows, so there
@@ -94,11 +109,11 @@ Completed milestones, newest first:
    the one that matters — pointed at the real `vrc-staging-main` with full
    consent, the suite refuses and staging's row counts do not move. Full detail
    at the top of this file.
-2. **Staging test litter removed** (no commit — a database operation). The two
+4. **Staging test litter removed** (no commit — a database operation). The two
    leftover `channel='race'` holds and their property were deleted by explicit
    primary key after confirming every dependent row count was zero. Staging now
    reports exactly the two documented demo intervals. See §4.
-3. **Smoke test B6 — concurrency over the Data API** (commit `7e9a99a`). Two
+5. **Smoke test B6 — concurrency over the Data API** (commit `7e9a99a`). Two
    `RentalStore`s on independent transports race to claim the same nights on one
    property; the `no_overlapping_live_holds` exclusion constraint is the only
    arbiter. Exactly one is accepted, the loser's refusal must name that
@@ -109,18 +124,18 @@ Completed milestones, newest first:
    all four assertions, including `expected 1, got 2` live holds — a real double
    booking. Passed against local PostgreSQL 17.10 **and** live Aurora over the
    RDS Data API (10/10, 29 assertions in the group). Parity digest unchanged.
-4. **Daterange Data API fix** (found by B5 against real Aurora) — `SELECT *` on
+6. **Daterange Data API fix** (found by B5 against real Aurora) — `SELECT *` on
    tables with generated `daterange` columns 400s over the RDS Data API;
    replaced with explicit column lists. Lambdas redeployed.
-5. **GUI keychain fix via helper delegation** — the SwiftUI app could not read
+7. **GUI keychain fix via helper delegation** — the SwiftUI app could not read
    the AWS credential (macOS pins each keychain item to the creating binary's
    code hash; the GUI and `vrc` are different code objects). The GUI now calls
    the bundled `vrc cloud check --json` helper, which returns only sanitized
    JSON. See [docs/KEYCHAIN.md](docs/KEYCHAIN.md).
-6. **Cloud integration in the Mac app** — Cloud pane, AWS status-bar indicator,
+8. **Cloud integration in the Mac app** — Cloud pane, AWS status-bar indicator,
    Refresh from AWS, build-provenance tab.
-7. **Staging deployed and validated** (A1–A5, B1–B5).
-8. **Minimal AWS backend** — DataStore over the RDS Data API, 5 Lambda handlers,
+9. **Staging deployed and validated** (A1–A5, B1–B5).
+10. **Minimal AWS backend** — DataStore over the RDS Data API, 5 Lambda handlers,
    restricted DB role, Postgres schema generated from the SQLite migrator.
 
 ---
@@ -268,15 +283,13 @@ swift run vrc-test                      # 369 tests / 1223 assertions — all pa
 swift run vrc-parity --digest           # b3398471…c604f5
 ./Scripts/build-lambda.sh               # also runs the suite inside Linux; parity must match
 ```
-- macOS: **all 369 pass**, verified at commit `096d0ba`. Two assertion counts are
-  both correct: **1223** for a plain `swift run vrc-test`, where the PostgreSQL
-  group skips, and **1242** with that group live (see the gate below).
-- Linux: **350/350 last verified at `08c3bc1`.** The 19 newer tests — 2 from B6,
-  17 from the isolation guard — have **not** been run on Linux. They use
-  `DispatchSemaphore`, `DispatchQueue.global()` and plain enums, all of which
-  corelibs supports, so they are expected to pass — but expected is not verified.
-  `./Scripts/build-lambda.sh` runs the suite in the container and will settle it.
-  Do that before trusting the Linux number.
+- macOS: **all 369 pass**. Two assertion counts are both correct: **1223** for a
+  plain `swift run vrc-test`, where the PostgreSQL group skips, and **1242** with
+  that group live (see the gate below).
+- Linux: **all 369 pass**, 1223 assertions, in `swift:6.3.3-amazonlinux2023` —
+  verified at commit `02f6df6`. The container has no PostgreSQL, so the group
+  skips and the count matches the macOS no-Postgres figure exactly.
+- Parity digest **identical on macOS and Linux**, confirmed in the same run.
 - Parity digest **unchanged**: `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5`.
   B6 is test-only, so parity could not move; it was re-checked anyway.
 
@@ -291,10 +304,58 @@ swift run vrc-parity --digest           # b3398471…c604f5
 | B4 sweeper by hand → holdsReleased:0, no reservation touched | ✅ (prior run) |
 | **B5 Data API transactions: Swift suite vs cluster** | ✅ **8/8 against live Aurora** |
 | **B6 concurrency: overlapping holds, one winner** | ✅ **passed on local PostgreSQL 17.10 and live Aurora** (group now 10/10, 29 assertions) |
-| B7 `POST /decisions` twice, one idempotency key | ⬜ **not started** |
-| B8 kill mid-write → client reports UNKNOWN | ⬜ **not started** |
-| B9 publication still impossible | 🟨 **3 of 4 layers verified** — code, function env and database all `false`; the Terraform `precondition` (layer 3) not re-checked. See the §4 table |
-| Phase C PITR into a temporary cluster, then delete | ⬜ remaining |
+| B7 `POST /decisions` twice, one idempotency key | 🟥 **blocked** — see below |
+| B8 kill mid-write → client reports UNKNOWN | 🟥 **blocked** — see below |
+| **B9 publication still impossible** | ✅ **all four layers verified** — see the §4 table |
+| Phase C PITR into a temporary cluster, then delete | 🟨 **C1 and C4 pass, C2/C3 blocked, C5 done** — see §12 |
+
+### B9 layer 3, verified plan-only 2026-11-09
+
+`terraform plan` with each unsafe value, against the saved staging configuration.
+Nothing was applied.
+
+| Variable forced | Exit | Rejected by |
+|---|---|---|
+| `outbound_enabled=true` | **1** | `precondition` — "REFUSED: outbound_enabled must be false in staging" |
+| `create_dns=true` | **1** | `precondition` |
+| `create_cdn=true` | **1** | `precondition` |
+| `allow_priyankahomes_read=true` | **1** | `precondition` |
+| `region=eu-west-1` | **1** | `precondition` |
+| `seconds_until_auto_pause=60` | **1** | **variable validation**, not the precondition — a different layer, equally non-zero |
+| *control:* the real `staging.tfvars` | **0** | nothing — "No changes" |
+
+A plan file **is** written on the error path, which looks alarming and is not:
+`terraform show -json` reports `errored: true, applyable: false, complete: false`
+on it, versus `errored: false, complete: true` for the control. Terraform writes
+an errored plan for inspection and `apply` refuses it.
+
+### Why B7 and B8 are blocked, precisely
+
+Both need to exercise the **deployed API** against a **disposable** database.
+Three routes exist and all three are closed:
+
+1. **Point the existing staging API at the disposable cluster** — forbidden, and
+   it would not work anyway: `vrc-staging-lambda-api`'s policy scopes
+   `rds-data:*` to `vrc-staging-main` alone. So does every other `vrc-*` role.
+   Widening one means editing shared staging configuration.
+2. **Deploy a temporary API Lambda of its own** — a Lambda needs an execution
+   role, and creating an IAM role was refused by the session's permission
+   policy. Nothing was created.
+3. **Run the deployed artifact locally against the disposable cluster** — a
+   harness for exactly this was written (the arm64 `bootstrap` from
+   `api.zip` under the official `provided:al2023` Runtime Interface Emulator,
+   which the image ships at `/usr/local/bin/aws-lambda-rie`). It is unusable,
+   because the handler speaks only the RDS Data API and **the Data API cannot be
+   enabled on a PITR-restored cluster** (§12).
+
+Much of what B7/B8 assert is already covered at unit level against fakes — see
+`DecisionRouteTests` ("the same key twice records one decision", "a reused
+publication UID with a NEW key is still not duplicated") and
+`CloudSyncClientTests` ("a dropped connection on a write is uncertain", "an
+uncertain write that DID apply is reconciled, not repeated"). What is missing is
+the same properties against the deployed service, and that is what stays
+unproven. Note for whoever unblocks it: `idempotency_keys` cannot be deleted by
+the runtime role, so each run needs a fresh `publicationUID`.
 
 **B7 and B8 were not begun.** Both need writes to the deployed staging API —
 B7 posts a decision twice, B8 interrupts a real write mid-flight — and the
@@ -509,24 +570,25 @@ Teardown (reversible, staging only): `./Scripts/staging-teardown.sh --destroy`.
 
 Ordered. **Each of these is a new task; the project is paused here.**
 
-1. **Finish staging validation.** ~~B6 (concurrency / no double booking)~~
-   **done**; ~~isolation guard~~ **done**; ~~staging litter~~ **done**.
-   Remaining: **B7** (idempotency), **B8** (interrupted write → UNKNOWN),
-   **B9 layer 3** (the Terraform `precondition`, the one layer of four still
-   unverified), **Phase C** (PITR drill into a temporary cluster, then delete
-   it), and **the Linux suite run** for the 19 newer tests.
+1. **Finish staging validation.** Done: ~~B6~~, ~~isolation guard~~, ~~staging
+   litter~~, ~~B9 (all four layers)~~, ~~Linux suite~~, ~~Phase C C1/C4/C5~~.
 
-   Two decisions to make before starting B7/B8, neither of which should be made
-   silently:
-   - **Where do they run?** They do not truncate, so the guard does not block
-     them against staging — but B7 writes a decision row and `idempotency_keys`
-     cannot be cleaned by the runtime role, so every run leaves a permanent key
-     behind. Use a fresh `publicationUID` per run, or run them on a disposable
-     cluster, which is cleaner but needs one created.
-   - **Phase C creates a real AWS cluster.** `restore-db-cluster-to-point-in-time`
-     is a resource-creating operation and needs explicit owner approval before it
-     is run, per CLAUDE.md. It also happens to produce exactly the disposable,
-     `pitr`-named cluster the guard accepts, so it is the natural host for B7/B8.
+   **What is genuinely left, and why it is not simply "retry":**
+   - **Phase C's C2 and C3 need the procedure redesigned, not repeated.** The
+     Data API cannot be enabled on a PITR-restored cluster, so there is no way
+     to reach one. §12 sets out the three candidate approaches and what each
+     costs. Pick one before spending any more on restores.
+   - **B7 and B8 depend on that same decision.** They need the deployed API
+     talking to a disposable database, and today there is no such combination
+     available: the staging roles are scoped to `vrc-staging-main`, creating a
+     role was refused, and a restored cluster is unreachable. A local
+     Runtime-Interface-Emulator harness is already written and waiting for a
+     reachable disposable cluster (§5).
+   - The cheapest unblock is probably to make a **purpose-built disposable
+     cluster with `create-db-cluster --enable-http-endpoint`** (not a restore),
+     migrate 010/011 into it, mark it disposable, and run B7/B8 and the
+     integration suite there. That gives up PITR verification but unblocks
+     everything else.
 2. **Prepare real imports (read-only):** confirm the Airbnb/Vrbo feed URLs read
    from the Keychain via the `vrc` helper; run the live feed-diff to measure the
    change-detection hit rate (decides the ~$5.76 vs ~$19.95/mo import cadence);
@@ -545,3 +607,80 @@ Ordered. **Each of these is a new task; the project is paused here.**
 GitHub visibility (it is intentionally public — secrets stay private), or touch
 PriyankaHomes / production DynamoDB / Google Calendar / DNS, without explicit
 owner approval.
+
+---
+
+## 12. Phase C — what the PITR drill actually proved, and where it stops
+
+Run 2026-11-09 under explicit owner authorization for a temporary, isolated
+recovery cluster. **The temporary resources were deleted afterwards; nothing
+from this drill remains.**
+
+### Result: C1 and C4 pass. C2 and C3 cannot be run at all. C5 done.
+
+| # | Test | Result |
+|---|---|---|
+| C1 | restore → a second, independent cluster appears | ✅ `vrc-staging-pitr` created from PITR of `vrc-staging-main`, restored to `2026-11-09T23:50:03Z`, 1 GB, own endpoint, own writer instance |
+| C2 | `vrc-migrate --status` against the restored cluster reports `10, 11` | 🟥 **impossible — no way to reach the cluster** |
+| C3 | safety assertions against the restored cluster | 🟥 **impossible, same reason** |
+| C4 | the restore is isolated; `vrc-staging-main` untouched | ✅ different endpoint, no shared instance, and staging still reads `properties=1 reservations=1 holds=1 availability_audit=41` with its own settings unchanged |
+| C5 | delete the temporary cluster | ✅ instance and cluster both deleted |
+
+### The blocker, which is a fault in the documented procedure
+
+**The RDS Data API cannot be enabled on a PITR-restored cluster**, and the
+Data API is the only route into these clusters.
+
+- `restore-db-cluster-to-point-in-time` has **no `EnableHttpEndpoint` field at
+  all** — confirmed from its own API model, not from documentation.
+- `modify-db-cluster` **does** have the field. It accepts it, returns success,
+  records no pending modification, and **does not change the setting** —
+  through the flag, through `--cli-input-json`, after the writer was available,
+  and across an off/on toggle. `rds-data` then answers
+  `HttpEndpointNotEnabledException`.
+- `restore-db-cluster-from-snapshot` has no such field either. Only
+  `create-db-cluster` does, and that cannot restore data.
+- There is no network path as an alternative: the restored instance is not
+  publicly accessible, its subnets have **no internet-gateway route**, and the
+  security group has **no ingress rules at all**. That is by design — the whole
+  architecture uses the Data API precisely so the Lambdas need no VPC.
+
+A full config diff of the two clusters showed only `HttpEndpointEnabled` and
+`CopyTagsToSnapshot` differing: nothing structural explains it. The source
+cluster has the Data API on because Terraform set it **at creation**.
+
+**So docs/STAGING-DEPLOYMENT.md §6's Phase C is not executable as written.**
+C2 and C3 assume the restored cluster is reachable; it is not. Whoever picks
+this up has to change the procedure, not retry it. The plausible options, none
+yet tested:
+
+1. Restore, then **create a new cluster with `create-db-cluster
+   --enable-http-endpoint` and migrate the restored data into it** — clumsy, and
+   it tests the wrong thing.
+2. Verify the restored cluster **from inside the VPC** — a Lambda attached to
+   the subnets, or a short-lived bastion. Both need IAM and network changes.
+3. Accept that PITR verification is **structural only** — the restore
+   completed, the cluster is independent, the source is untouched — and verify
+   schema and data integrity on the staging cluster instead, where the Data API
+   is already on. This is the cheapest honest answer, and it is weaker: it never
+   proves a restored database is actually usable.
+
+### Resources created, and the cost
+
+| Resource | Identifier | State |
+|---|---|---|
+| Cluster | `vrc-staging-pitr` (`arn:aws:rds:us-east-1:589744711110:cluster:vrc-staging-pitr`) | **deleted** |
+| Instance | `vrc-staging-pitr-writer`, `db.serverless` | **deleted** |
+| IAM role | `vrc-pitr-lambda-api` | **never created** — refused by the session's permission policy |
+
+Lifetime: cluster `23:37:33Z` → `~23:55Z` (~18 min); writer `~23:41Z` → `23:52Z`
+(~11 min, of which ~5 available).
+
+Cost, at rates read from the **AWS Pricing API** rather than quoted from memory:
+Aurora Serverless v2 **$0.12 per ACU-hour**, storage **$0.10 per GB-month**, I/O
+**$0.20 per million requests**. With one writer at low ACU for roughly a fifth of
+an hour and 1 GB for under 20 minutes, the incremental charge is **under $0.10,
+most likely $0.02–$0.05**. Cost Explorer had not yet published same-day figures
+(it lags about a day), so this is computed from verified rates and measured
+lifetimes, not observed billing. Confirm against Cost Explorer tomorrow if the
+exact number matters.
