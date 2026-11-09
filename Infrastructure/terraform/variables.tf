@@ -4,11 +4,6 @@ variable "region" {
   default     = "us-east-1"
 }
 
-variable "app_domain" {
-  description = "Hostname for the dashboard."
-  type        = string
-  default     = "calendar.bostonfurnishedstays.com"
-}
 
 variable "feed_domain" {
   description = "Hostname serving the filtered iCal feeds."
@@ -16,10 +11,6 @@ variable "feed_domain" {
   default     = "feeds.39gstboston.com"
 }
 
-variable "app_zone_name" {
-  type    = string
-  default = "bostonfurnishedstays.com"
-}
 
 variable "feed_zone_name" {
   type    = string

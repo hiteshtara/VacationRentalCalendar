@@ -20,14 +20,12 @@
 resource "aws_secretsmanager_secret" "source_feed_urls" {
   name                    = "vrc/sources/feed-urls"
   description             = "Inbound platform iCal export URLs. Read only by the fetcher."
-  kms_key_id              = aws_kms_key.main.arn
   recovery_window_in_days = 30
 }
 
 resource "aws_secretsmanager_secret" "outbound_feed_tokens" {
   name                    = "vrc/outbound/feed-tokens"
   description             = "Random object-key secrets for published feeds. Read only by the publisher."
-  kms_key_id              = aws_kms_key.main.arn
   recovery_window_in_days = 30
 }
 

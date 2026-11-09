@@ -42,12 +42,6 @@ resource "aws_iam_role_policy" "fetcher" {
         Resource = [aws_secretsmanager_secret.source_feed_urls.arn]
       },
       {
-        Sid      = "DecryptWithProjectKey"
-        Effect   = "Allow"
-        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
-        Resource = [aws_kms_key.main.arn]
-      },
-      {
         Sid      = "WriteRawPayloadsAndReadPriorHashes"
         Effect   = "Allow"
         Action   = ["s3:PutObject", "s3:GetObject"]
@@ -96,12 +90,6 @@ resource "aws_iam_role_policy" "processor" {
         Resource = [aws_secretsmanager_secret.db_master.arn]
       },
       {
-        Sid      = "DecryptWithProjectKey"
-        Effect   = "Allow"
-        Action   = ["kms:Decrypt"]
-        Resource = [aws_kms_key.main.arn]
-      },
-      {
         Sid      = "ReadRawPayloads"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
@@ -142,12 +130,6 @@ resource "aws_iam_role_policy" "publisher" {
           aws_secretsmanager_secret.db_master.arn,
           aws_secretsmanager_secret.outbound_feed_tokens.arn,
         ]
-      },
-      {
-        Sid      = "DecryptWithProjectKey"
-        Effect   = "Allow"
-        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
-        Resource = [aws_kms_key.main.arn]
       },
       {
         # Writes the feed and its last-known-good copy. Deliberately no
@@ -197,11 +179,6 @@ resource "aws_iam_role_policy" "api" {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = [aws_secretsmanager_secret.db_master.arn]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["kms:Decrypt"]
-        Resource = [aws_kms_key.main.arn]
       },
       {
         Effect   = "Allow"

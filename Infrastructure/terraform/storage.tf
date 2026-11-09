@@ -1,20 +1,19 @@
-resource "aws_kms_key" "main" {
-  description             = "VacationRentalCalendar: database, secrets, S3"
-  deletion_window_in_days = 30
-  enable_key_rotation     = true
-}
+# Encryption uses AWS-managed keys throughout: aws/s3, aws/secretsmanager,
+# aws/rds and aws/logs. All are free, all encrypt at rest, and none needs a key
+# policy in a single-operator account where IAM already scopes every reader to
+# one secret or one bucket prefix.
+#
+# If a customer-managed key is ever wanted -- for a key policy as a second
+# layer of deny, or for an audit requirement -- it is one resource and $1/month
+# per key version, and every encrypted resource below takes a kms_key_id.
 
-resource "aws_kms_alias" "main" {
-  name          = "alias/vrc-main"
-  target_key_id = aws_kms_key.main.key_id
-}
+
 
 locals {
   buckets = {
     feeds     = "Published iCal feeds. Served through CloudFront at the feed domain."
     raw       = "Raw fetched payloads, for forensics when an import is disputed."
     snapshots = "Versioned database snapshots and reconciliation reports."
-    dashboard = "Dashboard static assets."
   }
 }
 
@@ -43,8 +42,11 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
   bucket   = aws_s3_bucket.main[each.key].id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
-      kms_master_key_id = aws_kms_key.main.arn
+      # The AWS-managed aws/s3 key. A customer-managed key is $1/month per
+      # key version, and automatic rotation adds a version every year, so it
+      # would grow to a sixth of this system's entire bill while adding a key
+      # policy that one operator with least-privilege IAM does not need.
+      sse_algorithm = "aws:kms"
     }
     bucket_key_enabled = true
   }

@@ -7,7 +7,7 @@ resource "aws_scheduler_schedule" "import" {
   flexible_time_window { mode = "OFF" }
 
   target {
-    arn      = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:vrc-fetch"
+    arn      = aws_lambda_function.functions["fetch"].arn
     role_arn = aws_iam_role.scheduler.arn
   }
 
@@ -22,7 +22,7 @@ resource "aws_scheduler_schedule" "sweeper" {
   flexible_time_window { mode = "OFF" }
 
   target {
-    arn      = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:vrc-sweeper"
+    arn      = aws_lambda_function.functions["sweeper"].arn
     role_arn = aws_iam_role.scheduler.arn
   }
 
@@ -50,8 +50,8 @@ resource "aws_iam_role_policy" "scheduler" {
       Effect = "Allow"
       Action = ["lambda:InvokeFunction"]
       Resource = [
-        "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:vrc-fetch",
-        "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:vrc-sweeper",
+        aws_lambda_function.functions["fetch"].arn,
+        aws_lambda_function.functions["sweeper"].arn,
       ]
     }]
   })

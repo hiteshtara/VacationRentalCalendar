@@ -9,7 +9,6 @@ resource "random_password" "db_master" {
 resource "aws_secretsmanager_secret" "db_master" {
   name                    = "vrc/database/master"
   description             = "Aurora master credentials. Consumed by the RDS Data API by ARN."
-  kms_key_id              = aws_kms_key.main.arn
   recovery_window_in_days = 30
 }
 
@@ -48,7 +47,6 @@ resource "aws_rds_cluster" "main" {
   vpc_security_group_ids = [aws_security_group.db.id]
 
   storage_encrypted = true
-  kms_key_id        = aws_kms_key.main.arn
 
   backup_retention_period      = 7
   preferred_backup_window      = "07:00-08:00"

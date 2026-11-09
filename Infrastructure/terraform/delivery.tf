@@ -1,7 +1,3 @@
-data "aws_route53_zone" "app" {
-  name         = "${var.app_zone_name}."
-  private_zone = false
-}
 
 data "aws_route53_zone" "feeds" {
   name         = "${var.feed_zone_name}."
@@ -11,11 +7,6 @@ data "aws_route53_zone" "feeds" {
 # Certificates are validated by DNS records added to zones that already exist.
 # Nothing else in either zone is touched: the live website's records are not
 # read, modified or referenced.
-resource "aws_acm_certificate" "app" {
-  domain_name       = var.app_domain
-  validation_method = "DNS"
-  lifecycle { create_before_destroy = true }
-}
 
 resource "aws_acm_certificate" "feeds" {
   domain_name       = var.feed_domain
@@ -23,16 +14,6 @@ resource "aws_acm_certificate" "feeds" {
   lifecycle { create_before_destroy = true }
 }
 
-resource "aws_route53_record" "app_validation" {
-  for_each = {
-    for d in aws_acm_certificate.app.domain_validation_options : d.domain_name => d
-  }
-  zone_id = data.aws_route53_zone.app.zone_id
-  name    = each.value.resource_record_name
-  type    = each.value.resource_record_type
-  records = [each.value.resource_record_value]
-  ttl     = 60
-}
 
 resource "aws_route53_record" "feeds_validation" {
   for_each = {
@@ -105,36 +86,3 @@ resource "aws_cloudfront_cache_policy" "short" {
   }
 }
 
-resource "aws_cloudfront_distribution" "app" {
-  enabled             = true
-  comment             = "VRC dashboard"
-  aliases             = [var.app_domain]
-  price_class         = "PriceClass_100"
-  is_ipv6_enabled     = true
-  default_root_object = "index.html"
-
-  origin {
-    domain_name              = aws_s3_bucket.main["dashboard"].bucket_regional_domain_name
-    origin_id                = "dashboard"
-    origin_access_control_id = aws_cloudfront_origin_access_control.s3.id
-  }
-
-  default_cache_behavior {
-    target_origin_id       = "dashboard"
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD"]
-    cached_methods         = ["GET", "HEAD"]
-    compress               = true
-    cache_policy_id        = aws_cloudfront_cache_policy.short.id
-  }
-
-  viewer_certificate {
-    acm_certificate_arn      = aws_acm_certificate.app.arn
-    ssl_support_method       = "sni-only"
-    minimum_protocol_version = "TLSv1.2_2021"
-  }
-
-  restrictions {
-    geo_restriction { restriction_type = "none" }
-  }
-}
