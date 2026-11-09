@@ -4,6 +4,11 @@ public struct AvailabilityRepository: Sendable {
     let database: DataStore
     public init(database: DataStore) { self.database = database }
 
+    /// Explicit column list rather than `SELECT *`. The Postgres schema adds a
+    /// generated `stay daterange` column the RDS Data API cannot return, so
+    /// `SELECT *` would 400 over the Data API. Found by B5.
+    static let columns = "id, property_id, destination, action, start_day, end_day, status, reason, publication_uid, created_at, updated_at, validated_at, approved_at, approved_by, published_at, refresh_expected_by, verified_at, cancelled_at, failure_reason, supersedes_id, created_by"
+
     private func decode(_ row: Row) -> AvailabilityDecision {
         AvailabilityDecision(
             id: row.int("id"),
@@ -79,19 +84,19 @@ public struct AvailabilityRepository: Sendable {
 
     public func find(id: Int64) throws -> AvailabilityDecision? {
         try database.queryOne(
-            "SELECT * FROM availability_decisions WHERE id = ?;", [.integer(id)]
+            "SELECT \(Self.columns) FROM availability_decisions WHERE id = ?;", [.integer(id)]
         ).map(decode)
     }
 
     public func all() throws -> [AvailabilityDecision] {
         try database.query(
-            "SELECT * FROM availability_decisions ORDER BY start_day, destination;"
+            "SELECT \(Self.columns) FROM availability_decisions ORDER BY start_day, destination;"
         ).map(decode)
     }
 
     public func forProperty(_ propertyID: Int64) throws -> [AvailabilityDecision] {
         try database.query("""
-            SELECT * FROM availability_decisions WHERE property_id = ?
+            SELECT \(Self.columns) FROM availability_decisions WHERE property_id = ?
             ORDER BY start_day, destination;
             """, [.integer(propertyID)]).map(decode)
     }
@@ -105,7 +110,7 @@ public struct AvailabilityRepository: Sendable {
             .map { "'\($0.rawValue)'" }
             .joined(separator: ", ")
         return try database.query("""
-            SELECT * FROM availability_decisions
+            SELECT \(Self.columns) FROM availability_decisions
             WHERE property_id = ? AND destination = ? AND action = 'block'
               AND status IN (\(statuses))
             ORDER BY start_day;
@@ -118,7 +123,7 @@ public struct AvailabilityRepository: Sendable {
             .map { "'\($0.rawValue)'" }
             .joined(separator: ", ")
         return try database.query("""
-            SELECT * FROM availability_decisions WHERE status IN (\(statuses))
+            SELECT \(Self.columns) FROM availability_decisions WHERE status IN (\(statuses))
             ORDER BY created_at DESC;
             """).map(decode)
     }

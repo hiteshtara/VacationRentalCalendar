@@ -309,11 +309,20 @@ public enum PostgresIntegrationTests {
                 + "\(DayMath.icalDateString(decision.endDay)) "
                 + "nights=\(decision.nights)\n"
         }
-        for entry in try store.auditLog.recent(limit: 50)
-            .sorted(by: { $0.detail < $1.detail }) {
-            report += "audit \(entry.actor)/\(entry.event) "
-                + "to=\(entry.toStatus?.rawValue ?? "-") detail=\(entry.detail)\n"
+        // Audit scoped to this run's decisions, not a global recent() — the
+        // availability_audit table is append-only to the runtime role, so on a
+        // shared cluster it accumulates across runs. Reading per current
+        // decision isolates the run and makes the comparison robust. Found by
+        // B5 on the real Data API.
+        var auditLines: [String] = []
+        for decision in try store.availability.all() {
+            guard let decisionID = decision.id else { continue }
+            for entry in try store.auditLog.entries(forDecision: decisionID) {
+                auditLines.append("audit \(entry.actor)/\(entry.event) "
+                    + "to=\(entry.toStatus?.rawValue ?? "-") detail=\(entry.detail)")
+            }
         }
+        for line in auditLines.sorted() { report += line + "\n" }
         return report
     }
 
@@ -479,8 +488,11 @@ public enum PostgresIntegrationTests {
             for kind in BlockKind.allCases {
                 let row = try store.database.queryOne(
                     "SELECT describes_genuine_unavailability(?) AS genuine", [.text(kind.rawValue)])
+                // A PostgreSQL boolean comes back as "t"/"f" over psql but as a
+                // booleanValue the Data API decodes to 1/0. Accept both so the
+                // test asserts the business rule, not the wire encoding.
                 let fromDatabase = (row?.string("genuine") ?? "").lowercased()
-                let databaseSaysYes = fromDatabase == "t" || fromDatabase == "true"
+                let databaseSaysYes = ["t", "true", "1"].contains(fromDatabase)
                 expect.equal(databaseSaysYes, kind.describesGenuineUnavailability,
                              "\(kind.rawValue): database=\(fromDatabase) "
                              + "swift=\(kind.describesGenuineUnavailability)")
