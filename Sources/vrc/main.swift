@@ -416,7 +416,12 @@ func runDoctor() {
         print("")
         let signature = CodeSignatureInfo.current()
         check("code signature survives a rebuild", signature.kind.survivesRebuild,
-              signature.kind.rawValue)
+              signature.kind.rawValue
+                  + (signature.authority.map { " — \($0)" } ?? ""))
+        if !signature.kind.survivesRebuild {
+            print("     Run ./Scripts/fix-signing.sh once to stop the repeated")
+            print("     Keychain prompts after every rebuild.")
+        }
         print("")
         print("Credential store: \(store.credentials.storageDescription)")
         print("Code signature:   \(signature.kind.rawValue)"
