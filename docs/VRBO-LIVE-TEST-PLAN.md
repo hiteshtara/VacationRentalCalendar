@@ -117,9 +117,11 @@ The custom-domain requirement is Cloudflare's, not a preference of mine. The
 docs state `r2.dev` "is intended for non-production traffic", is rate-limited,
 and supports no caching, WAF, access controls or Bot Management; they also warn
 that CNAMEing to it is "an unsupported access path" with no reliability
-guarantee. If you already own one, it is
-free. Rates used: storage $0.015/GB-month, Class A $4.50/million, Class B
-$0.36/million, egress free.
+guarantee.
+
+Rates used: storage $0.015/GB-month, Class A $4.50/million, Class B
+$0.36/million, egress free. If you already own a domain, the whole thing is
+free.
 
 For comparison, the channel manager this replaces is tens of dollars a month.
 
@@ -147,9 +149,11 @@ version wrote its publication rows into the real one, which would have corrupted
 the next genuine publish, since the safety diff compares against the last known
 good feed and a rehearsal snapshot is not one. Those rows were removed.
 
-**189 tests, 791 assertions, all passing.** Twelve are new and cover the URL
-structure, cache policy, the eight-night output, the protected nights, approval
-gating, both failure modes, rollback and failure reporting.
+**201 tests, 844 assertions, all passing.** Twenty-four cover this work: the
+URL structure, cache policy, the eight-night output, the protected nights,
+approval gating, both failure modes, rollback, failure reporting, rehearsal
+isolation, the publication preconditions, and the refusal to describe any of
+this as real time.
 
 ---
 
