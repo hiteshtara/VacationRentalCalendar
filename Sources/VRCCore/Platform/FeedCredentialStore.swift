@@ -36,9 +36,14 @@ public enum FeedCredentialError: Error, LocalizedError {
         case .notFound(let reference):
             return "No feed URL is stored under \"\(reference)\"."
         case .timedOut:
-            return "The Keychain did not answer in time. macOS is probably waiting for you to "
-                + "approve access — look for a \"Vacation Rental Calendar wants to use your "
-                + "confidential information\" prompt and choose Always Allow."
+            return "macOS is waiting for you to approve access to this feed URL. Look for a "
+                + "\"Vacation Rental Calendar wants to use your confidential information\" "
+                + "prompt and choose Always Allow — not Allow, which grants a single use.\n\n"
+                + "This happens once per Keychain item after the app's signing identity "
+                + "changes. Items saved before the app was signed with a certificate recorded "
+                + "the old identity, and macOS cannot transfer that permission on your behalf. "
+                + "Once approved, it persists: the signing identity no longer changes between "
+                + "builds."
         }
     }
 }

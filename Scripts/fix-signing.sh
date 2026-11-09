@@ -33,6 +33,36 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 bad()  { printf '  \033[31mfail\033[0m %s\n' "$*"; }
 
+
+# Reads the designated requirement from stdout only — `codesign -d` writes
+# "Executable=…" to stderr, and merging the two invites matching the wrong line.
+# Normalised so that a stray "# " prefix, repeated spaces or a trailing newline
+# cannot make two identical requirements compare unequal.
+designated_requirement() {
+    codesign -d -r- "$1" 2>/dev/null \
+        | grep "designated" \
+        | head -1 \
+        | sed -e 's/^[[:space:]]*#[[:space:]]*//' \
+              -e 's/[[:space:]]\{1,\}/ /g' \
+              -e 's/^[[:space:]]*//' \
+              -e 's/[[:space:]]*$//'
+}
+
+# The signing authority. Requires -dvvv: plain -dv does NOT print Authority=,
+# which is exactly the mistake that made this check silently always fail.
+signing_authority() {
+    codesign -dvvv "$1" 2>&1 | sed -n 's/^Authority=//p' | head -1
+}
+
+# A requirement naming a certificate root survives rebuilds; one naming a
+# cdhash does not.
+requirement_is_certificate_based() {
+    case "$1" in
+        *"certificate root"*|*"certificate leaf"*|*anchor*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Runs a command with a time limit so a hidden prompt cannot wedge the script.
 bounded() {
     local seconds="$1"; shift
@@ -129,33 +159,83 @@ fi
 # --------------------------------------------------- 3. two consecutive rebuilds
 
 step "3. Building twice and comparing the signatures"
-say "  A stable identity means both builds must produce the same requirement."
+say "  Each build gets a different bundle version, so the binaries genuinely"
+say "  differ. A certificate-based requirement should survive that; an ad-hoc"
+say "  one would not."
 
-./Scripts/build-app.sh --install >/tmp/vrc-build-1.log 2>&1 \
+VRC_BUILD_NUMBER=101 ./Scripts/build-app.sh --install >/tmp/vrc-build-1.log 2>&1 \
     || { bad "first build failed, see /tmp/vrc-build-1.log"; exit 1; }
-FIRST=$(codesign -d -r- "${APP}" 2>&1 | grep "designated" | head -1)
-FIRST_AUTH=$(codesign -dv "${APP}" 2>&1 | grep -c "Authority=${IDENTITY}" || true)
-ok "build 1: ${FIRST}"
+FIRST_REQ="$(designated_requirement "${APP}")"
+FIRST_AUTH="$(signing_authority "${APP}")"
+FIRST_HASH="$(codesign -dvvv "${APP}" 2>&1 | sed -n 's/^CDHash=//p' | head -1)"
+ok "build 1 requirement: ${FIRST_REQ}"
+say "       authority: ${FIRST_AUTH:-<none>}"
+say "       cdhash:    ${FIRST_HASH:-<none>}"
 
-# Force a genuinely different binary so the comparison means something.
-touch Sources/VacationRentalCalendar/App.swift
-./Scripts/build-app.sh --install >/tmp/vrc-build-2.log 2>&1 \
+VRC_BUILD_NUMBER=102 ./Scripts/build-app.sh --install >/tmp/vrc-build-2.log 2>&1 \
     || { bad "second build failed, see /tmp/vrc-build-2.log"; exit 1; }
-SECOND=$(codesign -d -r- "${APP}" 2>&1 | grep "designated" | head -1)
-ok "build 2: ${SECOND}"
+SECOND_REQ="$(designated_requirement "${APP}")"
+SECOND_AUTH="$(signing_authority "${APP}")"
+SECOND_HASH="$(codesign -dvvv "${APP}" 2>&1 | sed -n 's/^CDHash=//p' | head -1)"
+ok "build 2 requirement: ${SECOND_REQ}"
+say "       authority: ${SECOND_AUTH:-<none>}"
+say "       cdhash:    ${SECOND_HASH:-<none>}"
 
-if [ "${FIRST}" = "${SECOND}" ] && [ "${FIRST_AUTH}" -gt 0 ]; then
-    ok "the two builds share one designated requirement"
-    say ""
-    say "  That is the fix. A Keychain permission granted once now keeps"
-    say "  working across every future rebuild."
+# Each condition is checked and reported separately. Folding them together is
+# what produced the earlier false alarm: a failing authority check printed a
+# message about the requirement changing.
+PROBLEMS=0
+
+if [ -z "${FIRST_REQ}" ] || [ -z "${SECOND_REQ}" ]; then
+    bad "could not read a designated requirement from the bundle"
+    PROBLEMS=$((PROBLEMS + 1))
+elif [ "${FIRST_REQ}" = "${SECOND_REQ}" ]; then
+    ok "the designated requirement is identical across both builds"
 else
-    bad "the requirement changed between builds"
-    say "  build 1: ${FIRST}"
-    say "  build 2: ${SECOND}"
-    say "  If both say \"cdhash\", the builds are still ad-hoc signed."
+    bad "the designated requirement changed between builds"
+    say "      build 1: ${FIRST_REQ}"
+    say "      build 2: ${SECOND_REQ}"
+    PROBLEMS=$((PROBLEMS + 1))
+fi
+
+if requirement_is_certificate_based "${SECOND_REQ}"; then
+    ok "the requirement names a certificate, so it survives rebuilds"
+else
+    bad "the requirement is hash-based, so Keychain grants will not stick"
+    say "      ${SECOND_REQ}"
+    PROBLEMS=$((PROBLEMS + 1))
+fi
+
+if [ "${FIRST_AUTH}" = "${IDENTITY}" ]; then
+    ok "signed by \"${IDENTITY}\""
+else
+    bad "unexpected signing authority"
+    say "      expected: ${IDENTITY}"
+    say "      found:    ${FIRST_AUTH:-<none>}"
+    PROBLEMS=$((PROBLEMS + 1))
+fi
+
+if [ -n "${FIRST_HASH}" ] && [ "${FIRST_HASH}" != "${SECOND_HASH}" ]; then
+    ok "the binaries really did differ, so the comparison means something"
+else
+    say "  note: both builds produced the same code hash, so this run did not"
+    say "        actually exercise a rebuild. Not a failure."
+fi
+
+if codesign --verify --deep --strict --verbose=2 "${APP}" >/tmp/vrc-verify.log 2>&1; then
+    ok "bundle verifies and satisfies its designated requirement"
+else
+    bad "bundle verification failed, see /tmp/vrc-verify.log"
+    PROBLEMS=$((PROBLEMS + 1))
+fi
+
+if [ "${PROBLEMS}" -gt 0 ]; then
+    bad "${PROBLEMS} problem(s) above"
     exit 1
 fi
+say ""
+say "  That is the fix. A Keychain permission granted once now keeps"
+say "  working across every future rebuild."
 
 # ------------------------------------------------------- 4. can it read a feed?
 
