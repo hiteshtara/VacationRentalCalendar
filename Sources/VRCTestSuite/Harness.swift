@@ -101,6 +101,7 @@ public enum TestRegistry {
             + ICalParsingTests.cases
             + SemanticHashTests.cases
             + DataStoreTests.cases
+            + LambdaHandlerTests.cases
             + ClassifierTests.cases
             + ImportTests.cases
             + ConflictTests.cases

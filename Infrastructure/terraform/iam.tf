@@ -57,6 +57,15 @@ resource "aws_iam_role_policy" "fetcher" {
         Resource = var.priyankahomes_table_arns
       },
       {
+        # The one write the fetcher may perform, and it is not a data write:
+        # waking the processor when a feed has genuinely changed. Scoped to
+        # that single function.
+        Sid      = "WakeTheProcessorOnChange"
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = ["arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:vrc-process"]
+      },
+      {
         Sid      = "Logs"
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]

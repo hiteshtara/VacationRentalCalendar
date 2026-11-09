@@ -9,6 +9,12 @@ let package = Package(
         .executable(name: "vrc-test", targets: ["vrc-test"]),
         .executable(name: "vrc", targets: ["vrc"]),
         .executable(name: "vrc-parity", targets: ["vrc-parity"]),
+        .library(name: "VRCLambda", targets: ["VRCLambda"]),
+        .executable(name: "vrc-lambda-fetch", targets: ["vrc-lambda-fetch"]),
+        .executable(name: "vrc-lambda-process", targets: ["vrc-lambda-process"]),
+        .executable(name: "vrc-lambda-publish", targets: ["vrc-lambda-publish"]),
+        .executable(name: "vrc-lambda-api", targets: ["vrc-lambda-api"]),
+        .executable(name: "vrc-lambda-sweeper", targets: ["vrc-lambda-sweeper"]),
         .library(name: "VRCCore", targets: ["VRCCore"]),
     ],
     dependencies: [
@@ -38,7 +44,7 @@ let package = Package(
         // The canonical test suite. Plain Swift so it runs without Xcode.
         .target(
             name: "VRCTestSuite",
-            dependencies: ["VRCCore"],
+            dependencies: ["VRCCore", "VRCLambda"],
             path: "Sources/VRCTestSuite"
         ),
         // Front-end that runs the suite from the command line.
@@ -52,6 +58,39 @@ let package = Package(
             name: "vrc",
             dependencies: ["VRCCore"],
             path: "Sources/vrc"
+        ),
+        // The AWS handlers. Linux-only in practice, but builds on macOS so the
+        // tests run here too.
+        .target(
+            name: "VRCLambda",
+            dependencies: ["VRCCore"],
+            path: "Sources/VRCLambda"
+        ),
+        // The five handlers, each a thin entry point over VRCLambda.
+        .executableTarget(
+            name: "vrc-lambda-fetch",
+            dependencies: ["VRCCore", "VRCLambda"],
+            path: "Sources/vrc-lambda-fetch"
+        ),
+        .executableTarget(
+            name: "vrc-lambda-process",
+            dependencies: ["VRCCore", "VRCLambda"],
+            path: "Sources/vrc-lambda-process"
+        ),
+        .executableTarget(
+            name: "vrc-lambda-publish",
+            dependencies: ["VRCCore", "VRCLambda"],
+            path: "Sources/vrc-lambda-publish"
+        ),
+        .executableTarget(
+            name: "vrc-lambda-api",
+            dependencies: ["VRCCore", "VRCLambda"],
+            path: "Sources/vrc-lambda-api"
+        ),
+        .executableTarget(
+            name: "vrc-lambda-sweeper",
+            dependencies: ["VRCCore", "VRCLambda"],
+            path: "Sources/vrc-lambda-sweeper"
         ),
         // Cross-platform parity harness. Builds on Linux as well as macOS,
         // which is the whole point: it proves the business rules agree.

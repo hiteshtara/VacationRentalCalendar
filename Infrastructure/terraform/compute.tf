@@ -77,20 +77,30 @@ resource "aws_lambda_function" "functions" {
   filename         = data.archive_file.placeholder.output_path
   source_code_hash = data.archive_file.placeholder.output_base64sha256
 
+  # The fetcher is given no database variables at all. ServiceContext also
+  # refuses to run if VRC_DB_SECRET_ARN is present, so the rule is stated
+  # twice: once in IAM, once at runtime.
   environment {
-    variables = {
-      VRC_CLUSTER_ARN     = aws_rds_cluster.main.arn
-      VRC_DB_SECRET_ARN   = aws_secretsmanager_secret.db_runtime.arn
-      VRC_DB_NAME         = aws_rds_cluster.main.database_name
-      VRC_RAW_BUCKET      = aws_s3_bucket.main["raw"].bucket
-      VRC_FEEDS_BUCKET    = aws_s3_bucket.main["feeds"].bucket
-      VRC_SNAPSHOT_BUCKET = aws_s3_bucket.main["snapshots"].bucket
-      VRC_FEED_DOMAIN     = var.feed_domain
-      VRC_FEEDS_DIST_ID   = aws_cloudfront_distribution.feeds.id
-      # Outbound publication stays off in the deployed service too, not just
-      # in the Mac application. Flipping it is a reviewed change here as well.
-      VRC_OUTBOUND_ENABLED = "false"
-    }
+    variables = merge(
+      {
+        VRC_RAW_BUCKET           = aws_s3_bucket.main["raw"].bucket
+        VRC_FEEDS_BUCKET         = aws_s3_bucket.main["feeds"].bucket
+        VRC_SNAPSHOT_BUCKET      = aws_s3_bucket.main["snapshots"].bucket
+        VRC_FEED_DOMAIN          = var.feed_domain
+        VRC_FEEDS_DIST_ID        = aws_cloudfront_distribution.feeds.id
+        VRC_SOURCE_SECRET_ARN    = aws_secretsmanager_secret.source_feed_urls.arn
+        VRC_PROCESS_FUNCTION     = "vrc-process"
+        VRC_DISCONNECTED_SOURCES = "booking_com"
+        # Outbound publication is off in the deployed service too, not only in
+        # the Mac application. Flipping it is a reviewed change here as well.
+        VRC_OUTBOUND_ENABLED = "false"
+      },
+      each.key == "fetch" ? {} : {
+        VRC_CLUSTER_ARN   = aws_rds_cluster.main.arn
+        VRC_DB_SECRET_ARN = aws_secretsmanager_secret.db_runtime.arn
+        VRC_DB_NAME       = aws_rds_cluster.main.database_name
+      }
+    )
   }
 
   lifecycle {
