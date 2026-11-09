@@ -20,6 +20,14 @@ public enum FeedReductionCause: Sendable, Hashable, Identifiable {
     case staleInboundFeed(platforms: [RentalPlatform], hoursOld: Int)
     /// An inbound feed has never been read, or has no URL.
     case missingInboundFeed(platforms: [RentalPlatform])
+    /// A platform revoked the credential, or the owner switched the feed off.
+    ///
+    /// Deliberate in the sense that somebody caused it — and emphatically
+    /// **not** deliberate in the sense that matters here. Losing sight of a
+    /// platform's calendar is never a reason to put its nights back on sale;
+    /// if anything it is a stronger reason not to, because the app no longer
+    /// knows what is booked there.
+    case disconnectedFeed(platforms: [RentalPlatform], reason: String)
     /// The last import attempt failed.
     case importFailure(platforms: [RentalPlatform], detail: String)
     /// The database could not be read.
@@ -51,6 +59,7 @@ public enum FeedReductionCause: Sendable, Hashable, Identifiable {
         case .sourceEventModified: return "A source event changed and needs review"
         case .staleInboundFeed: return "An inbound calendar is stale"
         case .missingInboundFeed: return "An inbound calendar is missing"
+        case .disconnectedFeed: return "A platform feed is disconnected"
         case .importFailure: return "An import failed"
         case .databaseFailure: return "The database could not be read"
         case .unexplained: return "Unexplained reduction"
@@ -80,6 +89,11 @@ public enum FeedReductionCause: Sendable, Hashable, Identifiable {
         case .missingInboundFeed(let platforms):
             return "\(platforms.map(\.displayName).joined(separator: ", ")) "
                 + "\(platforms.count == 1 ? "has" : "have") never been read successfully."
+        case .disconnectedFeed(let platforms, let reason):
+            let names = platforms.map(\.displayName).joined(separator: ", ")
+            return "\(names) \(platforms.count == 1 ? "is" : "are") disconnected. \(reason) "
+                + "While a calendar is disconnected this app cannot see what is booked there, so "
+                + "it will not put any previously blocked night back on sale."
         case .importFailure(let platforms, let detail):
             return "\(platforms.map(\.displayName).joined(separator: ", ")): \(detail)"
         case .databaseFailure(let detail):
@@ -275,7 +289,20 @@ public struct FeedPublicationSafety: Sendable {
         var stale: [RentalPlatform] = []
         var staleHours = 0
         var missing: [RentalPlatform] = []
+        var disconnected: [RentalPlatform] = []
+        var disconnectReason = ""
+
         for listing in context.listings {
+            // Checked first: a disconnected feed is reported as disconnected
+            // rather than as merely stale, which it would otherwise become as
+            // time passes and which would misdescribe the problem.
+            if listing.connectionState.isDisconnected {
+                disconnected.append(listing.platform)
+                if disconnectReason.isEmpty {
+                    disconnectReason = listing.connectionState.explanation
+                }
+                continue
+            }
             guard let last = listing.lastSyncAt else {
                 missing.append(listing.platform)
                 continue
@@ -285,6 +312,11 @@ public struct FeedPublicationSafety: Sendable {
                 stale.append(listing.platform)
                 staleHours = max(staleHours, Int(age / 3_600))
             }
+        }
+        if !disconnected.isEmpty {
+            causes.append(.disconnectedFeed(
+                platforms: disconnected, reason: disconnectReason
+            ))
         }
         if !missing.isEmpty { causes.append(.missingInboundFeed(platforms: missing)) }
         if !stale.isEmpty {

@@ -51,6 +51,8 @@ func runHelp() {
       vrc feed --property <id> --to <platform> [--raw]
                                    Show the feed a destination would receive
       vrc availability             List availability decisions and audit history
+      vrc connection [--listing <id>] [--state <state>] [--detail "..."]
+                                   Show or change a feed's connection state
       vrc doctor                   Check the database, Keychain and outbound gate
 
     KINDS
@@ -332,6 +334,64 @@ func runAvailability() {
     }
 }
 
+/// Shows or changes a feed's connection state, with history.
+func runConnection() {
+    let store = makeStore()
+    guard let listingID = value(for: "--listing").flatMap(Int64.init) else {
+        // No listing given: summarise them all.
+        do {
+            for listing in try store.listings.all() {
+                print("[\(listing.id ?? 0)] \(pad(listing.platform.displayName, 12)) "
+                    + "\(pad(listing.connectionState.displayName, 28)) \(listing.label)")
+                if !listing.connectionDetail.isEmpty {
+                    print("      \(listing.connectionDetail)")
+                }
+                if let next = listing.connectionState.nextStep {
+                    print("      next: \(next)")
+                }
+            }
+        } catch {
+            bail("could not list connections: \(error)")
+        }
+        return
+    }
+
+    do {
+        guard let listing = try store.listings.find(id: listingID) else {
+            bail("no listing with id \(listingID)")
+        }
+        if let raw = value(for: "--state") {
+            guard let state = FeedConnectionState(rawValue: raw) else {
+                bail("--state must be one of: "
+                    + FeedConnectionState.allCases.map(\.rawValue).joined(separator: ", "))
+            }
+            try store.listings.setConnectionState(
+                listingID: listingID, to: state,
+                detail: value(for: "--detail") ?? "",
+                httpStatus: value(for: "--http").flatMap(Int.init),
+                actor: value(for: "--actor") ?? "owner"
+            )
+            print("\(listing.label) → \(state.displayName)")
+            if !state.shouldAttemptImport {
+                print("This feed will no longer be fetched.")
+            }
+        }
+
+        let updated = try store.listings.find(id: listingID)!
+        print("")
+        print("State:  \(updated.connectionState.displayName)")
+        print("        \(updated.connectionState.explanation)")
+        if let next = updated.connectionState.nextStep { print("Next:   \(next)") }
+        print("")
+        print("History:")
+        for entry in try store.listings.connectionHistory(listingID: listingID) {
+            print("  \(entry.line)")
+        }
+    } catch {
+        bail("connection command failed: \(error)")
+    }
+}
+
 func runDoctor() {
     let store = makeStore()
     var problems = 0
@@ -380,6 +440,7 @@ case "classify": runClassify()
 case "conflicts": runConflicts()
 case "feed": runFeed()
 case "availability": runAvailability()
+case "connection": runConnection()
 case "export": runExport()
 case "doctor": runDoctor()
 case "help", "--help", "-h": runHelp()

@@ -266,6 +266,32 @@ public enum Migrator {
             UNIQUE(property_id, destination, version)
         );
         """),
+
+        Migration(version: 12, name: "feed_connection_state", sql: """
+        -- A feed that a platform has revoked is not the same thing as a feed
+        -- that failed to load. One is a settled fact about the connection, the
+        -- other is a transient problem — and only the second is worth retrying.
+        ALTER TABLE platform_listings
+            ADD COLUMN connection_state TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE platform_listings ADD COLUMN connection_changed_at REAL;
+        ALTER TABLE platform_listings
+            ADD COLUMN connection_detail TEXT NOT NULL DEFAULT '';
+
+        -- Configuration history is kept even when a connection is torn down,
+        -- so "this used to work, and here is when it stopped" stays answerable.
+        CREATE TABLE listing_connection_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            listing_id  INTEGER NOT NULL,
+            at          REAL NOT NULL,
+            from_state  TEXT,
+            to_state    TEXT NOT NULL,
+            actor       TEXT NOT NULL DEFAULT '',
+            detail      TEXT NOT NULL DEFAULT '',
+            http_status INTEGER
+        );
+        CREATE INDEX idx_connection_events_listing
+            ON listing_connection_events(listing_id, at DESC);
+        """),
     ]
 
     public static var latestVersion: Int {

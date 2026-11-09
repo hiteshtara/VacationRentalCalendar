@@ -66,6 +66,21 @@ public struct ImportService: Sendable {
 
         var run = SyncRun(listingID: listingID, startedAt: now)
 
+        // A revoked credential is never retried. The platform has already
+        // given its answer, and repeating the request only fills the history
+        // with failures that look like trouble rather than a settled fact.
+        guard listing.connectionState.shouldAttemptImport else {
+            run.outcome = .disconnected
+            run.finishedAt = Date()
+            run.errorMessage = listing.connectionState.explanation
+            try? syncRuns.record(run)
+            try? listings.recordSync(
+                listingID: listingID, at: now,
+                summary: "Not imported — \(listing.connectionState.displayName.lowercased())"
+            )
+            return ImportReport(run: run)
+        }
+
         // Resolved here, at the one moment it is needed, rather than on every
         // listing read. A Keychain prompt is tolerable when the owner just asked
         // for a refresh; it is not tolerable while drawing a calendar.
@@ -90,11 +105,35 @@ public struct ImportService: Sendable {
         do {
             response = try await fetcher.fetch(urlString: feedURL)
         } catch {
+            let message = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            if let fetchError = error as? FeedFetchError,
+               fetchError.indicatesRevokedCredential {
+                // Settled, not transient. Stop retrying and say so plainly.
+                var status: Int?
+                if case .credentialRejected(let code, _) = fetchError { status = code }
+                run.outcome = .disconnected
+                run.finishedAt = Date()
+                run.errorMessage = message
+                try? syncRuns.record(run)
+                try? listings.setConnectionState(
+                    listingID: listingID, to: .revoked, detail: message,
+                    httpStatus: status, actor: "import", at: now
+                )
+                try? listings.recordSync(
+                    listingID: listingID, at: now,
+                    summary: "Disconnected by the platform — a new export URL is needed"
+                )
+                return ImportReport(run: run)
+            }
+
             run.outcome = .failure
             run.finishedAt = Date()
-            run.errorMessage = (error as? LocalizedError)?.errorDescription
-                ?? error.localizedDescription
+            run.errorMessage = message
             try? syncRuns.record(run)
+            try? listings.setConnectionState(
+                listingID: listingID, to: .failing, detail: message, actor: "import", at: now
+            )
             try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
             return ImportReport(run: run)
         }
@@ -219,6 +258,9 @@ public struct ImportService: Sendable {
 
         report.run.outcome = .success
         report.run.finishedAt = Date()
+        try? listings.setConnectionState(
+            listingID: listingID, to: .connected, detail: "", actor: "import", at: now
+        )
         if let recorded = try? syncRuns.record(report.run) { report.run = recorded }
         try? listings.recordSync(
             listingID: listingID, at: now, summary: report.run.summaryLine
@@ -235,6 +277,10 @@ public struct ImportService: Sendable {
         var reports: [ImportReport] = []
         for listing in listingsToImport {
             if autoRefreshOnly && !listing.autoRefreshEnabled { continue }
+            // Revoked feeds are skipped even on an explicit refresh-all, so a
+            // dead connection cannot flood the history with failures.
+            if !listing.connectionState.shouldAttemptImport, listing.hasURL == false,
+               listing.connectionState == .notConfigured { continue }
             reports.append(await importFeed(for: listing, now: now))
         }
         return reports

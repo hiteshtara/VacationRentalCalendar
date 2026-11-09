@@ -41,6 +41,11 @@ public struct ListingRepository: Sendable {
             autoRefreshEnabled: row.bool("auto_refresh_enabled", default: true),
             lastSyncAt: row.date("last_sync_at"),
             lastSyncSummary: row.stringValue("last_sync_summary"),
+            connectionState: FeedConnectionState(
+                rawValue: row.stringValue("connection_state")
+            ) ?? .unknown,
+            connectionChangedAt: row.date("connection_changed_at"),
+            connectionDetail: row.stringValue("connection_detail"),
             createdAt: row.dateValue("created_at"),
             updatedAt: row.dateValue("updated_at")
         )
@@ -102,6 +107,61 @@ public struct ListingRepository: Sendable {
                 .text(reference), SQLValue(listing.autoRefreshEnabled),
                 SQLValue(Date()), .integer(id),
             ])
+    }
+
+    /// Moves a listing's connection state and records why, keeping the history
+    /// even when the connection itself is finished.
+    public func setConnectionState(
+        listingID: Int64,
+        to state: FeedConnectionState,
+        detail: String = "",
+        httpStatus: Int? = nil,
+        actor: String = "system",
+        at date: Date = Date()
+    ) throws {
+        let previous = try find(id: listingID)?.connectionState
+        guard previous != state || !detail.isEmpty else { return }
+
+        try database.run("""
+            UPDATE platform_listings
+            SET connection_state = ?, connection_changed_at = ?, connection_detail = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """, [
+                .text(state.rawValue), SQLValue(date), .text(detail),
+                SQLValue(date), .integer(listingID),
+            ])
+        try database.run("""
+            INSERT INTO listing_connection_events
+                (listing_id, at, from_state, to_state, actor, detail, http_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+            """, [
+                .integer(listingID), SQLValue(date), SQLValue(previous?.rawValue),
+                .text(state.rawValue), .text(actor), .text(detail), SQLValue(httpStatus),
+            ])
+    }
+
+    public func connectionHistory(listingID: Int64, limit: Int = 50) throws -> [ConnectionEvent] {
+        try database.query("""
+            SELECT * FROM listing_connection_events WHERE listing_id = ?
+            ORDER BY at DESC, id DESC LIMIT ?;
+            """, [.integer(listingID), .integer(Int64(limit))]).map { row in
+            ConnectionEvent(
+                id: row.int("id"),
+                listingID: row.int("listing_id") ?? 0,
+                at: row.dateValue("at"),
+                fromState: row.string("from_state").flatMap(FeedConnectionState.init(rawValue:)),
+                toState: FeedConnectionState(rawValue: row.stringValue("to_state")) ?? .unknown,
+                actor: row.stringValue("actor"),
+                detail: row.stringValue("detail"),
+                httpStatus: row.int("http_status").map(Int.init)
+            )
+        }
+    }
+
+    /// Listings a platform has disconnected, so the UI can ask for a new URL.
+    public func disconnected() throws -> [PlatformListing] {
+        try all().filter { $0.connectionState.isDisconnected }
     }
 
     public func recordSync(listingID: Int64, at date: Date, summary: String) throws {
