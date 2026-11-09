@@ -57,6 +57,8 @@ func runHelp() {
       vrc draft --property <id> --platform <p> --action block
                 --ranges YYYY-MM-DD:YYYY-MM-DD[,...] [--reason "..."]
                                    Record DRAFT decisions only; never advances
+      vrc approve --decision <id>[,<id>…]
+                                   Draft -> validated -> awaiting -> approved
       vrc connection [--listing <id>] [--state <state>] [--detail "..."]
                                    Show or change a feed's connection state
       vrc doctor                   Check the database, Keychain and outbound gate
@@ -585,6 +587,49 @@ func runDraft() {
     }
 }
 
+/// Walks a decision from draft to approved, re-validating on the way.
+/// Approval is not publication: see OutboundSyncGate.
+func runApprove() {
+    let store = makeStore()
+    guard let raw = value(for: "--decision") else {
+        bail("--decision <id>[,<id>…] is required")
+    }
+    let ids = raw.split(separator: ",").compactMap { Int64($0) }
+    guard !ids.isEmpty else { bail("no usable decision ids in \"\(raw)\"") }
+    let actor = value(for: "--actor") ?? "owner"
+
+    for id in ids {
+        do {
+            let (afterValidation, validation) =
+                try store.availabilityManager.validateDraft(decisionID: id, actor: actor)
+            print("DECISION #\(id)  \(afterValidation.summaryLine)")
+            print("  checks: \(validation.isRefused ? "REFUSED" : (validation.needsReview ? "review advised" : "no conflicts"))")
+            for violation in validation.violations {
+                print("    [\(violation.severity.rawValue)] \(violation.rule.rawValue) \(violation.message)")
+            }
+            guard !validation.isRefused else {
+                print("  not approved — \(afterValidation.status.displayName)")
+                print("")
+                continue
+            }
+
+            let approved = try store.availabilityManager.approve(decisionID: id, actor: actor)
+            let stamp = approved.approvedAt.map {
+                ISO8601DateFormatter().string(from: $0)
+            } ?? "—"
+            print("  status:      \(approved.status.rawValue)")
+            print("  approved at: \(stamp)")
+            print("  approved by: \(approved.approvedBy ?? "—")")
+            print("  published:   \(approved.publishedAt == nil ? "no — publication is a separate act" : "yes")")
+            print("")
+        } catch {
+            print("DECISION #\(id): \((error as? LocalizedError)?.errorDescription ?? "\(error)")")
+            print("")
+        }
+    }
+    print("Outbound publishing: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
+}
+
 func runDoctor() {
     let store = makeStore()
     var problems = 0
@@ -641,6 +686,7 @@ case "availability": runAvailability()
 case "connection": runConnection()
 case "preview": runPreview()
 case "draft": runDraft()
+case "approve": runApprove()
 case "export": runExport()
 case "doctor": runDoctor()
 case "help", "--help", "-h": runHelp()
