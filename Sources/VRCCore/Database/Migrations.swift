@@ -215,6 +215,57 @@ public enum Migrator {
         );
         CREATE INDEX idx_entries_publication ON published_feed_entries(publication_id);
         """),
+
+        Migration(version: 11, name: "feed_publication_safety", sql: """
+        -- The last feed each destination was actually served, kept in full.
+        -- Without it there is nothing to diff a proposed publication against,
+        -- and "the feed is empty" cannot be told apart from "the feed became
+        -- empty because an import failed".
+        CREATE TABLE feed_snapshots (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id         INTEGER NOT NULL,
+            destination         TEXT NOT NULL,
+            revision            INTEGER NOT NULL,
+            generated_at        REAL NOT NULL,
+            published_at        REAL,
+            checksum            TEXT NOT NULL,
+            entry_count         INTEGER NOT NULL DEFAULT 0,
+            covered_nights      INTEGER NOT NULL DEFAULT 0,
+            payload             TEXT NOT NULL DEFAULT '',
+            entry_uids          TEXT NOT NULL DEFAULT '',
+            is_last_known_good  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX idx_snapshots_dest
+            ON feed_snapshots(property_id, destination, revision DESC);
+        CREATE INDEX idx_snapshots_good
+            ON feed_snapshots(property_id, destination, is_last_known_good);
+
+        -- Publication is a pipeline, not an event. Each stage is recorded
+        -- separately so that a successful upload is never mistaken for a
+        -- platform having applied the change.
+        ALTER TABLE feed_publications ADD COLUMN stage TEXT NOT NULL DEFAULT 'generated';
+        ALTER TABLE feed_publications ADD COLUMN uploaded_at REAL;
+        ALTER TABLE feed_publications ADD COLUMN cache_invalidated_at REAL;
+        ALTER TABLE feed_publications ADD COLUMN verified_at REAL;
+        ALTER TABLE feed_publications ADD COLUMN removal_approved_by TEXT;
+        ALTER TABLE feed_publications ADD COLUMN removal_approved_at REAL;
+        ALTER TABLE feed_publications ADD COLUMN diff_summary TEXT NOT NULL DEFAULT '';
+        ALTER TABLE feed_publications ADD COLUMN safety_verdict TEXT NOT NULL DEFAULT '';
+        ALTER TABLE feed_publications ADD COLUMN failure_detail TEXT;
+
+        -- Which key version each destination's feed URL is on, so rotation is
+        -- recorded. The key itself lives in the Keychain and never here.
+        CREATE TABLE feed_tokens (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            property_id   INTEGER NOT NULL,
+            destination   TEXT NOT NULL,
+            version       INTEGER NOT NULL,
+            credential_ref TEXT NOT NULL,
+            created_at    REAL NOT NULL,
+            retired_at    REAL,
+            UNIQUE(property_id, destination, version)
+        );
+        """),
     ]
 
     public static var latestVersion: Int {

@@ -22,6 +22,8 @@ public final class RentalStore: @unchecked Sendable {
     public let policy: ExportPolicy
     public let availability: AvailabilityRepository
     public let auditLog: AvailabilityAuditLog
+    public let snapshots: FeedSnapshotRepository
+    public let feedTokens: FeedTokenRepository
     public private(set) var availabilityManager: AvailabilityManager!
     public private(set) var outbound: OutboundSyncCoordinator!
 
@@ -42,6 +44,8 @@ public final class RentalStore: @unchecked Sendable {
         self.exporter = ExportService(policy: policy)
         self.availability = AvailabilityRepository(database: database)
         self.auditLog = AvailabilityAuditLog(database: database)
+        self.snapshots = FeedSnapshotRepository(database: database)
+        self.feedTokens = FeedTokenRepository(database: database, credentials: credentials)
 
         // Built after the stored properties so they can close over `self`
         // safely; the closure only reads, and only on demand.
