@@ -243,13 +243,14 @@ struct SettingsPane: View {
     @State private var tab: Tab = .feeds
 
     enum Tab: String, CaseIterable, Identifiable {
-        case feeds, export, history
+        case feeds, export, history, build
         var id: String { rawValue }
         var title: String {
             switch self {
             case .feeds: return "Calendar feeds"
             case .export: return "Filtered export"
             case .history: return "Sync history"
+            case .build: return "This build"
             }
         }
     }
@@ -268,6 +269,7 @@ struct SettingsPane: View {
             case .feeds: FeedsView()
             case .export: ExportView()
             case .history: SyncHistoryView()
+            case .build: BuildView()
             }
         }
     }

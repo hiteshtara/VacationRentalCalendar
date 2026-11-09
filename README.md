@@ -1,12 +1,15 @@
 # Vacation Rental Calendar
 
+Start with the [project documentation](docs/README.md), including [how the application works and its diagrams](docs/PROJECT-GUIDE.md). The Mac app works locally; the AWS service is written but not deployed according to [the handoff](HANDOFF.md). Outbound publication remains disabled.
+
 A native macOS application that imports your Airbnb, Vrbo and Booking.com
 calendars into one view, finds double bookings, and produces a **filtered**
 outbound calendar — without a channel-manager subscription and without sending
 anything to a booking platform.
 
-Everything stays on your Mac: SQLite for data, the macOS Keychain for feed
-credentials, no server, no account, no third-party service.
+In the current local workflow, records stay in SQLite on your Mac and feed
+credentials stay in macOS Keychain. The planned AWS service will import calendars
+while the Mac sleeps; see the [current architecture guide](docs/PROJECT-GUIDE.md).
 
 ---
 
@@ -233,8 +236,8 @@ Sources/
   vrc-test/             Test runner
 ```
 
-There are **no third-party dependencies.** SQLite, Keychain, notifications and
-SwiftUI all come from the system.
+SQLite, Keychain, notifications and SwiftUI come from the system. Linux builds
+use Apple’s `swift-crypto` package for the shared cryptographic APIs.
 
 ### Data model
 

@@ -49,6 +49,15 @@ cp "${BIN_DIR}/${APP_NAME}" "${APP}/Contents/MacOS/${APP_NAME}"
 cp "${BIN_DIR}/vrc" "${APP}/Contents/MacOS/vrc"
 cp Resources/AppIcon.icns "${APP}/Contents/Resources/AppIcon.icns"
 
+# Build provenance. Without this, "is the installed app the build I just made?"
+# is unanswerable from the bundle, which is exactly the question that wasted an
+# afternoon. `git describe` is not used: this works in a dirty tree too, and
+# says so.
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if git diff --quiet HEAD 2>/dev/null; then GIT_STATE="clean"; else GIT_STATE="modified"; fi
+BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+
 cat > "${APP}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,6 +80,10 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>NSHumanReadableCopyright</key>      <string>Local build. Not for distribution.</string>
     <key>NSSupportsAutomaticTermination</key><false/>
     <key>NSSupportsSuddenTermination</key>   <false/>
+    <key>VRCGitCommit</key>                  <string>${GIT_COMMIT}</string>
+    <key>VRCGitBranch</key>                  <string>${GIT_BRANCH}</string>
+    <key>VRCWorkingTree</key>                <string>${GIT_STATE}</string>
+    <key>VRCBuildDate</key>                  <string>${BUILD_DATE}</string>
 </dict>
 </plist>
 PLIST
@@ -178,6 +191,23 @@ if [ "${INSTALL}" = true ]; then
     cp -R "${APP}" "/Applications/${APP_NAME}.app"
     echo "Installed at /Applications/${APP_NAME}.app"
     TARGET="/Applications/${APP_NAME}.app"
+
+    # A rebuilt helper has a new code hash, so it can no longer read the AWS
+    # credential a previous build stored (see docs/KEYCHAIN.md). If a credential
+    # is present but unreadable, offer to migrate it in place -- this reads the
+    # existing secret with your approval and hands it to the new helper. It does
+    # NOT create or rotate an AWS key. Skipped when there is nothing to migrate,
+    # and skippable entirely with VRC_SKIP_KEYCHAIN_MIGRATION=1.
+    HELPER_BIN="/Applications/${APP_NAME}.app/Contents/MacOS/vrc"
+    if [ "${VRC_SKIP_KEYCHAIN_MIGRATION:-0}" != "1" ] \
+       && "${HELPER_BIN}" cloud status 2>/dev/null | grep -q "could not be read"; then
+        echo ""
+        echo "The rebuilt helper cannot yet read its stored AWS credential."
+        echo "Running ./Scripts/migrate-cloud-credential.sh to re-own it."
+        echo "macOS will ask permission to read the existing secret — choose Always Allow."
+        ./Scripts/migrate-cloud-credential.sh || \
+            echo "  (migration skipped or declined; run it later to restore the Cloud pane)"
+    fi
 else
     TARGET="$(pwd)/${APP}"
 fi

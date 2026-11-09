@@ -63,6 +63,10 @@ func runHelp() {
                                    Run the publication pipeline in a sandbox
       vrc connection [--listing <id>] [--state <state>] [--detail "..."]
                                    Show or change a feed's connection state
+      vrc cloud [status|check]     Show or test the AWS staging connection
+      vrc cloud set-endpoint <url> [--region us-east-1]
+      vrc cloud set-credentials    Store an AWS access key (read without echo)
+      vrc keychain                 Report which stored items this build can read
       vrc doctor                   Check the database, Keychain and outbound gate
 
     KINDS
@@ -1025,6 +1029,215 @@ func runFeedDiff() async {
     }
 }
 
+// MARK: - Cloud
+
+/// Configures and inspects the AWS staging service.
+///
+/// The access key and secret are read with echo suppressed, stored in the
+/// Keychain, and never printed, logged or written to the database -- the same
+/// treatment feed URLs get.
+func runCloud() async {
+    let store = makeStore()
+    let connection = CloudConnection(settings: store.settings, credentials: store.credentials)
+    let subcommand = arguments.count > 1 ? arguments[1] : "status"
+
+    switch subcommand {
+    case "status":
+        print("AWS staging configuration")
+        print("")
+        switch connection.availability() {
+        case .configured(let endpoint, let region):
+            print("  endpoint    \(endpoint.absoluteString)")
+            print("  region      \(region)")
+            print("  credentials present in the Keychain and readable")
+        case .notConfigured(let missing):
+            print("  not configured — missing \(missing.joined(separator: ", "))")
+            print("")
+            print("  vrc cloud set-endpoint https://<id>.execute-api.<region>.amazonaws.com")
+            print("  vrc cloud set-credentials")
+        case .insecureEndpoint(let text):
+            print("  stored endpoint is not https and will not be used: \(text)")
+        case .credentialUnreadable(let detail):
+            print("  credentials are stored but could not be read: \(detail)")
+        }
+
+    case "set-endpoint":
+        guard arguments.count > 2 else {
+            bail("usage: vrc cloud set-endpoint <https url> [--region us-east-1]")
+        }
+        let region = value(for: "--region") ?? "us-east-1"
+        do {
+            try connection.setEndpoint(arguments[2], region: region)
+            print("Stored. endpoint \(arguments[2]) · region \(region)")
+        } catch {
+            bail("\(error)")
+        }
+
+    case "set-credentials":
+        // Non-interactive path for piping straight from `aws iam
+        // create-access-key`, so the secret never reaches a terminal, a shell
+        // history or a log. Two lines: key id, then secret.
+        if flags.contains("--stdin") {
+            guard let keyID = Swift.readLine(strippingNewline: true),
+                  let secret = Swift.readLine(strippingNewline: true),
+                  !keyID.isEmpty, !secret.isEmpty else {
+                bail("--stdin expects two lines: access key id, then secret")
+            }
+            do {
+                try connection.setCredentials(accessKeyID: keyID, secretAccessKey: secret)
+                print("Stored in the Keychain (\(keyID.count)-character key id).")
+            } catch {
+                bail("\(error)")
+            }
+            return
+        }
+
+        print("Storing an AWS access key for the staging API.")
+        print("")
+        print("  Your typing will not be shown. Neither value is printed, written")
+        print("  to the database, or stored in this project.")
+        if !SecureInput.standardInputIsTerminal {
+            print("")
+            print("  NOTE: standard input is not a terminal, so echo cannot be")
+            print("        suppressed. Saving is refused — run this in Terminal.")
+            exit(1)
+        }
+        print("")
+        guard let keyID = SecureInput.readLine(prompt: "  Access key ID: "),
+              !keyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            bail("no access key ID supplied")
+        }
+        guard let secret = SecureInput.readLine(prompt: "  Secret access key: "),
+              !secret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            bail("no secret access key supplied")
+        }
+        do {
+            try connection.setCredentials(
+                accessKeyID: keyID.trimmingCharacters(in: .whitespacesAndNewlines),
+                secretAccessKey: secret.trimmingCharacters(in: .whitespacesAndNewlines))
+            // Only the identifier's length is reported. Printing any part of
+            // either value would defeat reading them without echo.
+            print("")
+            print("Stored in the Keychain (\(keyID.count)-character key id).")
+        } catch {
+            bail("\(error)")
+        }
+
+    case "check":
+        // --json is the GUI's entry point. It prints exactly one line of
+        // sanitized JSON to stdout and nothing else there; every human message
+        // and every error goes to stderr. The GUI reads stdout only, so a
+        // stray diagnostic can never be parsed as status, and a secret can
+        // never reach stdout because only CloudStatusPayload is written there.
+        let asJSON = flags.contains("--json")
+
+        func emit(_ payload: CloudStatusPayload) -> Never {
+            if asJSON {
+                print(payload.encoded())
+                exit(payload.ok ? 0 : 0)   // JSON mode: the payload carries ok
+            }
+            exit(payload.ok ? 0 : 1)
+        }
+
+        guard let client = connection.makeClient() else {
+            switch connection.availability() {
+            case .insecureEndpoint(let text):
+                if asJSON { emit(.failure(.insecureEndpoint,
+                    "The stored endpoint is not https.")) }
+                bail("stored endpoint is not https: \(text)")
+            case .credentialUnreadable(let detail):
+                if asJSON { emit(.failure(.notConfigured,
+                    "The helper cannot read its AWS credential. Re-run vrc cloud set-credentials.")) }
+                bail(detail)
+            default:
+                if asJSON { emit(.failure(.notConfigured,
+                    "No AWS endpoint or credentials stored.")) }
+                bail("not configured — run `vrc cloud status`")
+            }
+        }
+        if asJSON {
+            do {
+                let status = try client.status()
+                let intervals = (try? client.availability()) ?? []
+                emit(.reached(status, intervals: intervals))
+            } catch {
+                // The error text from CloudSyncClient is secret-free by design
+                // (status codes and service messages, never the credential),
+                // but the GUI is given a fixed sentence regardless.
+                FileHandle.standardError.write(Data("could not reach the service: \(error)\n".utf8))
+                emit(.failure(.unreachable, "Could not reach the AWS service."))
+            }
+        }
+        do {
+            let status = try client.status()
+            print("Reached the service.")
+            print("")
+            print("  live source events     \(status.liveSourceEvents)")
+            print("  approved decisions     \(status.approvedDecisions)")
+            print("  published decisions    \(status.publishedDecisions)")
+            print("  open conflicts         \(status.openConflicts)")
+            print("  last successful import \(status.lastSuccessfulImport)")
+            print("  outbound enabled       \(status.outboundEnabled)")
+            print("  platforms confirmed    \(status.remoteSynchronised)")
+            for (source, reason) in status.failingSources.sorted(by: { $0.key < $1.key }) {
+                print("  FAILING \(source): \(reason)")
+            }
+            for (source, reason) in status.staleSources.sorted(by: { $0.key < $1.key }) {
+                print("  STALE   \(source): \(reason)")
+            }
+            let intervals = (try? client.availability()) ?? []
+            print("")
+            print("  \(intervals.count) blocking interval(s)")
+            for interval in intervals {
+                print("    \(interval.from) → \(interval.to)  "
+                      + "\(interval.source) · \(interval.basis)")
+            }
+        } catch {
+            bail("could not reach the service: \(error)")
+        }
+
+    default:
+        bail("unknown: vrc cloud \(subcommand) — try status, set-endpoint, set-credentials, check")
+    }
+}
+
+// MARK: - Keychain
+
+/// Reports, per stored item, whether this executable can read it — and when it
+/// cannot, the actual reason.
+///
+/// Values are never printed. The point is the status, because "refused" and
+/// "wants to ask" need opposite fixes and a timeout cannot tell them apart.
+func runKeychain() {
+    let store = makeStore()
+    var references: [(String, String)] = []
+    for listing in (try? store.listings.all()) ?? [] where !listing.credentialRef.isEmpty {
+        references.append((listing.label, listing.credentialRef))
+    }
+    references.append(("AWS access key id", CloudConnection.accessKeyReference))
+    references.append(("AWS secret access key", CloudConnection.secretKeyReference))
+
+    print("Keychain readability for this executable")
+    print("  \(Bundle.main.executablePath ?? CommandLine.arguments[0])")
+    print("")
+    var unreadable = 0
+    for (label, reference) in references {
+        let probe = KeychainDiagnostics.probe(reference: reference)
+        let mark = probe.isReadable ? "ok  " : "FAIL"
+        print("  \(mark) \(label) [\(reference)] — \(probe.detail)")
+        if !probe.isReadable, probe.outcome != .absent { unreadable += 1 }
+    }
+    print("")
+    if unreadable == 0 {
+        print("Every stored item is readable by this executable.")
+    } else {
+        print("\(unreadable) item(s) unreadable. The access list names code by its")
+        print("designated requirement; an item created by a differently signed")
+        print("build is not covered by it.")
+        exit(1)
+    }
+}
+
 // MARK: - Dispatch
 
 switch command {
@@ -1045,6 +1258,8 @@ case "rehearse": await runRehearsal()
 case "export": runExport()
 case "doctor": runDoctor()
 case "feed-diff": await runFeedDiff()
+case "cloud": await runCloud()
+case "keychain": runKeychain()
 case "help", "--help", "-h": runHelp()
 default:
     runHelp()

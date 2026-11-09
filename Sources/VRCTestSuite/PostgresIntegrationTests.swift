@@ -218,6 +218,36 @@ public enum PostgresIntegrationTests {
 
     // MARK: Fixtures
 
+    /// True when the suite is pointed at a real Aurora cluster rather than a
+    /// local PostgreSQL. Set VRC_CLUSTER_ARN, VRC_DB_SECRET_ARN and
+    /// VRC_DB_NAME to use the Data API, which is the path the Lambdas use.
+    static var usingAurora: Bool {
+        ProcessInfo.processInfo.environment["VRC_CLUSTER_ARN"] != nil
+            && ProcessInfo.processInfo.environment["VRC_DB_SECRET_ARN"] != nil
+    }
+
+    /// A store over the real Data API. Rows are cleaned between cases the same
+    /// way the psql path does, so the two produce comparable results.
+    static func auroraStore() throws -> RentalStore {
+        let environment = ProcessInfo.processInfo.environment
+        var configuration = try DataAPIStore.Configuration.fromEnvironment(environment)
+        configuration.actor = "owner"
+        let store = DataAPIStore(
+            transport: try URLSessionDataAPITransport.fromEnvironment(environment),
+            configuration: configuration)
+        // Dependency order, so foreign keys do not block the clean-up.
+        for table in ["published_feed_entries", "feed_publications", "feed_snapshots",
+                      "conflicts", "holds", "reservations", "availability_audit",
+                      "availability_decisions", "classifications", "events",
+                      "listing_connection_events", "sync_runs", "platform_listings",
+                      "properties", "conflict_acknowledgements", "feed_tokens",
+                      "idempotency_keys"] {
+            _ = try? store.run("DELETE FROM \(table)")
+        }
+        return try RentalStore(database: store, credentials: InMemoryFeedCredentialStore(),
+                               skipMigration: true)
+    }
+
     static func freshStore() throws -> (RentalStore, PsqlTransport)? {
         guard let port else { return nil }
         let transport = try PsqlTransport(port: port)
@@ -239,7 +269,15 @@ public enum PostgresIntegrationTests {
                 transport)
     }
 
+    /// Whichever backend is configured: Aurora if the cluster variables are
+    /// set, local PostgreSQL otherwise.
+    static func backend() throws -> RentalStore? {
+        if usingAurora { return try auroraStore() }
+        return try freshStore()?.0
+    }
+
     static func skipped(_ expect: Expect) -> Bool {
+        if usingAurora { return false }
         if port == nil {
             expect.ok(true, "skipped: set VRC_PG_PORT to run against PostgreSQL")
             return true
@@ -332,7 +370,7 @@ public enum PostgresIntegrationTests {
             let sqliteOutcomes = try outcomes(sqlite)
 
             // PostgreSQL, through the same repositories.
-            guard let (postgres, _) = try freshStore() else { return }
+            guard let postgres = try backend() else { return }
             try workflow(postgres)
             let postgresOutcomes = try outcomes(postgres)
 
@@ -357,7 +395,7 @@ public enum PostgresIntegrationTests {
         TestCase(group: "PostgreSQL integration",
                  name: "the generated daterange matches the repository's own night count") { expect in
             if skipped(expect) { return }
-            guard let (store, transport) = try freshStore() else { return }
+            guard let store = try backend() else { return }
             try workflow(store)
 
             // The repositories write epoch doubles; the constraints read a
@@ -375,13 +413,12 @@ public enum PostgresIntegrationTests {
                              "generated nights must equal the repository's nights for "
                              + item.event.eventKey)
             }
-            _ = transport
         },
 
         TestCase(group: "PostgreSQL integration",
                  name: "December 17 and 18 are excluded by the decisions") { expect in
             if skipped(expect) { return }
-            guard let (store, _) = try freshStore() else { return }
+            guard let store = try backend() else { return }
             try workflow(store)
             let decisions = try store.availability.all()
             for night in [DayMath.day(2026, 12, 17), DayMath.day(2026, 12, 18)] {
@@ -396,7 +433,7 @@ public enum PostgresIntegrationTests {
                  name: "a rolled-back transaction leaves no rows") { expect in
             if skipped(expect) { return }
             struct Nope: Error {}
-            guard let (store, _) = try freshStore() else { return }
+            guard let store = try backend() else { return }
             let before = try store.properties.all().count
             do {
                 try store.database.transaction {
@@ -413,7 +450,7 @@ public enum PostgresIntegrationTests {
         TestCase(group: "PostgreSQL integration",
                  name: "a committed transaction persists every row") { expect in
             if skipped(expect) { return }
-            guard let (store, _) = try freshStore() else { return }
+            guard let store = try backend() else { return }
             try store.database.transaction {
                 _ = try store.properties.insert(Property(name: "Kept one"))
                 _ = try store.properties.insert(Property(name: "Kept two"))
@@ -426,7 +463,7 @@ public enum PostgresIntegrationTests {
             if skipped(expect) { return }
             // PostgreSQL does not fill the Data API's generatedFields, so
             // without the RETURNING mapping every row would get id 0.
-            guard let (store, _) = try freshStore() else { return }
+            guard let store = try backend() else { return }
             let first = try store.properties.insert(Property(name: "One"))
             let second = try store.properties.insert(Property(name: "Two"))
             expect.ok(first.id != nil && first.id != 0, "an id came back")
@@ -438,7 +475,7 @@ public enum PostgresIntegrationTests {
             if skipped(expect) { return }
             // The check that would have caught the camelCase bug immediately:
             // ask the database about every BlockKind and compare with Swift.
-            guard let (store, _) = try freshStore() else { return }
+            guard let store = try backend() else { return }
             for kind in BlockKind.allCases {
                 let row = try store.database.queryOne(
                     "SELECT describes_genuine_unavailability(?) AS genuine", [.text(kind.rawValue)])
@@ -453,7 +490,7 @@ public enum PostgresIntegrationTests {
         TestCase(group: "PostgreSQL integration",
                  name: "the export gate still excludes cancellation blocks") { expect in
             if skipped(expect) { return }
-            guard let (store, _) = try freshStore() else { return }
+            guard let store = try backend() else { return }
             try workflow(store)
             // Read through the database's own allow-list, not the Swift one,
             // so both layers are checked to agree.

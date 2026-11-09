@@ -42,6 +42,28 @@ public struct CloudSyncClient: Sendable {
         public var staleSources: [String: String]
 
         public var isHealthy: Bool { failingSources.isEmpty && staleSources.isEmpty }
+
+        public init(
+            liveSourceEvents: Int,
+            approvedDecisions: Int,
+            publishedDecisions: Int,
+            openConflicts: Int,
+            lastSuccessfulImport: String,
+            outboundEnabled: Bool,
+            remoteSynchronised: Bool,
+            failingSources: [String: String],
+            staleSources: [String: String]
+        ) {
+            self.liveSourceEvents = liveSourceEvents
+            self.approvedDecisions = approvedDecisions
+            self.publishedDecisions = publishedDecisions
+            self.openConflicts = openConflicts
+            self.lastSuccessfulImport = lastSuccessfulImport
+            self.outboundEnabled = outboundEnabled
+            self.remoteSynchronised = remoteSynchronised
+            self.failingSources = failingSources
+            self.staleSources = staleSources
+        }
     }
 
     public struct BlockingInterval: Sendable, Equatable {
@@ -50,6 +72,15 @@ public struct CloudSyncClient: Sendable {
         public var to: String
         public var basis: String
         public var source: String
+
+        public init(property: String, from: String, to: String,
+                    basis: String, source: String) {
+            self.property = property
+            self.from = from
+            self.to = to
+            self.basis = basis
+            self.source = source
+        }
     }
 
     /// The result of a mutating request. `uncertain` is a first-class outcome,

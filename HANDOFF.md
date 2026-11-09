@@ -42,6 +42,29 @@ swift run vrc-parity --digest           # the parity digest
 /Applications/VacationRentalCalendar.app/Contents/MacOS/vrc doctor
 ```
 
+The Mac app talks to the AWS staging service through these:
+
+```bash
+vrc cloud status                        # endpoint, region, whether the key reads
+vrc cloud set-endpoint https://…        # https only; stored in app_settings
+vrc cloud set-credentials               # access key, read without echo
+vrc cloud check                         # one signed request to the live service
+```
+
+**Re-store the credential after every `build-app.sh --install`.** The Keychain
+item's access list is pinned to the binary that created it, so a reinstall can
+leave it unreadable — the Cloud pane says so and names the remedy. Piping avoids
+the secret ever reaching a terminal or a shell history:
+
+```bash
+aws iam create-access-key --user-name vrc-staging-mac-client --output json \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin)["AccessKey"]; print(d["AccessKeyId"]); print(d["SecretAccessKey"])' \
+  | /Applications/VacationRentalCalendar.app/Contents/MacOS/vrc cloud set-credentials --stdin
+```
+
+An AWS secret cannot be read back after creation, so replacing the Keychain
+entry means rotating the key: delete the old one first.
+
 PostgreSQL integration tests need a local cluster:
 
 ```bash

@@ -107,6 +107,9 @@ public enum TestRegistry {
             + PostgresIntegrationTests.cases
             + DecisionRouteTests.cases
             + CloudSyncClientTests.cases
+            + CloudConnectionTests.cases
+            + CloudIntervalTests.cases
+            + CloudStatusPayloadTests.cases
             + LambdaHandlerTests.cases
             + ClassifierTests.cases
             + ImportTests.cases
