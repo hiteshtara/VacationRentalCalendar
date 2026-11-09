@@ -48,6 +48,8 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
     private let eventsProvider: @Sendable () throws -> [ClassifiedEvent]
     private let listingsProvider: @Sendable () throws -> [PlatformListing]
     private let syncRunsProvider: @Sendable () throws -> [SyncRun]
+    private let settingsProvider: @Sendable () -> (String) throws -> String?
+    private let tokensProvider: @Sendable () -> (Int64, RentalPlatform) throws -> String?
 
     public init(
         generator: CalendarFeedGenerator = CalendarFeedGenerator(),
@@ -58,7 +60,9 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
         database: Database,
         eventsProvider: @escaping @Sendable () throws -> [ClassifiedEvent],
         listingsProvider: @escaping @Sendable () throws -> [PlatformListing],
-        syncRunsProvider: @escaping @Sendable () throws -> [SyncRun]
+        syncRunsProvider: @escaping @Sendable () throws -> [SyncRun],
+        settingsProvider: @escaping @Sendable () -> (String) throws -> String?,
+        tokensProvider: @escaping @Sendable () -> (Int64, RentalPlatform) throws -> String?
     ) {
         self.generator = generator
         self.decisions = decisions
@@ -69,6 +73,8 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
         self.eventsProvider = eventsProvider
         self.listingsProvider = listingsProvider
         self.syncRunsProvider = syncRunsProvider
+        self.settingsProvider = settingsProvider
+        self.tokensProvider = tokensProvider
     }
 
     // MARK: - Generation (always allowed — local only)
@@ -278,6 +284,41 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
         )
     }
 
+    /// Splits a feed by where each entry came from.
+    ///
+    /// The two are never mixed in reasoning, and should never be mixed in
+    /// reporting either: a block is something the owner decided, a reservation
+    /// is something a platform reported. Conflating them is how an app starts
+    /// treating its own output as evidence.
+    public func originBreakdown(
+        _ feed: DestinationFeed
+    ) -> (manualBlocks: [FeedEntryDecision], reservationDriven: [FeedEntryDecision]) {
+        (
+            manualBlocks: feed.included.filter { $0.origin == .availabilityDecision },
+            reservationDriven: feed.included.filter { $0.origin == .sourceEvent }
+        )
+    }
+
+    /// How current the published feed is for one destination.
+    public func freshness(
+        propertyID: Int64, destination: RentalPlatform, now: Date = Date()
+    ) throws -> PublicationFreshness {
+        let lastImport = try listingsProvider()
+            .filter { $0.propertyID == propertyID }
+            .compactMap(\.lastSyncAt)
+            .max()
+        let lastPublished = try database.queryOne("""
+            SELECT MAX(cache_invalidated_at) AS v FROM feed_publications
+            WHERE property_id = ? AND destination = ? AND stage = 'platform_refresh_pending';
+            """, [.integer(propertyID), .text(destination.rawValue)])?.date("v")
+        return PublicationFreshness(
+            destination: destination,
+            lastImportAt: lastImport,
+            lastPublishedAt: lastPublished,
+            now: now
+        )
+    }
+
     /// Every publication attempt, newest first, for failure reporting.
     public func publicationHistory(
         propertyID: Int64, destination: RentalPlatform, limit: Int = 20
@@ -303,19 +344,63 @@ public final class OutboundSyncCoordinator: @unchecked Sendable {
 
     // MARK: - Publication (gated)
 
-    /// Would publish the feed to its hosting endpoint and mark its decisions
-    /// published.
+    /// What still stands between an approved decision and a live feed.
     ///
-    /// Refuses while the outbound gate is shut. There is also, deliberately, no
-    /// hosting client behind this: Phase C designs the hosting, Phase D would
-    /// build it, and this build stops before Phase D.
+    /// Four independent things, in order. The gate is only the first of them,
+    /// so flipping it publishes nothing and connects nothing — there is no
+    /// hosting configuration, no credentials and no feed token in this build,
+    /// and each absence refuses on its own.
+    public enum PublicationPrecondition: String, CaseIterable, Sendable {
+        case outboundGate = "outbound_gate"
+        case hostingConfiguration = "hosting_configuration"
+        case hostingCredentials = "hosting_credentials"
+        case feedToken = "feed_token"
+
+        public var requirement: String {
+            switch self {
+            case .outboundGate:
+                return "OutboundSyncGate.isEnabled must be true — a reviewed code change"
+            case .hostingConfiguration:
+                return "An R2 bucket, custom domain and zone must be configured"
+            case .hostingCredentials:
+                return "R2 and cache-purge tokens must be stored in the Keychain"
+            case .feedToken:
+                return "A feed token must be generated for this property and destination"
+            }
+        }
+    }
+
+    /// Which preconditions are unmet. Empty would mean publishing is possible.
+    public func unmetPreconditions(
+        propertyID: Int64, destination: RentalPlatform
+    ) throws -> [PublicationPrecondition] {
+        var unmet: [PublicationPrecondition] = []
+        if !OutboundSyncGate.isEnabled { unmet.append(.outboundGate) }
+        // No configuration is stored anywhere in this build.
+        if (try? settingsProvider()("r2_bucket")) ?? nil == nil {
+            unmet.append(.hostingConfiguration)
+            unmet.append(.hostingCredentials)
+        }
+        if try tokensProvider()(propertyID, destination) == nil {
+            unmet.append(.feedToken)
+        }
+        return unmet
+    }
+
+    /// Would publish the feed and mark its decisions published.
+    ///
+    /// Refuses while any precondition is unmet. The gate alone is never
+    /// sufficient: with it open and nothing else configured, this still
+    /// refuses, which is the property the architecture review asked about.
     public func publish(
         propertyID: Int64, destination: RentalPlatform, now: Date = Date()
     ) throws -> Never {
-        _ = propertyID
-        _ = destination
-        _ = now
-        throw AvailabilityError.outboundDisabled
+        let unmet = (try? unmetPreconditions(propertyID: propertyID, destination: destination))
+            ?? PublicationPrecondition.allCases
+        if unmet.contains(.outboundGate) {
+            throw AvailabilityError.outboundDisabled
+        }
+        throw HostingError.notConfigured
     }
 
     // MARK: - Status

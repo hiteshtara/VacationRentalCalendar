@@ -73,7 +73,15 @@ public final class RentalStore: @unchecked Sendable {
             database: database,
             eventsProvider: provider,
             listingsProvider: { [unowned self] in try self.listings.all() },
-            syncRunsProvider: { [unowned self] in try self.syncRuns.recent(limit: 50) }
+            syncRunsProvider: { [unowned self] in try self.syncRuns.recent(limit: 50) },
+            settingsProvider: { [unowned self] in { key in try self.settings.string(key) } },
+            tokensProvider: { [unowned self] in
+                { propertyID, destination in
+                    try self.feedTokens.current(
+                        propertyID: propertyID, destination: destination
+                    )?.credentialRef
+                }
+            }
         )
     }
 

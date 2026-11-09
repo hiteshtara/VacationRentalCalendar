@@ -658,6 +658,9 @@ func runRehearsal() async {
     let sandboxDatabasePath = root.appendingPathComponent("rehearsal.sqlite").path
     let rehearsalStore: RentalStore
     do {
+        // Structural guard, not a convention: refuses outright if the path is
+        // the production database or anywhere near it.
+        try RehearsalIsolation.assertIsolated(databasePath: sandboxDatabasePath)
         try store.database.run("VACUUM INTO ?;", [.text(sandboxDatabasePath)])
         rehearsalStore = try RentalStore(
             database: try Database(path: sandboxDatabasePath),
@@ -755,6 +758,21 @@ func runRehearsal() async {
         ) {
             print("   rev \(row.revision)  \(pad(row.stage, 26)) \(pad(row.verdict, 26)) \(row.detail)")
         }
+        print("")
+        // What still stands between this and a live feed.
+        let unmet = try store.outbound.unmetPreconditions(
+            propertyID: propertyID, destination: destination
+        )
+        print("preconditions still unmet for live publication (\(unmet.count))")
+        for item in unmet { print("   \(item.rawValue): \(item.requirement)") }
+        print("")
+        let freshness = try store.outbound.freshness(
+            propertyID: propertyID, destination: destination
+        )
+        print("delivery expectations")
+        print("   \(SynchronisationHonesty.headline)")
+        print("   \(freshness.describeExposureAwake())")
+        print("   \(freshness.offlineWarning)")
         print("")
         print("Outbound gate: \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
         print("Nothing was uploaded to the internet and no platform was contacted.")

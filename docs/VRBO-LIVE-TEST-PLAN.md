@@ -105,7 +105,19 @@ a few times an hour.
 | Uptime monitoring | 3 checks | free tier | **$0** |
 | **Domain name** | 1 | — | **~$10/year** |
 
-**Total: about $10 a year, all of it the domain.** If you already own one, it is
+**Total: about $10 a year, all of it the domain.**
+
+Verified against Cloudflare's official documentation on 2026-11-09:
+[R2 pricing](https://developers.cloudflare.com/r2/pricing/) and
+[public buckets](https://developers.cloudflare.com/r2/buckets/public-buckets/).
+One detail worth knowing: **Cloudflare rounds usage up to the next billing
+unit**, so 1.1 GB bills as 2 GB-month. At our volume that is still zero.
+
+The custom-domain requirement is Cloudflare's, not a preference of mine. The
+docs state `r2.dev` "is intended for non-production traffic", is rate-limited,
+and supports no caching, WAF, access controls or Bot Management; they also warn
+that CNAMEing to it is "an unsupported access path" with no reliability
+guarantee. If you already own one, it is
 free. Rates used: storage $0.015/GB-month, Class A $4.50/million, Class B
 $0.36/million, egress free.
 
@@ -160,6 +172,59 @@ Nothing below has been done, and none of it will be without your word.
 
 Step 6 is the one that matters. Everything up to it is reversible by deleting a
 file; after it, a real platform is reading your calendar.
+
+---
+
+## Architecture review verdict
+
+**Suitable for controlled, manual synchronisation testing. Not suitable as
+production channel management.**
+
+That is not a defect in the implementation. It is what iCal can do, and it is
+equally true of any tool built on iCal, paid ones included. What differs is
+whether the limitation is visible.
+
+### Why
+
+A booking taken on Airbnb reaches Vrbo through four steps:
+
+1. Airbnb publishes it to its export.
+2. **This Mac imports it.**
+3. **This Mac republishes the filtered feed.**
+4. Vrbo re-reads that feed, on Vrbo's schedule.
+
+Steps 2 and 3 happen only while this Mac is awake. So:
+
+| Situation | Delay before Vrbo knows |
+|---|---|
+| Mac awake | up to ~13 hours — 1h import cycle, then up to 12h for Vrbo to poll |
+| Mac asleep or off | **unbounded** — nothing updates until it wakes |
+
+The hosted feed never breaks while the Mac is off; it keeps serving the last
+version correctly. It simply stops being *current*, and the staleness is
+asymmetric: a feed missing a block is harmless, because the dates were already
+on sale. **A feed missing a reservation is not** — Vrbo may accept a booking
+for a night that is already taken.
+
+### What this is good for
+
+- Seeing all three calendars in one place, with cancellation blocks and
+  booking-window artefacts separated out rather than blindly propagated.
+- Deliberately blocking dates on one platform without touching the others.
+- A one-way, owner-approved publication of blocks you decided on.
+
+### What it must not be relied on for
+
+- Preventing double bookings.
+- Any expectation that blocking dates here protects them immediately.
+- Running unattended while the Mac is off for days.
+
+### What would change the verdict
+
+Real-time protection needs a direct API integration, which none of the three
+platforms offers to individual hosts. Short of that, the honest improvements
+are: run the importer somewhere that never sleeps, and shorten the import
+interval. Neither removes the destination's own polling delay.
 
 ---
 

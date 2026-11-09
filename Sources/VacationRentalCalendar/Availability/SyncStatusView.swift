@@ -9,6 +9,7 @@ struct SyncStatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                DeliveryWarningBanner()
                 gate
                 ForEach(state.syncStates) { syncState in
                     destinationCard(syncState)

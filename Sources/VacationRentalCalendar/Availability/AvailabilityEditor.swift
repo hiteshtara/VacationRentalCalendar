@@ -10,6 +10,7 @@ struct AvailabilityEditorView: View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    DeliveryWarningBanner()
                     gateBanner
                     rangeSection
                     if state.selectedNights > 0 { platformSection }
