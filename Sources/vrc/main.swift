@@ -928,6 +928,101 @@ func runDoctor() {
     exit(problems == 0 ? 0 : 1)
 }
 
+
+// MARK: - feed-diff
+
+/// Fetches each authorised feed twice and compares the semantic hash, to settle
+/// whether change detection can work against the real platforms.
+///
+/// Deliberately prints nothing that identifies a guest, a reservation, or a
+/// credential: source name, HTTP status, byte count, event count, a truncated
+/// hash, and — when a difference is found — the NAMES of the fields that moved.
+/// Never a URL, a token, a UID, a summary or a date.
+func runFeedDiff() async {
+    let store = makeStore()
+    let gap = Double(value(for: "--gap") ?? "") ?? 300
+    let fetcher = URLSessionFeedFetcher()
+
+    do {
+        let listings = try store.listings.all().filter { $0.connectionState.shouldAttemptImport }
+        guard !listings.isEmpty else { bail("no connected listings to test") }
+
+        print("Feed-diff experiment")
+        print("  Fetches each connected feed twice, \(Int(gap))s apart, and compares the")
+        print("  semantic hash. Excluded from the hash: \(SemanticFeedHash.excludedProperties.joined(separator: ", ")).")
+        print("  No URL, token, UID, summary or date is printed.\n")
+
+        var firstPass: [Int64: (hash: String, events: [ICalEvent], bytes: Int, status: Int?)] = [:]
+
+        for pass in 1...2 {
+            if pass == 2 {
+                print("  waiting \(Int(gap))s before the second fetch…\n")
+                try? await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000))
+            }
+            print("── pass \(pass)")
+            for listing in listings {
+                guard let id = listing.id else { continue }
+                let name = listing.platform.displayName
+                do {
+                    let resolved = try store.listings.resolveURL(for: listing)
+                    let response = try await fetcher.fetch(urlString: resolved)
+                    let parsed = try ICalParser.parse(response.text)
+                    let digest = SemanticFeedHash.hash(parsed.events)
+                    let label: String = name.padding(toLength: 12, withPad: " ", startingAt: 0)
+                    let status: String = response.httpStatus.map(String.init) ?? "?"
+                    let bytes: Int = response.text.utf8.count
+                    let count: Int = parsed.events.count
+                    let short: String = String(digest.prefix(16))
+                    print("   \(label) HTTP \(status)  \(bytes) bytes  \(count) events  hash \(short)")
+                    if pass == 1 {
+                        firstPass[id] = (digest, parsed.events, response.text.utf8.count,
+                                         response.httpStatus)
+                    } else if let before = firstPass[id] {
+                        if before.hash == digest {
+                            print("     → IDENTICAL hash. Change detection works for this source.")
+                            let nowBytes: Int = response.text.utf8.count
+                            if before.bytes != nowBytes {
+                                let was: Int = before.bytes
+                                print("     → note: raw byte count changed (\(was) → \(nowBytes)),")
+                                print("       so a raw-bytes checksum WOULD have reported a false change.")
+                            }
+                        } else {
+                            let names = SemanticFeedHash.changedFieldNames(
+                                from: before.events, to: parsed.events)
+                            print("     → HASH DIFFERS between two fetches.")
+                            print("     → fields that moved: "
+                                + (names.isEmpty ? "(none in common events — the UID set changed)"
+                                                 : names.joined(separator: ", ")))
+                        }
+                    }
+                } catch {
+                    let detail = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    print("   \(name): could not fetch — \(detail)")
+                }
+            }
+            print("")
+        }
+
+        print("── synthetic control (offline, proves the hash is not simply constant)")
+        let base = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+            + "DTSTAMP:20261108T090000Z\r\nUID:control@test\r\n"
+            + "DTSTART;VALUE=DATE:20261210\r\nDTEND;VALUE=DATE:20261217\r\n"
+            + "SUMMARY:Reserved\r\nEND:VEVENT\r\nEND:VCALENDAR"
+        let restamped = base.replacingOccurrences(
+            of: "DTSTAMP:20261108T090000Z", with: "DTSTAMP:20261108T094500Z")
+        let moved = base.replacingOccurrences(
+            of: "DTEND;VALUE=DATE:20261217", with: "DTEND;VALUE=DATE:20261218")
+        let h0 = SemanticFeedHash.hash(try ICalParser.parse(base).events)
+        let h1 = SemanticFeedHash.hash(try ICalParser.parse(restamped).events)
+        let h2 = SemanticFeedHash.hash(try ICalParser.parse(moved).events)
+        print("   DTSTAMP changed only       → \(h0 == h1 ? "same hash (correct)" : "DIFFERENT (wrong)")")
+        print("   check-out date changed     → \(h0 != h2 ? "different hash (correct)" : "SAME (wrong)")")
+    } catch {
+        bail("feed-diff failed: \(error)")
+    }
+}
+
 // MARK: - Dispatch
 
 switch command {
@@ -947,6 +1042,7 @@ case "approve": runApprove()
 case "rehearse": await runRehearsal()
 case "export": runExport()
 case "doctor": runDoctor()
+case "feed-diff": await runFeedDiff()
 case "help", "--help", "-h": runHelp()
 default:
     runHelp()
