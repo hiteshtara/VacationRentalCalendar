@@ -4,6 +4,9 @@ public enum SyncOutcome: String, Codable, CaseIterable, Sendable {
     case success
     case failure
     case skipped
+    /// The platform has revoked the credential, or the owner switched the feed
+    /// off. Not an error to be retried — a settled state.
+    case disconnected
 }
 
 /// Audit trail for one feed refresh. Kept so the owner can see what an import
@@ -56,6 +59,8 @@ public struct SyncRun: Identifiable, Hashable, Sendable {
             return "Failed: \(errorMessage ?? "unknown error")"
         case .skipped:
             return "Skipped: \(errorMessage ?? "no URL configured")"
+        case .disconnected:
+            return "Disconnected: \(errorMessage ?? "the platform no longer accepts this URL")"
         case .success:
             var parts = ["\(eventsSeen) in feed"]
             if eventsInserted > 0 { parts.append("\(eventsInserted) new") }

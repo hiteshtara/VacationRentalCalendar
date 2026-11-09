@@ -104,6 +104,14 @@ public enum TestRegistry {
             + ConflictTests.cases
             + ExportTests.cases
             + PresentationTests.cases
+            + AvailabilityTests.cases
+            + FeedGenerationTests.cases
+            + PublicationSafetyTests.cases
+            + ClassificationSafeguardTests.cases
+            + ConnectionStateTests.cases
+            + ConflictCategoryTests.cases
+            + HostingTests.cases
+            + ArchitectureReviewTests.cases
             + SecurityTests.cases
             + RequiredScenarioTests.cases
     }

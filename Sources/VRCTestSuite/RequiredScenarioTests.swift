@@ -103,9 +103,18 @@ public enum RequiredScenarioTests {
             let queue = try setup.store.needsReview()
             expect.equal(queue.count, 3)
             for item in queue {
-                expect.equal(item.classification.kind, .unknownUnavailable)
+                // Every one is undecided and automatic, whatever it is called.
                 expect.equal(item.classification.source, .automatic)
                 expect.ok(item.classification.needsReview)
+                // The 193-night block is named as a booking-window restriction;
+                // the two short ones remain genuinely unexplained.
+                let expected: BlockKind = item.event.nights >= BlockClassifier.longHorizonNights
+                    ? .platformRestriction
+                    : .unknownUnavailable
+                expect.equal(item.classification.kind, expected,
+                             "\(item.event.nights) nights")
+                expect.ok(!item.classification.kind.describesGenuineUnavailability,
+                          "none of them may ever be exported")
             }
 
             // Nothing in that state may be exported.

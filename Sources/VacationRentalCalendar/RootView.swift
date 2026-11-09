@@ -94,9 +94,9 @@ struct RootView: View {
         case .review:
             let count = state.reviewQueue.count
             return count > 0 ? ("\(count)", .orange) : nil
-        case .conflicts:
-            let count = state.doubleBookingCount
-            return count > 0 ? ("\(count)", .red) : nil
+        case .availability:
+            let count = state.pendingDecisions.count
+            return count > 0 ? ("\(count)", .blue) : nil
         default:
             return nil
         }
@@ -110,10 +110,9 @@ struct RootView: View {
             switch state.selectedSection {
             case .calendar: calendarPane
             case .review: ReviewView()
-            case .conflicts: ConflictsView()
-            case .export: ExportView()
-            case .feeds: FeedsView()
-            case .history: SyncHistoryView()
+            case .reservations: ReservationsView()
+            case .availability: AvailabilityPane()
+            case .settings: SettingsPane()
             }
             statusBar
         }
@@ -144,7 +143,38 @@ struct RootView: View {
                     .frame(width: 150, alignment: .trailing)
                     .monospacedDigit()
             }
-            .padding(10)
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 6)
+
+            HStack(spacing: 12) {
+                Toggle(isOn: $state.showPlatformRestrictions) {
+                    Text("Show platform restrictions").font(.callout)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+                if state.hiddenRestrictionCount > 0 {
+                    Text("\(state.hiddenRestrictionCount) hidden")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("Cancellation blocks, booking-window restrictions and undecided "
+                            + "events are hidden. Reservations and conflicts are never hidden, "
+                            + "and hiding changes nothing about exports or conflict checks.")
+                }
+
+                Spacer()
+
+                Button {
+                    state.selectedSection = .availability
+                } label: {
+                    Label("Block Dates", systemImage: "calendar.badge.minus")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 10)
             Divider()
 
             FeedWarningBanner()
@@ -154,6 +184,8 @@ struct RootView: View {
             case .week: WeekStripView()
             case .list: EventListView()
             }
+
+            RangeSelectionBar()
         }
         .inspector(isPresented: $state.isDetailPanelPresented) {
             Group {

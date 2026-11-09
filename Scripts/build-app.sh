@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 APP_NAME="VacationRentalCalendar"
 BUNDLE_ID="com.vacationrentalcalendar.app"
 VERSION="1.0.0"
-BUILD="1"
+BUILD="${VRC_BUILD_NUMBER:-1}"
 IDENTITY_NAME="Vacation Rental Calendar Local Signing"
 DIST="dist"
 APP="${DIST}/${APP_NAME}.app"
@@ -136,6 +136,40 @@ sign_bounded "${SIGN_WITH}" "${BUNDLE_ID}" "${APP}" \
 
 codesign --verify --deep --strict "${APP}" && echo "signature verifies"
 
+# Record the designated requirement and compare it with the previous build.
+# A stable requirement is the whole point of signing with a certificate: it is
+# what lets a Keychain permission survive a rebuild.
+REQ_FILE=".build/last-designated-requirement"
+# stdout only, and normalised — see Scripts/fix-signing.sh for why.
+CURRENT_REQ="$(codesign -d -r- "${APP}" 2>/dev/null | grep 'designated' | head -1 \
+    | sed -e 's/^[[:space:]]*#[[:space:]]*//' -e 's/[[:space:]]\{1,\}/ /g' \
+          -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+if [ -f "${REQ_FILE}" ]; then
+    PREVIOUS_REQ="$(cat "${REQ_FILE}")"
+    if [ "${CURRENT_REQ}" = "${PREVIOUS_REQ}" ]; then
+        echo "signature is stable across rebuilds — Keychain permissions will stick"
+    else
+        echo ""
+        echo "  !! The signature changed since the last build."
+        echo "     previous: ${PREVIOUS_REQ}"
+        echo "     current:  ${CURRENT_REQ}"
+        echo "     macOS will ask for Keychain permission again."
+        echo "     Fix it permanently with:  ./Scripts/fix-signing.sh"
+        echo ""
+    fi
+fi
+printf '%s' "${CURRENT_REQ}" > "${REQ_FILE}"
+
+case "${CURRENT_REQ}" in
+    *"certificate root"*|*"certificate leaf"*|*anchor*)
+        echo "  signed with a certificate — Keychain permissions survive rebuilds"
+        ;;
+    *cdhash*)
+        echo "  note: ad-hoc signed. Run ./Scripts/fix-signing.sh once to stop"
+        echo "        the repeated Keychain prompts."
+        ;;
+esac
+
 # ------------------------------------------------------------------ install
 
 if [ "${INSTALL}" = true ]; then
@@ -152,7 +186,8 @@ step "Done"
 cat <<SUMMARY
 Application: ${TARGET}
 Size:        $(du -sh "${TARGET}" | cut -f1)
-Signature:   $(codesign -dv "${TARGET}" 2>&1 | grep -E '^Signature' | head -1)
+Signature:   $(codesign -dvvv "${TARGET}" 2>&1 | sed -n 's/^Authority=/signed by /p' | head -1)
+Requirement: ${CURRENT_REQ}
 
 Open it by double-clicking in Finder, or:
     open "${TARGET}"

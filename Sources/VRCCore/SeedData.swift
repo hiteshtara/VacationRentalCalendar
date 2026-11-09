@@ -49,17 +49,46 @@ public enum SeedData {
                 credentialRef: "airbnb-1759472334611502986",
                 autoRefresh: true
             ),
+            ListingSeed(
+                platform: .bookingCom,
+                label: "Booking.com — Southie Beach House (17482435)",
+                credentialRef: "booking-17482435",
+                autoRefresh: true
+            ),
         ]
     )
 
     public static let all: [PropertySeed] = [gStreet]
 
-    /// Inserts the seed data unless a property with the same name already
-    /// exists. Safe to call on every launch.
+    /// Inserts the seed data, and adds any listing a known property is still
+    /// missing. Idempotent: existing properties, listings and the owner's
+    /// classifications are never modified, only gaps are filled.
     @discardableResult
     public static func apply(to store: RentalStore) throws -> [String] {
         var created: [String] = []
-        let existingNames = Set(try store.properties.all().map(\.name))
+        let existingProperties = try store.properties.all()
+        let existingNames = Set(existingProperties.map(\.name))
+
+        // A property already present may predate a listing being added here —
+        // Booking.com was added after the first run, for instance. Fill the
+        // gap without touching anything that already exists.
+        for seed in all {
+            guard let property = existingProperties.first(where: { $0.name == seed.name }),
+                  let propertyID = property.id else { continue }
+            let present = Set(try store.listings.forProperty(propertyID).map(\.platform))
+            for listingSeed in seed.listings where !present.contains(listingSeed.platform) {
+                try store.listings.insert(PlatformListing(
+                    propertyID: propertyID,
+                    platform: listingSeed.platform,
+                    label: listingSeed.label,
+                    icalURL: "",
+                    urlStorage: .keychain,
+                    credentialRef: listingSeed.credentialRef,
+                    autoRefreshEnabled: listingSeed.autoRefresh
+                ))
+                created.append("added missing listing: \(listingSeed.label)")
+            }
+        }
 
         for seed in all where !existingNames.contains(seed.name) {
             let property = try store.properties.insert(

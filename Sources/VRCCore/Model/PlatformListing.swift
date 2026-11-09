@@ -34,6 +34,10 @@ public struct PlatformListing: Identifiable, Hashable, Sendable {
     public var autoRefreshEnabled: Bool
     public var lastSyncAt: Date?
     public var lastSyncSummary: String
+    /// Standing state of the connection, as distinct from the last fetch.
+    public var connectionState: FeedConnectionState
+    public var connectionChangedAt: Date?
+    public var connectionDetail: String
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -48,6 +52,9 @@ public struct PlatformListing: Identifiable, Hashable, Sendable {
         autoRefreshEnabled: Bool = true,
         lastSyncAt: Date? = nil,
         lastSyncSummary: String = "",
+        connectionState: FeedConnectionState = .unknown,
+        connectionChangedAt: Date? = nil,
+        connectionDetail: String = "",
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -61,11 +68,20 @@ public struct PlatformListing: Identifiable, Hashable, Sendable {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.lastSyncAt = lastSyncAt
         self.lastSyncSummary = lastSyncSummary
+        self.connectionState = connectionState
+        self.connectionChangedAt = connectionChangedAt
+        self.connectionDetail = connectionDetail
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
 
     public var hasURL: Bool { !icalURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    /// Whether an import should even be attempted. A revoked credential is
+    /// never retried, regardless of the auto-refresh setting.
+    public var isImportable: Bool {
+        autoRefreshEnabled && connectionState.shouldAttemptImport
+    }
 
     /// Host-only description, safe to show in the UI and in logs. The secret
     /// part of a feed URL is the path, so the path is never displayed.

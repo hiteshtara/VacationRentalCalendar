@@ -26,6 +26,17 @@ public struct ListingRepository: Sendable {
     /// Keychain call, and on an unsigned local build each of those can block on
     /// an authorisation prompt. URLs are therefore resolved lazily, only when an
     /// import or the settings screen actually needs one — see `resolveURL`.
+    /// Adds or advances a `-vN` suffix, so a replacement entry is obviously
+    /// related to the one it supersedes.
+    public static func nextReference(after reference: String) -> String {
+        guard let range = reference.range(of: #"-v(\d+)$"#, options: .regularExpression) else {
+            return reference + "-v2"
+        }
+        let digits = reference[range].dropFirst(2)
+        let next = (Int(digits) ?? 1) + 1
+        return String(reference[reference.startIndex..<range.lowerBound]) + "-v\(next)"
+    }
+
     private func decode(_ row: Row) -> PlatformListing {
         let storage = FeedURLStorage(rawValue: row.stringValue("url_storage")) ?? .database
         let reference = row.stringValue("credential_ref")
@@ -41,6 +52,11 @@ public struct ListingRepository: Sendable {
             autoRefreshEnabled: row.bool("auto_refresh_enabled", default: true),
             lastSyncAt: row.date("last_sync_at"),
             lastSyncSummary: row.stringValue("last_sync_summary"),
+            connectionState: FeedConnectionState(
+                rawValue: row.stringValue("connection_state")
+            ) ?? .unknown,
+            connectionChangedAt: row.date("connection_changed_at"),
+            connectionDetail: row.stringValue("connection_detail"),
             createdAt: row.dateValue("created_at"),
             updatedAt: row.dateValue("updated_at")
         )
@@ -53,10 +69,32 @@ public struct ListingRepository: Sendable {
         case .database:
             return (listing.icalURL, listing.credentialRef)
         case .keychain:
-            let reference = listing.credentialRef.isEmpty
+            var reference = listing.credentialRef.isEmpty
                 ? Self.credentialReference(platform: listing.platform, listingLabel: listing.label)
                 : listing.credentialRef
+
             if listing.hasURL {
+                // If an item already sits at this reference, write to a fresh
+                // one instead of updating in place.
+                //
+                // Updating would preserve the existing access list, which is
+                // the one case where preserving the owner's grant is exactly
+                // wrong: a list naming an earlier build makes the item
+                // permanently unreadable. Note this uses `exists`, which reads
+                // attributes only — testing readability by actually reading
+                // would block, and an abandoned read holds the keychain for
+                // the rest of the process, breaking this very save.
+                //
+                // The old item is left untouched. Nothing is deleted and no
+                // credential is regenerated.
+                //
+                // Scoped to listings already known to be unreadable, so a
+                // working entry keeps its reference and the grant the owner
+                // gave it. Readability is never tested by reading.
+                if listing.connectionState == .credentialUnreadable,
+                   credentials.exists(reference: reference) {
+                    reference = Self.nextReference(after: reference)
+                }
                 try credentials.save(url: listing.icalURL, reference: reference)
             }
             // Deliberately store nothing in the database column.
@@ -90,6 +128,13 @@ public struct ListingRepository: Sendable {
     public func update(_ listing: PlatformListing) throws {
         guard let id = listing.id else { return }
         let (column, reference) = try persistURL(listing)
+        // A freshly entered URL supersedes whatever was wrong before.
+        if listing.hasURL, listing.connectionState == .credentialUnreadable {
+            try? setConnectionState(
+                listingID: id, to: .unknown,
+                detail: "A new URL was entered.", actor: "owner"
+            )
+        }
         try database.run("""
             UPDATE platform_listings
             SET property_id = ?, platform = ?, label = ?, ical_url = ?,
@@ -102,6 +147,61 @@ public struct ListingRepository: Sendable {
                 .text(reference), SQLValue(listing.autoRefreshEnabled),
                 SQLValue(Date()), .integer(id),
             ])
+    }
+
+    /// Moves a listing's connection state and records why, keeping the history
+    /// even when the connection itself is finished.
+    public func setConnectionState(
+        listingID: Int64,
+        to state: FeedConnectionState,
+        detail: String = "",
+        httpStatus: Int? = nil,
+        actor: String = "system",
+        at date: Date = Date()
+    ) throws {
+        let previous = try find(id: listingID)?.connectionState
+        guard previous != state || !detail.isEmpty else { return }
+
+        try database.run("""
+            UPDATE platform_listings
+            SET connection_state = ?, connection_changed_at = ?, connection_detail = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """, [
+                .text(state.rawValue), SQLValue(date), .text(detail),
+                SQLValue(date), .integer(listingID),
+            ])
+        try database.run("""
+            INSERT INTO listing_connection_events
+                (listing_id, at, from_state, to_state, actor, detail, http_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+            """, [
+                .integer(listingID), SQLValue(date), SQLValue(previous?.rawValue),
+                .text(state.rawValue), .text(actor), .text(detail), SQLValue(httpStatus),
+            ])
+    }
+
+    public func connectionHistory(listingID: Int64, limit: Int = 50) throws -> [ConnectionEvent] {
+        try database.query("""
+            SELECT * FROM listing_connection_events WHERE listing_id = ?
+            ORDER BY at DESC, id DESC LIMIT ?;
+            """, [.integer(listingID), .integer(Int64(limit))]).map { row in
+            ConnectionEvent(
+                id: row.int("id"),
+                listingID: row.int("listing_id") ?? 0,
+                at: row.dateValue("at"),
+                fromState: row.string("from_state").flatMap(FeedConnectionState.init(rawValue:)),
+                toState: FeedConnectionState(rawValue: row.stringValue("to_state")) ?? .unknown,
+                actor: row.stringValue("actor"),
+                detail: row.stringValue("detail"),
+                httpStatus: row.int("http_status").map(Int.init)
+            )
+        }
+    }
+
+    /// Listings a platform has disconnected, so the UI can ask for a new URL.
+    public func disconnected() throws -> [PlatformListing] {
+        try all().filter { $0.connectionState.isDisconnected }
     }
 
     public func recordSync(listingID: Int64, at date: Date, summary: String) throws {

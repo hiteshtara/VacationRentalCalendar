@@ -6,17 +6,21 @@ public struct ImportReport: Sendable {
     /// Keys whose classification the import left alone because the owner had
     /// already decided them.
     public var preservedDecisions: Int
+    /// Decisions kept, but sent back for review because the event changed.
+    public var reReviewed: Int
     public var productID: String
 
     public init(
         run: SyncRun,
         warnings: [String] = [],
         preservedDecisions: Int = 0,
+        reReviewed: Int = 0,
         productID: String = ""
     ) {
         self.run = run
         self.warnings = warnings
         self.preservedDecisions = preservedDecisions
+        self.reReviewed = reReviewed
         self.productID = productID
     }
 }
@@ -62,6 +66,21 @@ public struct ImportService: Sendable {
 
         var run = SyncRun(listingID: listingID, startedAt: now)
 
+        // A revoked credential is never retried. The platform has already
+        // given its answer, and repeating the request only fills the history
+        // with failures that look like trouble rather than a settled fact.
+        guard listing.connectionState.shouldAttemptImport else {
+            run.outcome = .disconnected
+            run.finishedAt = Date()
+            run.errorMessage = listing.connectionState.explanation
+            try? syncRuns.record(run)
+            try? listings.recordSync(
+                listingID: listingID, at: now,
+                summary: "Not imported — \(listing.connectionState.displayName.lowercased())"
+            )
+            return ImportReport(run: run)
+        }
+
         // Resolved here, at the one moment it is needed, rather than on every
         // listing read. A Keychain prompt is tolerable when the owner just asked
         // for a refresh; it is not tolerable while drawing a calendar.
@@ -74,11 +93,30 @@ public struct ImportService: Sendable {
         }
 
         guard !feedURL.isEmpty else {
-            run.outcome = .skipped
             run.finishedAt = Date()
-            run.errorMessage = resolveError ?? "No calendar URL configured."
+            if let resolveError {
+                // The read did not merely fail, it blocked — which means the
+                // item's access list names an earlier build. Recorded so no
+                // further attempt is made, because each one holds the keychain
+                // for the rest of the process.
+                run.outcome = .disconnected
+                run.errorMessage = resolveError
+                try? listings.setConnectionState(
+                    listingID: listingID, to: .credentialUnreadable,
+                    detail: resolveError, actor: "import", at: now
+                )
+                try? listings.recordSync(
+                    listingID: listingID, at: now,
+                    summary: "Enter this listing's URL again — the saved one cannot be read"
+                )
+            } else {
+                run.outcome = .skipped
+                run.errorMessage = "No calendar URL configured."
+                try? listings.recordSync(
+                    listingID: listingID, at: now, summary: run.summaryLine
+                )
+            }
             try? syncRuns.record(run)
-            try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
             return ImportReport(run: run)
         }
 
@@ -86,11 +124,35 @@ public struct ImportService: Sendable {
         do {
             response = try await fetcher.fetch(urlString: feedURL)
         } catch {
+            let message = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            if let fetchError = error as? FeedFetchError,
+               fetchError.indicatesRevokedCredential {
+                // Settled, not transient. Stop retrying and say so plainly.
+                var status: Int?
+                if case .credentialRejected(let code, _) = fetchError { status = code }
+                run.outcome = .disconnected
+                run.finishedAt = Date()
+                run.errorMessage = message
+                try? syncRuns.record(run)
+                try? listings.setConnectionState(
+                    listingID: listingID, to: .revoked, detail: message,
+                    httpStatus: status, actor: "import", at: now
+                )
+                try? listings.recordSync(
+                    listingID: listingID, at: now,
+                    summary: "Disconnected by the platform — a new export URL is needed"
+                )
+                return ImportReport(run: run)
+            }
+
             run.outcome = .failure
             run.finishedAt = Date()
-            run.errorMessage = (error as? LocalizedError)?.errorDescription
-                ?? error.localizedDescription
+            run.errorMessage = message
             try? syncRuns.record(run)
+            try? listings.setConnectionState(
+                listingID: listingID, to: .failing, detail: message, actor: "import", at: now
+            )
             try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
             return ImportReport(run: run)
         }
@@ -151,6 +213,8 @@ public struct ImportService: Sendable {
             )
 
             do {
+                // Captured before the upsert so a material change can be seen.
+                let previous = try events.find(eventKey: key)
                 let result = try events.upsert(event, seenAt: now)
                 switch result {
                 case .inserted: report.run.eventsInserted += 1
@@ -165,7 +229,28 @@ public struct ImportService: Sendable {
                 let existing = try classifications.find(eventKey: key)
                 if let existing, existing.isLocked {
                     report.preservedDecisions += 1
-                    if existing.needsReview { report.run.eventsNeedingReview += 1 }
+
+                    // R5: the decision stands, but if the platform changed the
+                    // event materially it may no longer describe it, so it goes
+                    // back to the queue rather than silently continuing to apply.
+                    var kept = existing
+                    if let previous, result == .updated {
+                        let assessment = MaterialChange.assess(
+                            previous: previous, updated: event, platform: listing.platform
+                        )
+                        if assessment.isMaterial, !existing.needsReview {
+                            kept = MaterialChange.flagForReReview(
+                                existing, assessment: assessment, at: now
+                            )
+                            try classifications.save(kept)
+                            report.reReviewed += 1
+                            report.warnings.append(
+                                "\(listing.platform.displayName): "
+                                    + "\(assessment.explanation) Sent back for review."
+                            )
+                        }
+                    }
+                    if kept.needsReview { report.run.eventsNeedingReview += 1 }
                 } else {
                     let proposal = classifier.classify(
                         event: icalEvent,
@@ -192,6 +277,9 @@ public struct ImportService: Sendable {
 
         report.run.outcome = .success
         report.run.finishedAt = Date()
+        try? listings.setConnectionState(
+            listingID: listingID, to: .connected, detail: "", actor: "import", at: now
+        )
         if let recorded = try? syncRuns.record(report.run) { report.run = recorded }
         try? listings.recordSync(
             listingID: listingID, at: now, summary: report.run.summaryLine
@@ -208,6 +296,10 @@ public struct ImportService: Sendable {
         var reports: [ImportReport] = []
         for listing in listingsToImport {
             if autoRefreshOnly && !listing.autoRefreshEnabled { continue }
+            // Revoked feeds are skipped even on an explicit refresh-all, so a
+            // dead connection cannot flood the history with failures.
+            if !listing.connectionState.shouldAttemptImport, listing.hasURL == false,
+               listing.connectionState == .notConfigured { continue }
             reports.append(await importFeed(for: listing, now: now))
         }
         return reports

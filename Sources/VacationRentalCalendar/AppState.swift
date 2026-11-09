@@ -23,6 +23,21 @@ final class AppState: ObservableObject {
     /// Keys ticked in the review queue for a batch decision.
     @Published var reviewSelection: Set<String> = []
 
+    // Availability editing
+    @Published var rangeStart: Date?
+    @Published var rangeEnd: Date?
+    @Published var plannedActions: [RentalPlatform: AvailabilityAction] = [:]
+    @Published var planReason: String = ""
+    @Published private(set) var decisions: [AvailabilityDecision] = []
+    @Published private(set) var auditEntries: [AuditEntry] = []
+    @Published private(set) var syncStates: [DestinationSyncState] = []
+    @Published private(set) var findings: [ConflictFinding] = []
+
+    /// Presentation only. Hiding restrictions declutters the calendar and
+    /// changes nothing about export eligibility, conflict detection or the
+    /// review queue — a test asserts exactly that.
+    @Published var showPlatformRestrictions = false
+
     // Status
     @Published private(set) var isRefreshing = false
     @Published private(set) var statusMessage = ""
@@ -31,6 +46,8 @@ final class AppState: ObservableObject {
     @Published private(set) var hasAskedForNotifications = false
     @Published private(set) var signature: CodeSignatureInfo = .init(kind: .unsigned)
     @Published private(set) var storeFailure: String?
+    /// How many long periods the one-off sweep brought back for review.
+    private(set) var longPeriodsFlagged = 0
 
     // Settings
     @Published var autoRefreshEnabled = true
@@ -41,28 +58,26 @@ final class AppState: ObservableObject {
     private var refreshTask: Task<Void, Never>?
 
     enum Section: String, CaseIterable, Identifiable, Hashable {
-        case calendar, review, conflicts, export, feeds, history
+        case calendar, reservations, availability, review, settings
         var id: String { rawValue }
 
         var title: String {
             switch self {
             case .calendar: return "Calendar"
+            case .reservations: return "Reservations"
+            case .availability: return "Availability"
             case .review: return "Needs Review"
-            case .conflicts: return "Conflicts"
-            case .export: return "Filtered Export"
-            case .feeds: return "Feeds"
-            case .history: return "Sync History"
+            case .settings: return "Settings"
             }
         }
 
         var symbol: String {
             switch self {
             case .calendar: return "calendar"
+            case .reservations: return "bed.double"
+            case .availability: return "slider.horizontal.3"
             case .review: return "questionmark.circle"
-            case .conflicts: return "exclamationmark.triangle"
-            case .export: return "square.and.arrow.up"
-            case .feeds: return "antenna.radiowaves.left.and.right"
-            case .history: return "clock.arrow.circlepath"
+            case .settings: return "gearshape"
             }
         }
     }
@@ -82,6 +97,9 @@ final class AppState: ObservableObject {
             do {
                 let created = try RentalStore.makeDefault()
                 try SeedData.apply(to: created)
+                // Raises the review flag on unusually long periods. Never
+                // changes a classification — see LongPeriodReview.
+                self.longPeriodsFlagged = (try? LongPeriodReview.runOnce(in: created))?.count ?? 0
                 self.store = created
             } catch {
                 self.storeFailure = "The local database could not be opened: \(error)"
@@ -134,6 +152,16 @@ final class AppState: ObservableObject {
             events = try store.classifiedEvents()
             conflicts = try store.conflicts()
             syncRuns = try store.syncRuns.recent(limit: 100)
+            findings = ConflictAnalyzer().analyse(
+                events: events,
+                listings: listings,
+                acknowledgedIDs: try store.conflictAcks.acknowledgedIDs()
+            )
+            decisions = try store.availability.all()
+            auditEntries = try store.auditLog.recent(limit: 200)
+            if let propertyID = selectedPropertyID {
+                syncStates = (try? store.outbound.allStates(propertyID: propertyID)) ?? []
+            }
             if selectedPropertyID == nil { selectedPropertyID = properties.first?.id }
             lastError = nil
         } catch {
@@ -160,9 +188,67 @@ final class AppState: ObservableObject {
         properties.first { $0.id == selectedPropertyID }
     }
 
+    /// Everything for the selected property. The authority for exports,
+    /// conflicts and review — never filtered by a display toggle.
     var visibleEvents: [ClassifiedEvent] {
         guard let id = selectedPropertyID else { return events }
         return events.filter { $0.propertyID == id }
+    }
+
+    /// What the calendar draws. Restrictions and undecided blocks are hidden
+    /// by default so reservations and real conflicts stand out; confirmed
+    /// reservations and owner blocks are never hidden.
+    var calendarEvents: [ClassifiedEvent] {
+        guard !showPlatformRestrictions else { return visibleEvents }
+        return visibleEvents.filter { item in
+            switch item.displayStatus {
+            case .confirmed, .ownerBlock, .maintenance:
+                return true
+            case .cancellationBlock, .platformRestriction, .needsReview, .unknown:
+                return false
+            }
+        }
+    }
+
+    /// How many the toggle is currently hiding.
+    var hiddenRestrictionCount: Int {
+        showPlatformRestrictions ? 0 : visibleEvents.count - calendarEvents.count
+    }
+
+    var reservations: [ClassifiedEvent] {
+        visibleEvents
+            .filter { $0.classification.kind == .confirmedReservation }
+            .sorted { $0.event.checkIn < $1.event.checkIn }
+    }
+
+    // MARK: - Conflict categories
+
+    var visibleFindings: [ConflictFinding] {
+        guard let id = selectedPropertyID else { return findings }
+        return findings.filter { $0.propertyID == id }
+    }
+
+    func findings(_ category: ConflictCategory) -> [ConflictFinding] {
+        visibleFindings.filter { $0.category == category }
+    }
+
+    var bookingConflictCount: Int {
+        findings(.bookingConflict).filter { !$0.acknowledged }.count
+    }
+
+    var availabilityDifferences: [AvailabilityDifference] {
+        guard let id = selectedPropertyID else { return [] }
+        return AvailabilityOverview().differences(
+            from: DayMath.utcMidnight(Date()), days: 120, propertyID: id,
+            events: visibleEvents, listings: listingsForSelectedProperty
+        )
+    }
+
+    func availability(on day: Date) -> DayAvailability? {
+        guard let id = selectedPropertyID else { return nil }
+        return AvailabilityOverview().day(
+            day, propertyID: id, events: visibleEvents, listings: listingsForSelectedProperty
+        )
     }
 
     var reviewQueue: [ClassifiedEvent] {
@@ -374,6 +460,18 @@ final class AppState: ObservableObject {
         reload()
     }
 
+    func acknowledge(finding: ConflictFinding) {
+        guard let store else { return }
+        try? store.conflictAcks.acknowledge(conflictID: finding.id)
+        reload()
+    }
+
+    func unacknowledge(finding: ConflictFinding) {
+        guard let store else { return }
+        try? store.conflictAcks.unacknowledge(conflictID: finding.id)
+        reload()
+    }
+
     func acknowledge(conflict: ReservationConflict) {
         guard let store else { return }
         try? store.conflictAcks.acknowledge(conflictID: conflict.id)
@@ -448,6 +546,128 @@ final class AppState: ObservableObject {
         } catch {
             lastError = "Could not add that property: \(error)"
         }
+    }
+
+    // MARK: - Availability
+
+    /// The nights currently selected in the calendar, checkout-exclusive.
+    var selectedRange: (start: Date, end: Date)? {
+        guard let rangeStart, let rangeEnd else { return nil }
+        let lower = min(rangeStart, rangeEnd)
+        let upper = max(rangeStart, rangeEnd)
+        // The user picks the last night; the stored end is the morning after.
+        return (lower, DayMath.adding(days: 1, to: upper))
+    }
+
+    var selectedNights: Int {
+        guard let range = selectedRange else { return 0 }
+        return max(0, DayMath.daysBetween(range.start, range.end))
+    }
+
+    /// Clicking a day starts a range; clicking a second day completes it.
+    func selectDay(_ day: Date) {
+        let value = DayMath.utcMidnight(day)
+        if rangeStart == nil || rangeEnd != nil {
+            rangeStart = value
+            rangeEnd = nil
+        } else {
+            rangeEnd = value
+        }
+    }
+
+    func extendSelection(to day: Date) {
+        if rangeStart == nil { rangeStart = DayMath.utcMidnight(day) }
+        rangeEnd = DayMath.utcMidnight(day)
+    }
+
+    func clearRange() {
+        rangeStart = nil
+        rangeEnd = nil
+        plannedActions = [:]
+        planReason = ""
+    }
+
+    func isDayInSelection(_ day: Date) -> Bool {
+        guard let range = selectedRange else { return false }
+        let value = DayMath.utcMidnight(day)
+        return value >= range.start && value < range.end
+    }
+
+    var currentPlan: AvailabilityPlan? {
+        guard let propertyID = selectedPropertyID, let range = selectedRange,
+              !plannedActions.isEmpty else { return nil }
+        return AvailabilityPlan(
+            propertyID: propertyID, startDay: range.start, endDay: range.end,
+            reason: planReason, actions: plannedActions
+        )
+    }
+
+    /// Works out what the plan would do. Writes nothing.
+    func previewPlan() -> VRCCore.AvailabilityPreview? {
+        guard let store, let plan = currentPlan else { return nil }
+        return try? store.availabilityManager.preview(plan)
+    }
+
+    func submitPlan() {
+        guard let store, let plan = currentPlan else { return }
+        do {
+            let submitted = try store.availabilityManager.submit(plan)
+            reload()
+            let refused = submitted.filter { $0.status == .failed }.count
+            statusMessage = refused == 0
+                ? "\(submitted.count) change\(submitted.count == 1 ? "" : "s") waiting for your approval."
+                : "\(submitted.count - refused) waiting for approval, \(refused) refused."
+            clearRange()
+        } catch {
+            lastError = "Could not save that plan: \(error.localizedDescription)"
+        }
+    }
+
+    func approve(decisionID: Int64) {
+        guard let store else { return }
+        do {
+            let approved = try store.availabilityManager.approve(decisionID: decisionID)
+            reload()
+            statusMessage = "Approved: \(approved.summaryLine). Nothing has been sent anywhere."
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+            reload()
+        }
+    }
+
+    func cancel(decisionID: Int64) {
+        guard let store else { return }
+        try? store.availabilityManager.cancel(decisionID: decisionID)
+        reload()
+        statusMessage = "Change cancelled."
+    }
+
+    func cancelAllPending() {
+        guard let store, let propertyID = selectedPropertyID else { return }
+        let count = (try? store.availabilityManager.cancelPending(propertyID: propertyID)) ?? 0
+        reload()
+        statusMessage = "Cleared \(count) pending change\(count == 1 ? "" : "s")."
+    }
+
+    var decisionsForSelectedProperty: [AvailabilityDecision] {
+        guard let id = selectedPropertyID else { return decisions }
+        return decisions.filter { $0.propertyID == id }
+    }
+
+    var pendingDecisions: [AvailabilityDecision] {
+        decisionsForSelectedProperty.filter { $0.status.isPending }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    func destinationFeed(for destination: RentalPlatform) -> DestinationFeed? {
+        guard let store, let id = selectedPropertyID else { return nil }
+        return try? store.outbound.generateFeed(propertyID: id, destination: destination)
+    }
+
+    func auditEntries(forDecision id: Int64) -> [AuditEntry] {
+        guard let store else { return [] }
+        return (try? store.auditLog.entries(forDecision: id)) ?? []
     }
 
     // MARK: - Export
