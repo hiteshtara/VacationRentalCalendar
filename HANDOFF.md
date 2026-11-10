@@ -2064,3 +2064,56 @@ and the migration moves them.
 
 Until then the app shows all three feeds disconnected. Imports are not
 retried in that state, so nothing is being fetched and nothing is at risk.
+
+## 24. Targeted Booking.com recovery (2026-11-10)
+
+Installed build `ee39d8d`. Backup `Backups/20261110T183929Z`, verified, retained.
+
+### Outcome
+
+| Platform | Reference | Result |
+|---|---|---|
+| Airbnb | `airbnb-1759472334611502986-v6` | HTTP 200, 4 events |
+| Vrbo | `vrbo-5550554-v6` | HTTP 200, 3 events |
+| Booking.com | `booking-17482435-v3` | HTTP 200, 2 events |
+
+Proven independently for both code objects: the installed CLI at 18:47, and
+**the GUI's own imports at 18:49:54 after a full quit and relaunch**. Every
+earlier Keychain entry is still present; nothing was deleted or rotated.
+
+Data unchanged throughout: 9 observations, 10 classifications, 2 decisions, 2
+publication UIDs, 10 audit rows, schema 13. Conflicts **0** — the fix in §23
+holds against live data.
+
+### Why the first attempt failed
+
+The full migration raised six prompts for three credentials. Three were for
+Test Cottage, a synthetic property whose listings had never had a URL stored,
+so those reads could only fail — and the one real failure was lost in the
+noise.
+
+Fixed in `bf71ccc`: presence is now checked with
+`security find-generic-password` **without** `-w`, which reads attributes only
+and never prompts, so a listing with nothing behind its reference is skipped
+silently. `--listing`, `--platform` and `--feeds-only` make a targeted
+recovery cost exactly one prompt. The recovery above used
+`--feeds-only --platform booking_com` and raised precisely one.
+
+Two further bugs abandoned the feed migration entirely: an unreadable AWS
+credential exited before the feed loop, and a readable one `exit 0`d. They are
+separate credentials and neither should skip the other.
+
+### A message that is still wrong
+
+The script printed "migrated; the helper still cannot read it — re-entry may
+be required" for a credential that had migrated perfectly. Its verification
+greps `vrc keychain` output in a way that does not match. **Cosmetic, but it
+has now cried wolf twice** — the first time it was right and was disbelieved,
+this time it was wrong. Worth fixing before it is trusted either way.
+
+### Known: `doctor` reports 3 unreadable
+
+They are the three **Test Cottage** placeholders — references created before
+the fix, with nothing behind them. The three real credentials all report `ok`.
+Clearing those three references would silence it, but they are synthetic
+records and were left alone deliberately.
