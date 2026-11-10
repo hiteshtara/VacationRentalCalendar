@@ -81,7 +81,7 @@ Both loose ends from the previous round are closed: the truncating setup is now
 | AWS staging | **deployed** in account …1110, us-east-1; cluster + 5 Lambdas + API Gateway + 3 buckets + 4 secrets |
 | Tests | **369 tests**, passing on **macOS and Linux** (1242 assertions with the PostgreSQL group live, 1223 without) |
 | Cross-platform parity | byte-identical digest `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` |
-| Staging smoke tests | **A1–A6, B1–B6, B9 done.** B7 and B8 are **blocked** (§5); Phase C is **partially done and blocked at C2/C3** (§12) |
+| Staging smoke tests | **A1–A5, B1–B6, B9 done.** B7, B8 and Phase C C2/C3 are **unrun, not blocked** — one `aws rds enable-http-endpoint` call unblocks all three (§12) |
 | Outbound publishing | **off** — code gate, function env and database setting all verified `false` 2026-11-09; Terraform precondition not re-checked (§4) |
 | Scheduled imports | **disabled** (both EventBridge schedules DISABLED) |
 
@@ -342,11 +342,14 @@ Three routes exist and all three are closed:
    role, and creating an IAM role was refused by the session's permission
    policy. Nothing was created.
 3. **Run the deployed artifact locally against the disposable cluster** — a
-   harness for exactly this was written (the arm64 `bootstrap` from
+   harness for exactly this is written and ready (the arm64 `bootstrap` from
    `api.zip` under the official `provided:al2023` Runtime Interface Emulator,
-   which the image ships at `/usr/local/bin/aws-lambda-rie`). It is unusable,
-   because the handler speaks only the RDS Data API and **the Data API cannot be
-   enabled on a PITR-restored cluster** (§12).
+   which the image ships at `/usr/local/bin/aws-lambda-rie`), using the
+   operator's own credentials so no new IAM role is needed. **This route is
+   open.** It was blocked only because the disposable cluster had no working
+   Data API, and that turned out to be the wrong-API mistake corrected in §12 —
+   one `aws rds enable-http-endpoint` call fixes it. B7/B8 need a disposable
+   cluster with the Data API enabled, and nothing else.
 
 Much of what B7/B8 assert is already covered at unit level against fakes — see
 `DecisionRouteTests` ("the same key twice records one decision", "a reused
@@ -573,22 +576,24 @@ Ordered. **Each of these is a new task; the project is paused here.**
 1. **Finish staging validation.** Done: ~~B6~~, ~~isolation guard~~, ~~staging
    litter~~, ~~B9 (all four layers)~~, ~~Linux suite~~, ~~Phase C C1/C4/C5~~.
 
-   **What is genuinely left, and why it is not simply "retry":**
-   - **Phase C's C2 and C3 need the procedure redesigned, not repeated.** The
-     Data API cannot be enabled on a PITR-restored cluster, so there is no way
-     to reach one. §12 sets out the three candidate approaches and what each
-     costs. Pick one before spending any more on restores.
-   - **B7 and B8 depend on that same decision.** They need the deployed API
-     talking to a disposable database, and today there is no such combination
-     available: the staging roles are scoped to `vrc-staging-main`, creating a
-     role was refused, and a restored cluster is unreachable. A local
-     Runtime-Interface-Emulator harness is already written and waiting for a
-     reachable disposable cluster (§5).
-   - The cheapest unblock is probably to make a **purpose-built disposable
-     cluster with `create-db-cluster --enable-http-endpoint`** (not a restore),
-     migrate 010/011 into it, mark it disposable, and run B7/B8 and the
-     integration suite there. That gives up PITR verification but unblocks
-     everything else.
+   **What is left, and it is now one short sequence rather than three
+   decisions.** The earlier claim that this needed a redesign was based on a
+   wrong root cause, corrected in §12.
+
+   1. Restore `vrc-staging-main` to a `pitr`-named cluster (C1 — already proven
+      to work), add its writer instance, then **`aws rds enable-http-endpoint
+      --resource-arn <cluster ARN>`** — the step that was missing.
+   2. Run **C2** (`vrc-migrate --status` → `10, 11`) and **C3** (the safety
+      assertions) against it. A ready-made script for both, plus the recovery
+      consistency and isolation checks, is in this session's scratchpad notes;
+      it was written but never got to run.
+   3. Mark that cluster disposable (`app_settings.disposable_database='true'`)
+      and run **B7/B8** against it through the RIE harness (§5), plus the
+      truncating integration suite, which the isolation guard will now permit.
+   4. Delete the cluster and its instance.
+
+   Budget roughly $0.10–$0.30 of Aurora time for the whole sequence, and expect
+   the restore plus writer to take about 10 minutes before any test can run.
 2. **Prepare real imports (read-only):** confirm the Airbnb/Vrbo feed URLs read
    from the Keychain via the `vrc` helper; run the live feed-diff to measure the
    change-detection hit rate (decides the ~$5.76 vs ~$19.95/mo import cadence);
@@ -616,54 +621,60 @@ Run 2026-11-09 under explicit owner authorization for a temporary, isolated
 recovery cluster. **The temporary resources were deleted afterwards; nothing
 from this drill remains.**
 
-### Result: C1 and C4 pass. C2 and C3 cannot be run at all. C5 done.
+### Result: C1 and C4 pass. C2 and C3 were not run. C5 done.
 
 | # | Test | Result |
 |---|---|---|
 | C1 | restore → a second, independent cluster appears | ✅ `vrc-staging-pitr` created from PITR of `vrc-staging-main`, restored to `2026-11-09T23:50:03Z`, 1 GB, own endpoint, own writer instance |
-| C2 | `vrc-migrate --status` against the restored cluster reports `10, 11` | 🟥 **impossible — no way to reach the cluster** |
-| C3 | safety assertions against the restored cluster | 🟥 **impossible, same reason** |
+| C2 | `vrc-migrate --status` against the restored cluster reports `10, 11` | ⬜ **not run** — the Data API was never successfully enabled, for the reason corrected below |
+| C3 | safety assertions against the restored cluster | ⬜ **not run**, same reason |
 | C4 | the restore is isolated; `vrc-staging-main` untouched | ✅ different endpoint, no shared instance, and staging still reads `properties=1 reservations=1 holds=1 availability_audit=41` with its own settings unchanged |
 | C5 | delete the temporary cluster | ✅ instance and cluster both deleted |
 
-### The blocker, which is a fault in the documented procedure
+### Why C2/C3 failed, and the one-line fix — CORRECTED 2026-11-10
 
-**The RDS Data API cannot be enabled on a PITR-restored cluster**, and the
-Data API is the only route into these clusters.
+**I used the wrong API.** The first write-up of this (commit `cabe65f`) claimed
+"the RDS Data API cannot be enabled on a PITR-restored cluster." **That was
+wrong**, and anyone acting on it would redesign a procedure that does not need
+redesigning.
 
-- `restore-db-cluster-to-point-in-time` has **no `EnableHttpEndpoint` field at
-  all** — confirmed from its own API model, not from documentation.
-- `modify-db-cluster` **does** have the field. It accepts it, returns success,
-  records no pending modification, and **does not change the setting** —
-  through the flag, through `--cli-input-json`, after the writer was available,
-  and across an off/on toggle. `rds-data` then answers
-  `HttpEndpointNotEnabledException`.
-- `restore-db-cluster-from-snapshot` has no such field either. Only
-  `create-db-cluster` does, and that cannot restore data.
-- There is no network path as an alternative: the restored instance is not
-  publicly accessible, its subnets have **no internet-gateway route**, and the
-  security group has **no ingress rules at all**. That is by design — the whole
-  architecture uses the Data API precisely so the Lambdas need no VPC.
+`modify-db-cluster --enable-http-endpoint` **applies only to Aurora Serverless
+v1.** On a Serverless v2 or provisioned cluster it is accepted, reports success,
+records no pending modification, and changes nothing — exactly the silent no-op
+observed. For v2 and provisioned clusters there is a **separate operation**:
 
-A full config diff of the two clusters showed only `HttpEndpointEnabled` and
-`CopyTagsToSnapshot` differing: nothing structural explains it. The source
-cluster has the Data API on because Terraform set it **at creation**.
+```bash
+aws rds enable-http-endpoint  --resource-arn <cluster ARN>   # and
+aws rds disable-http-endpoint --resource-arn <cluster ARN>
+```
 
-**So docs/STAGING-DEPLOYMENT.md §6's Phase C is not executable as written.**
-C2 and C3 assume the restored cluster is reachable; it is not. Whoever picks
-this up has to change the procedure, not retry it. The plausible options, none
-yet tested:
+The CLI's own help for `enable-http-endpoint` says so outright: *"This operation
+applies only to Aurora Serverless v2 and provisioned DB clusters. To enable the
+HTTP endpoint for Aurora Serverless v1 DB clusters, use modify-db-cluster."*
+That is also why neither restore operation has an `EnableHttpEndpoint` field —
+the field belongs to the v1 path, and the v2 path is a separate call made after
+the cluster exists. Terraform's `enable_http_endpoint` had the same bug for
+provisioned/v2 clusters until provider v5.64.0.
 
-1. Restore, then **create a new cluster with `create-db-cluster
-   --enable-http-endpoint` and migrate the restored data into it** — clumsy, and
-   it tests the wrong thing.
-2. Verify the restored cluster **from inside the VPC** — a Lambda attached to
-   the subnets, or a short-lived bastion. Both need IAM and network changes.
-3. Accept that PITR verification is **structural only** — the restore
-   completed, the cluster is independent, the source is untouched — and verify
-   schema and data integrity on the staging cluster instead, where the Data API
-   is already on. This is the cheapest honest answer, and it is weaker: it never
-   proves a restored database is actually usable.
+**So Phase C's C2/C3 are not blocked.** The procedure in
+docs/STAGING-DEPLOYMENT.md §6 needs one extra step after C1, not a redesign:
+
+```bash
+aws rds enable-http-endpoint --resource-arn \
+  arn:aws:rds:us-east-1:589744711110:cluster:<the restored cluster>
+```
+
+This has **not yet been executed against a restored cluster** — the drill's
+cluster was already being deleted when the correct operation was identified. So
+C2/C3 remain *unrun*, not *impossible*. Re-running Phase C with that one added
+step is the next step, and it needs a fresh restore.
+
+What does remain true from the first write-up: there is no network path to these
+clusters as an alternative to the Data API — not publicly accessible, no
+internet-gateway route on the subnets, and **no security-group ingress at all**,
+by design, since the architecture uses the Data API so the Lambdas need no VPC.
+So the Data API is the only route in, which is why getting this call right
+matters.
 
 ### Resources created, and the cost
 
