@@ -115,13 +115,38 @@ public final class RentalStore: @unchecked Sendable {
     #if canImport(Security)
     public static func makeDefault() throws -> RentalStore {
         AppPaths.ensureDirectories()
-        let keychain = KeychainFeedCredentialStore(
-            additionalTrustedPaths: AppPaths.siblingExecutablePaths()
-        )
         return try RentalStore(
             database: Database(path: AppPaths.databaseURL.path),
-            credentials: DeadlineFeedCredentialStore(wrapping: keychain)
+            credentials: makeCredentialStore()
         )
+    }
+
+    /// The production credential store.
+    ///
+    /// A build signed by this team reads from the data protection Keychain and
+    /// falls back to the login Keychain for anything not migrated yet; writes
+    /// go only to the new store, and the legacy entry is never touched. That
+    /// makes the migration additive and the rollback a one-line change here.
+    ///
+    /// A build that is NOT signed by the team — the development CLI, a local
+    /// build, the test runner — stays entirely on the login Keychain. The data
+    /// protection Keychain needs an entitlement only a properly signed build
+    /// carries, and selecting it without one makes every call fail with
+    /// `-34018` rather than upgrading anything.
+    ///
+    /// Both paths keep the deadline wrapper. The data protection Keychain does
+    /// not prompt, so it should rarely fire, but an unbounded system call is
+    /// not something to introduce on the assumption it is now unnecessary.
+    public static func makeCredentialStore() -> FeedCredentialStore {
+        let legacy = KeychainFeedCredentialStore(
+            additionalTrustedPaths: AppPaths.siblingExecutablePaths()
+        )
+        guard CredentialStoreSelection.shouldUseDataProtection else {
+            return DeadlineFeedCredentialStore(wrapping: legacy)
+        }
+        let modern = DataProtectionFeedCredentialStore(policy: AppleTeam.keychainPolicy)
+        return DeadlineFeedCredentialStore(
+            wrapping: LayeredFeedCredentialStore(primary: modern, fallback: legacy))
     }
     #endif
 

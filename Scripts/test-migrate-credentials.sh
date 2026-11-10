@@ -21,6 +21,12 @@ pass=0; fail=0
 ok()  { printf '  \033[32mok\033[0m   %s\n' "$*"; pass=$((pass+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=$((fail+1)); }
 
+# Never let a test reach the real installed application. An earlier version of
+# the credential-health lookup probed by RUNNING the app binary, which on a
+# build that does not recognise the flag launches the GUI — it started a second
+# copy of the installed app and hung the suite.
+export VRC_APP_BINARY="/nonexistent/VacationRentalCalendar"
+
 ROOT="$(mktemp -d)"; trap 'rm -rf "${ROOT}"' EXIT
 mkdir -p "${ROOT}/bin"
 CALLS="${ROOT}/security-calls.log"

@@ -73,6 +73,10 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
     <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>        <string>14.0</string>
+    <!-- Declares that this build answers --credential-health. The scripts
+         read this key rather than probing by running the binary: an older
+         build ignores the flag and launches the GUI instead. -->
+    <key>VRCSupportsCredentialHealth</key>      <true/>
     <key>LSApplicationCategoryType</key>     <string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key>       <true/>
     <!-- false: the app keeps a Dock icon as well as its menu-bar item. -->

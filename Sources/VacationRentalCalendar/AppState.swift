@@ -140,8 +140,6 @@ final class AppState: ObservableObject {
         let region = ((try? store.settings.string(CloudConnection.regionSettingKey)) ?? nil) ?? "us-east-1"
         if endpoint.isEmpty {
             cloudConfiguration = .notConfigured(missing: ["endpoint"])
-        } else if HelperCloudClient.helperURL() == nil {
-            cloudConfiguration = .credentialUnreadable("The bundled vrc helper is missing.")
         } else if let url = URL(string: endpoint), CloudConnection.isSecure(endpoint) {
             cloudConfiguration = .configured(endpoint: url, region: region)
         } else {
@@ -172,22 +170,39 @@ final class AppState: ObservableObject {
         }
 
         isCloudRefreshing = true
+        // In process. Previously this spawned the bundled `vrc` helper and
+        // parsed its stdout; the same work now runs here through VRCCore.
+        //
+        // Three reasons, in order of how much they have cost. The helper is a
+        // second code object with its own credential access, and the app
+        // disagreeing with its own helper about whether a credential is
+        // readable has been the most expensive bug class in this project. A
+        // bare nested executable cannot carry the keychain entitlement, so
+        // after the Keychain migration it could not do this work at all. And
+        // parsing a subprocess's output is a problem nobody needs when the
+        // logic is already a library.
+        //
+        // Aurora auto-pauses, so the first call after an idle period wakes it
+        // and can be slow; it stays off the main actor for that reason.
+        let settings = store?.settings
+        let credentials = store?.credentials
         Task { [weak self] in
-            let result = await Task.detached(priority: .userInitiated) {
-                HelperCloudClient.statusWakingSleepingCluster()
+            let payload: CloudStatusPayload? = await Task.detached(priority: .userInitiated) {
+                guard let settings, let credentials else { return nil }
+                return CloudStatusService.status(
+                    for: CloudConnection(settings: settings, credentials: credentials))
             }.value
 
             await MainActor.run {
                 guard let self else { return }
                 self.isCloudRefreshing = false
-                switch result {
-                case .success(let payload):
+                if let payload {
                     self.cloud = Self.snapshot(from: payload)
-                case .failure(let failure):
+                } else {
                     // The failure is kept and shown. An indicator that can only
                     // say "fine" is worse than none.
                     self.cloud = CloudSnapshot(
-                        health: .unreachable(Self.describe(failure)),
+                        health: .unreachable("The local store is not open."),
                         status: self.cloud.status,
                         intervals: self.cloud.intervals,
                         checkedAt: Date())
@@ -229,15 +244,6 @@ final class AppState: ObservableObject {
         }
         return CloudSnapshot(health: health, status: status,
                              intervals: intervals, checkedAt: Date())
-    }
-
-    private static func describe(_ failure: HelperCloudClient.Failure) -> String {
-        switch failure {
-        case .helperMissing: return "The bundled vrc helper is missing."
-        case .timedOut: return "The helper did not respond in time."
-        case .noOutput: return "The helper returned nothing."
-        case .unreadableOutput: return "The helper returned an unreadable result."
-        }
     }
 
     /// Cloud intervals that have no counterpart in the local calendar, so the

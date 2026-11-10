@@ -137,6 +137,17 @@ public struct EventRepository: Sendable {
             """).map(decode)
     }
 
+    /// How many live observations a listing currently holds.
+    ///
+    /// Used to refuse a mass withdrawal: a feed that parses to zero events for
+    /// a listing that currently has some is far more likely to be truncated
+    /// than to mean every booking was cancelled.
+    public func activeCount(listingID: Int64) throws -> Int {
+        try database.scalarInt("""
+            SELECT COUNT(*) FROM events WHERE listing_id = ? AND is_tombstoned = 0;
+            """, [.integer(listingID)])
+    }
+
     public func all(includeTombstoned: Bool = true) throws -> [CalendarEvent] {
         let clause = includeTombstoned ? "" : "WHERE is_tombstoned = 0"
         return try database.query("SELECT \(Self.columns) FROM events \(clause) ORDER BY check_in;")

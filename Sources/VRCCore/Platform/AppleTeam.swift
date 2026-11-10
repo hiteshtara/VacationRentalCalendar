@@ -36,8 +36,14 @@ public enum AppleTeam {
         var staticCode: SecStaticCode?
         guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
               let staticCode else { return nil }
+        // kSecCSSigningInformation is REQUIRED: without it the returned
+        // dictionary carries no team identifier and this silently reports an
+        // unsigned build. A correctly signed Developer ID app then falls back
+        // to the login Keychain forever, which is the exact failure this type
+        // exists to detect.
         var info: CFDictionary?
-        guard SecCodeCopySigningInformation(staticCode, [], &info) == errSecSuccess,
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(staticCode, flags, &info) == errSecSuccess,
               let dictionary = info as? [String: Any] else { return nil }
         let team = dictionary[kSecCodeInfoTeamIdentifier as String] as? String
         return (team?.isEmpty ?? true) ? nil : team

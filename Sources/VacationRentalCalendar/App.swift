@@ -42,15 +42,83 @@ final class LoginItemController: ObservableObject {
 @main
 struct VacationRentalCalendarApp: App {
     // A headless self-check, used to verify end-to-end that THIS code object
-    // (the GUI app binary, not the CLI) can drive the helper and read back a
-    // sanitized status. It runs the exact HelperCloudClient the Cloud pane
-    // uses, prints a secret-free summary, and exits before any window opens.
-    // It is the GUI's own answer to "can Refresh from AWS succeed?", gathered
+    // — the signed app binary — can reach the service and read back a
+    // sanitized status. It runs the exact in-process path the Cloud pane uses,
+    // prints a secret-free summary, and exits before any window opens. It is
+    // the app's own answer to "can Refresh from AWS succeed?", gathered
     // without a human clicking.
+    /// Machine-readable credential health, printed by the SIGNED APP BINARY.
+    ///
+    /// The installation, backup and migration scripts used
+    /// `/usr/bin/security` for this. That cannot work after the move to the
+    /// data protection Keychain: `security` operates on the file Keychain
+    /// only and has no flag to do otherwise, so every script would keep
+    /// running and quietly report the wrong answer — backup calling every live
+    /// credential missing, migration skipping everything.
+    ///
+    /// It has to be THIS binary rather than the `vrc` helper, because a bare
+    /// executable cannot carry the `keychain-access-groups` entitlement. The
+    /// app bundle can, so the app is the only thing able to answer the
+    /// question for production credentials.
+    ///
+    /// Presence is checked with `exists`, which reads attributes only and
+    /// never prompts; a value is only read for references that actually have
+    /// an item behind them. Output is one line per listing plus a summary, and
+    /// carries no secret — references are names, not values.
+    /// Which credential store this build selects, and why.
+    ///
+    /// Deliberately touches NOTHING: no database, no Keychain item, no
+    /// credential. It exists so a freshly signed build can be verified to
+    /// select the data protection Keychain before it is allowed anywhere near
+    /// a real credential.
+    static func runCredentialStoreIfRequested() {
+        guard CommandLine.arguments.contains("--credential-store") else { return }
+        print("team-signed \(AppleTeam.runningCodeCanUseAccessGroup)")
+        print("running-team \(AppleTeam.runningTeamIdentifier() ?? "(none)")")
+        print("expected-team \(AppleTeam.identifier)")
+        print("data-protection \(CredentialStoreSelection.shouldUseDataProtection)")
+        print("access-group \(AppleTeam.keychainPolicy.accessGroup ?? "(none)")")
+        print("explanation \(CredentialStoreSelection.explanation)")
+        exit(CredentialStoreSelection.shouldUseDataProtection ? 0 : 1)
+    }
+
+    static func runCredentialHealthIfRequested() {
+        guard CommandLine.arguments.contains("--credential-health") else { return }
+        func out(_ text: String) { print(text) }
+
+        do {
+            let store = try RentalStore.makeDefault()
+            out("store \(store.credentials.storageDescription)")
+            out("selection \(CredentialStoreSelection.explanation)")
+
+            let health = try store.credentialHealth()
+            for report in health {
+                let reference = report.listing.credentialRef.isEmpty
+                    ? "(none)" : report.listing.credentialRef
+                out("\(report.status.rawValue)\t\(reference)\t\(report.listing.label)")
+            }
+            let unreadable = health.filter { $0.status == .unreadable }.count
+            out("summary readable=\(health.filter { $0.status == .readable }.count) "
+                + "unreadable=\(unreadable) "
+                + "notConfigured=\(health.filter { $0.status == .notConfigured }.count)")
+            exit(unreadable == 0 ? 0 : 1)
+        } catch {
+            out("error \(error)")
+            exit(2)
+        }
+    }
+
     static func runSelfCheckIfRequested() {
         guard CommandLine.arguments.contains("--self-check-cloud") else { return }
-        let result = HelperCloudClient.status()
-        switch result {
+        // In process now, not through the helper: the same code the Cloud
+        // pane uses, so the self-check exercises what actually ships.
+        guard let store = try? RentalStore.makeDefault() else {
+            FileHandle.standardError.write(Data("gui-self-check store unavailable\n".utf8))
+            exit(2)
+        }
+        let payload = CloudStatusService.status(
+            for: CloudConnection(settings: store.settings, credentials: store.credentials))
+        switch Result<CloudStatusPayload, Never>.success(payload) {
         case .success(let payload):
             let summary = "gui-self-check ok=\(payload.ok) health=\(payload.health.rawValue) "
                 + "message=\(payload.message) intervals=\(payload.intervals.count)\n"
@@ -71,6 +139,8 @@ struct VacationRentalCalendarApp: App {
     @StateObject private var loginItem = LoginItemController()
 
     init() {
+        Self.runCredentialStoreIfRequested()
+        Self.runCredentialHealthIfRequested()
         Self.runSelfCheckIfRequested()
     }
 

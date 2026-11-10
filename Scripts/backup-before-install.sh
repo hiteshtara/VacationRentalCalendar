@@ -31,6 +31,9 @@ cd "$(dirname "$0")/.."
 # Overridable so the restore path can be exercised by tests against a
 # throwaway database. Untestable backup tooling is how you find out it never
 # worked at the moment you need it.
+# shellcheck source=credential-health.sh
+source "$(dirname "$0")/credential-health.sh"
+
 SUPPORT="${VRC_SUPPORT_DIR:-${HOME}/Library/Application Support/VacationRentalCalendar}"
 DB="${SUPPORT}/VacationRentalCalendar.sqlite"
 SERVICE="com.vacationrentalcalendar.feed-url"
@@ -94,14 +97,14 @@ take_backup() {
         >> "${dir}/credential-references.txt"
     while read -r ref; do
         [ -z "${ref}" ] && continue
-        # No -w: attributes only. Never reads the secret, never prompts.
-        if security find-generic-password -s "${SERVICE}" -a "${ref}" >/dev/null 2>&1; then
-            printf 'present    %s\n' "${ref}" >> "${dir}/keychain-presence.txt"
-        else
-            printf 'MISSING    %s\n' "${ref}" >> "${dir}/keychain-presence.txt"
-        fi
+        # Asked through the signed app where one is installed, because
+        # /usr/bin/security cannot see data protection Keychain items at all.
+        # No secret is read either way.
+        printf '%-15s %s\n' "$(credential_status "${ref}")" "${ref}" \
+            >> "${dir}/keychain-presence.txt"
     done < <(sqlite3 "${DB}" "SELECT credential_ref FROM platform_listings WHERE credential_ref <> '';" 2>/dev/null)
     ok "$(wc -l < "${dir}/credential-references.txt" | tr -d ' ') reference(s) recorded, no values"
+    say "  health source: $(credential_health_source)"
 
     step "4. Manifest"
     {

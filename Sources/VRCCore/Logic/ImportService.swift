@@ -280,12 +280,35 @@ public struct ImportService: Sendable {
             }
         }
 
-        do {
-            report.run.eventsTombstoned = try events.tombstoneMissing(
-                listingID: listingID, keysStillPresent: keysSeen, at: now
+        // An empty calendar that parsed cleanly is NOT evidence that every
+        // booking vanished. It is equally consistent with a truncated
+        // response, a platform outage serving a stub, or a feed URL that now
+        // points at an empty listing — and CLAUDE.md is explicit that a
+        // failed, empty or truncated feed withdraws nothing.
+        //
+        // Getting this wrong is the dangerous direction for an IMPORT:
+        // tombstoning a reservation makes those nights look free here, which
+        // is how a double booking happens. Keeping a stale block only
+        // withholds inventory, which is visible and recoverable.
+        //
+        // So a feed that yields zero events for a listing that currently has
+        // some is refused, loudly, rather than believed.
+        let previouslyActive = (try? events.activeCount(listingID: listingID)) ?? 0
+        if keysSeen.isEmpty && previouslyActive > 0 {
+            report.warnings.append(
+                "The feed parsed but contained no events, while \(previouslyActive) "
+                    + "are currently held. Nothing was withdrawn — an empty feed is not "
+                    + "proof that bookings were cancelled. Check the listing on the platform."
             )
-        } catch {
-            report.warnings.append("Could not tombstone removed events: \(error)")
+            report.run.eventsTombstoned = 0
+        } else {
+            do {
+                report.run.eventsTombstoned = try events.tombstoneMissing(
+                    listingID: listingID, keysStillPresent: keysSeen, at: now
+                )
+            } catch {
+                report.warnings.append("Could not tombstone removed events: \(error)")
+            }
         }
 
         report.run.outcome = .success

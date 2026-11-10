@@ -410,3 +410,44 @@ public final class TimingOutFeedCredentialStore: FeedCredentialStore, @unchecked
         throw FeedCredentialError.timedOut
     }
 }
+
+
+/// A credential store that fails a fixed number of times, then works.
+///
+/// Models the transient conditions the app must ride out rather than latch
+/// on: a busy machine, a Keychain call during wake-from-sleep, a first read
+/// after a long idle period. Test-only, and in VRCCore so Linux compiles it.
+public final class FlakyFeedCredentialStore: FeedCredentialStore, @unchecked Sendable {
+    private let wrapped: FeedCredentialStore
+    private let failures: Int
+    private let error: FeedCredentialError
+    private var attempts = 0
+    private let lock = NSLock()
+
+    public init(
+        wrapping wrapped: FeedCredentialStore,
+        failingFirst failures: Int,
+        with error: FeedCredentialError = .timedOut
+    ) {
+        self.wrapped = wrapped
+        self.failures = failures
+        self.error = error
+    }
+
+    public var attemptCount: Int { lock.lock(); defer { lock.unlock() }; return attempts }
+    public var storageDescription: String { "flaky (test only)" }
+    public func save(url: String, reference: String) throws {
+        try wrapped.save(url: url, reference: reference)
+    }
+    public func delete(reference: String) throws { try wrapped.delete(reference: reference) }
+    public func exists(reference: String) -> Bool { wrapped.exists(reference: reference) }
+
+    public func url(reference: String) throws -> String? {
+        lock.lock()
+        attempts += 1
+        let shouldFail = attempts <= failures
+        lock.unlock()
+        if shouldFail { throw error }
+        return try wrapped.url(reference: reference)
+    }
+}

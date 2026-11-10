@@ -124,6 +124,10 @@ build_and_sign() {
     <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>        <string>14.0</string>
     <key>NSHighResolutionCapable</key>       <true/>
+    <!-- Declares that this build answers --credential-health. The scripts
+         read this key rather than probing by running the binary: an older
+         build ignores the flag and launches the GUI instead. -->
+    <key>VRCSupportsCredentialHealth</key>      <true/>
     <key>LSApplicationCategoryType</key>     <string>public.app-category.productivity</string>
     <key>NSHumanReadableCopyright</key>      <string>Copyright © 2026. All rights reserved.</string>
 </dict>
@@ -131,16 +135,45 @@ build_and_sign() {
 PLIST
     ok "bundle assembled, CFBundleVersion ${build_number}"
 
+    # The profile is SEALED by the signature, so it goes in first. Without it
+    # the keychain-access-groups entitlement is claimed but not authorized,
+    # and AMFI kills the app on launch with no error and no log.
+    if [ -f "${PROFILE}" ]; then
+        cp "${PROFILE}" "${APP}/Contents/embedded.provisionprofile"
+        ok "embedded $(basename "${PROFILE}")"
+    else
+        bad "no provisioning profile at ${PROFILE} — the app would be killed on launch"
+        exit 1
+    fi
+
+    # codesign does NOT expand $(AppIdentifierPrefix) — that substitution is an
+    # Xcode build setting, not a signing feature. Signing the template verbatim
+    # embeds the literal string "$(AppIdentifierPrefix)com.vacation..." as the
+    # access group, which is not a valid group, so AMFI kills the app on launch
+    # with no output at all. Verified here on 2026-11-10.
+    #
+    # So the entitlements are resolved first, exactly as Xcode would: the
+    # prefix becomes the team identifier. The template stays readable and this
+    # is the only place the substitution happens.
+    local resolved="${OUT}/developer-id.resolved.entitlements"
+    sed "s/\$(AppIdentifierPrefix)/${APPLE_TEAM_ID}./g" \
+        "${ENTITLEMENTS_DEVELOPER_ID}" > "${resolved}"
+    if grep -q 'AppIdentifierPrefix' "${resolved}"; then
+        bad "the entitlements still contain an unexpanded variable"
+        exit 1
+    fi
+    ok "resolved entitlements: access group ${KEYCHAIN_ACCESS_GROUP}"
+
     step "Signing"
     # Inside out: nested code first, then the bundle. --options runtime is the
     # hardened runtime, which notarization requires; --timestamp is a secure
     # timestamp, which it also requires. The old local script used neither.
     codesign --force --options runtime --timestamp \
-             --entitlements "${ENTITLEMENTS_DEVELOPER_ID}" \
+             --entitlements "${resolved}" \
              --identifier "${HELPER_BUNDLE_ID}" \
              -s "${SIGN_IDENTITY}" "${APP}/Contents/MacOS/vrc" 2>&1 | sed 's/^/      /'
     codesign --force --options runtime --timestamp \
-             --entitlements "${ENTITLEMENTS_DEVELOPER_ID}" \
+             --entitlements "${resolved}" \
              --identifier "${BUNDLE_ID}" \
              -s "${SIGN_IDENTITY}" "${APP}" 2>&1 | sed 's/^/      /'
 

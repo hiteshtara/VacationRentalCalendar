@@ -37,6 +37,9 @@
 
 set -uo pipefail
 
+# shellcheck source=credential-health.sh
+source "$(dirname "$0")/credential-health.sh"
+
 SERVICE="com.vacationrentalcalendar.feed-url"
 # Overridable so the selection logic can be tested without the real Keychain
 # or a real install. Untestable migration tooling is how you discover it
@@ -153,7 +156,7 @@ while IFS='|' read -r listing_id platform ref label; do
     #
     # WITHOUT -w this reads attributes only. It never prompts, never blocks,
     # and never touches secret material.
-    if ! security find-generic-password -s "$SERVICE" -a "$ref" >/dev/null 2>&1; then
+    if [ "$(credential_status "${ref}")" = "not-configured" ]; then
         say ""
         say "  ${platform} (listing ${listing_id}) — no credential stored; skipped without prompting"
         skipped=$((skipped + 1))
@@ -197,8 +200,8 @@ while IFS='|' read -r listing_id platform ref label; do
         # had already cried wolf in the other direction the same day, and a
         # verification nobody can trust is worse than none.
         new_ref="$(sqlite3 "$DB" "SELECT credential_ref FROM platform_listings WHERE id = ${listing_id};" 2>/dev/null)"
-        if [ -n "${new_ref}" ] \
-           && security find-generic-password -s "$SERVICE" -a "${new_ref}" >/dev/null 2>&1; then
+        _VRC_HEALTH_SOURCE=""   # the write changed things; ask again
+        if [ -n "${new_ref}" ] && [ "$(credential_status "${new_ref}")" != "not-configured" ]; then
             if [ "${new_ref}" = "${ref}" ]; then
                 say "    migrated — stored under ${new_ref}"
             else

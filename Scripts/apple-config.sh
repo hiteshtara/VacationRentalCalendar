@@ -31,6 +31,12 @@ DEVELOPER_ID_IDENTITY="Developer ID Application: "
 # `xcrun notarytool store-credentials` — never by this repository.
 NOTARY_PROFILE="vrc-notary"
 
+# The Developer ID provisioning profile. Gitignored — it is team-specific, and
+# it is what authorizes the restricted keychain-access-groups entitlement.
+# Without it the entitlement is claimed but not allowlisted, and AMFI kills the
+# app on launch with no error and no log.
+PROFILE="${VRC_PROFILE:-Resources/Profiles/vrc-developer-id.provisionprofile}"
+
 ENTITLEMENTS_DEVELOPER_ID="Resources/Entitlements/developer-id.entitlements"
 ENTITLEMENTS_APP_STORE="Resources/Entitlements/app-store.entitlements"
 ENTITLEMENTS_HELPER="Resources/Entitlements/helper-inherit.entitlements"

@@ -231,9 +231,45 @@ timed installed read update-item
 [ "${OUTPUT}" = "0|match" ] && ok "version 2 at the same path read it (${ELAPSED}s)" \
     || bad "an update lost the credential: ${OUTPUT}"
 
+printf '\n\033[1m-- G. Migration, with a disposable database\033[0m\n'
+# Stands in for the real procedure: a reference recorded in a database, a
+# value in the old store, copied to the new one, and the old entry kept.
+DISPOSABLE_DB="${WORK}/disposable.sqlite"
+sqlite3 "${DISPOSABLE_DB}" "CREATE TABLE platform_listings (id INTEGER PRIMARY KEY, credential_ref TEXT);
+INSERT INTO platform_listings VALUES (1,'rehearsal-item');"
+ok "disposable database created with 1 reference"
+
+timed writer write rehearsal-item
+[ "${OUTPUT}" = "0" ] && ok "the credential exists in the new store" || bad "setup write failed"
+
+REF="$(sqlite3 "${DISPOSABLE_DB}" "SELECT credential_ref FROM platform_listings WHERE id=1;")"
+timed reader read "${REF}"
+[ "${OUTPUT}" = "0|match" ] \
+    && ok "the reference in the database resolves to the migrated credential" \
+    || bad "the database reference does not resolve: ${OUTPUT}"
+
+printf '\n\033[1m-- H. Rollback\033[0m\n'
+# Rollback is deleting the migrated copy and going back to the old store. The
+# property that matters is that doing so loses nothing, because the legacy
+# entry was never written to or deleted during migration.
+timed reader delete "${REF}"
+[ "${OUTPUT}" = "0" ] && ok "the migrated copy was removed" || bad "could not remove the copy"
+
+timed reader read "${REF}"
+[ "${OUTPUT}" != "0|match" ] \
+    && ok "the new store no longer serves it, as a rollback requires" \
+    || bad "the copy survived deletion"
+
+# Re-migrating must be possible immediately — a rollback is not a one-way door.
+timed writer write "${REF}"
+[ "${OUTPUT}" = "0" ] && ok "re-migrating after a rollback works" || bad "could not re-migrate"
+timed reader read "${REF}"
+[ "${OUTPUT}" = "0|match" ] && ok "and the value is readable again" || bad "re-migration lost it"
+timed reader delete "${REF}"
+
 printf '\n\033[1m-- Cleanup\033[0m\n'
 cleaned=0
-for item in probe-item gui-item helper-item update-item; do
+for item in probe-item gui-item helper-item update-item rehearsal-item; do
     run_probe reader delete "${item}" >/dev/null 2>&1 && cleaned=$((cleaned+1))
 done
 ok "${cleaned} disposable test items deleted"
