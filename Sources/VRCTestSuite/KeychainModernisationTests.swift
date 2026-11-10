@@ -254,5 +254,49 @@ public enum KeychainModernisationTests {
             expect.ok(true)
             #endif
         },
+        // --- Configuration cannot drift --------------------------------------
+
+        TestCase(group: "Keychain modernisation",
+                 name: "the Team ID in code matches the one the build scripts use") { expect in
+            // Two sources of truth for an access group is how credentials stop
+            // being shared without anyone noticing: the app writes under one
+            // group and the signature grants another, and the only symptom is
+            // a credential that cannot be read.
+            let config = (try? String(contentsOfFile: "Scripts/apple-config.sh",
+                                      encoding: .utf8)) ?? ""
+            expect.ok(!config.isEmpty, "Scripts/apple-config.sh must be readable from the root")
+            expect.contains(config, "APPLE_TEAM_ID=\"\(AppleTeam.identifier)\"")
+            expect.contains(config, "KEYCHAIN_GROUP_SUFFIX=\"\(KeychainPolicy.groupSuffix)\"")
+        },
+
+        TestCase(group: "Keychain modernisation",
+                 name: "the entitlements request the group the policy writes under") { expect in
+            // The entitlement uses $(AppIdentifierPrefix), which the signing
+            // tools expand to "<TeamID>." — so the suffix is what has to match.
+            for file in ["Resources/Entitlements/developer-id.entitlements",
+                         "Resources/Entitlements/app-store.entitlements"] {
+                let xml = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
+                expect.ok(!xml.isEmpty, "\(file) must exist")
+                expect.contains(xml, "keychain-access-groups")
+                expect.contains(xml, "$(AppIdentifierPrefix)\(KeychainPolicy.groupSuffix)")
+            }
+        },
+
+        TestCase(group: "Keychain modernisation",
+                 name: "the production policy is usable and correctly grouped") { expect in
+            expect.ok(AppleTeam.keychainPolicy.isUsable)
+            expect.equal(AppleTeam.keychainPolicy.accessGroup,
+                         "26JLFSV9YS.com.vacationrentalcalendar.shared")
+            expect.equal(AppleTeam.keychainPolicy.service, FeedCredentialService.name)
+        },
+
+        TestCase(group: "Keychain modernisation",
+                 name: "an unsigned build knows it cannot use an access group") { expect in
+            // The test binary is not signed by the team, so this must be false.
+            // If it ever becomes true here, the check is not measuring what it
+            // claims to.
+            expect.ok(!AppleTeam.runningCodeCanUseAccessGroup,
+                      "the test runner is not team-signed, and must say so")
+        },
     ] }
 }

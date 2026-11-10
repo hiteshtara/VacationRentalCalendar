@@ -86,8 +86,18 @@ public struct ImportService: Sendable {
         // for a refresh; it is not tolerable while drawing a calendar.
         var feedURL = ""
         var resolveError: String?
+        // A TIMEOUT is not a broken credential. It says the Keychain was slow
+        // at this moment and nothing at all about the stored value, so it must
+        // stay retryable. Treating the two alike meant any busy machine could
+        // permanently disconnect every calendar: on 2026-11-10 it silenced
+        // three working feeds for an hour and a real Airbnb reservation went
+        // unimported, while `vrc doctor` read all three credentials fine.
+        var resolveTimedOut = false
         do {
             feedURL = try listings.resolveURL(for: listing)
+        } catch let error as FeedCredentialError {
+            if case .timedOut = error { resolveTimedOut = true }
+            resolveError = error.errorDescription ?? "\(error)"
         } catch {
             resolveError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -99,15 +109,18 @@ public struct ImportService: Sendable {
                 // item's access list names an earlier build. Recorded so no
                 // further attempt is made, because each one holds the keychain
                 // for the rest of the process.
-                run.outcome = .disconnected
+                run.outcome = resolveTimedOut ? .failure : .disconnected
                 run.errorMessage = resolveError
                 try? listings.setConnectionState(
-                    listingID: listingID, to: .credentialUnreadable,
+                    listingID: listingID,
+                    to: resolveTimedOut ? .failing : .credentialUnreadable,
                     detail: resolveError, actor: "import", at: now
                 )
                 try? listings.recordSync(
                     listingID: listingID, at: now,
-                    summary: "Enter this listing's URL again — the saved one cannot be read"
+                    summary: resolveTimedOut
+                        ? "The Keychain did not answer in time — will try again"
+                        : "Enter this listing's URL again — the saved one cannot be read"
                 )
             } else {
                 run.outcome = .skipped

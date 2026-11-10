@@ -300,7 +300,15 @@ public final class DeadlineFeedCredentialStore: FeedCredentialStore, @unchecked 
     private let wrapped: FeedCredentialStore
     private let timeout: TimeInterval
 
-    public init(wrapping wrapped: FeedCredentialStore, timeout: TimeInterval = 4) {
+    /// The bound exists so an abandoned authorisation prompt cannot freeze the
+    /// app forever. Four seconds was too tight: on a busy machine an ordinary
+    /// read exceeded it, and the timeout was misread as a broken credential,
+    /// which silently disconnected three working feeds for an hour. Twenty
+    /// still prevents a frozen app and no longer trips on load.
+    public static let defaultTimeout: TimeInterval = 20
+
+    public init(wrapping wrapped: FeedCredentialStore,
+                timeout: TimeInterval = DeadlineFeedCredentialStore.defaultTimeout) {
         self.wrapped = wrapped
         self.timeout = timeout
     }
@@ -379,5 +387,26 @@ public final class UnreadableFeedCredentialStore: FeedCredentialStore, @unchecke
     public func url(reference: String) throws -> String? {
         guard present.contains(reference) else { return nil }
         throw FeedCredentialError.keychainFailure(-25293, "read")
+    }
+}
+
+
+/// A credential store whose reads never return in time.
+///
+/// Models the real failure of 2026-11-10: the machine was busy, a Keychain
+/// read exceeded `DeadlineFeedCredentialStore`'s limit, and the timeout was
+/// classified as "this build cannot read its credentials" — a latched state
+/// that stops all further attempts. Three working feeds went silent and a
+/// genuine Airbnb reservation went unseen for an hour.
+///
+/// Test-only, and in VRCCore rather than the test target so Linux compiles it.
+public final class TimingOutFeedCredentialStore: FeedCredentialStore, @unchecked Sendable {
+    public init() {}
+    public var storageDescription: String { "times out (test only)" }
+    public func save(url: String, reference: String) throws {}
+    public func delete(reference: String) throws {}
+    public func exists(reference: String) -> Bool { true }
+    public func url(reference: String) throws -> String? {
+        throw FeedCredentialError.timedOut
     }
 }
