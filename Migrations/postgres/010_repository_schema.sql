@@ -121,7 +121,7 @@ CREATE TABLE properties (
     notes       text NOT NULL DEFAULT '',
     created_at  double precision NOT NULL,
     updated_at  double precision NOT NULL
-, time_zone text NOT NULL DEFAULT 'UTC'
+, time_zone text NOT NULL DEFAULT 'UTC', archived_at double precision
 );
 
 CREATE TABLE sync_runs (

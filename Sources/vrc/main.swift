@@ -207,7 +207,8 @@ func runSetURL() async {
     updated.urlStorage = .keychain
     if updated.credentialRef.isEmpty {
         updated.credentialRef = ListingRepository.credentialReference(
-            platform: listing.platform, listingLabel: listing.label
+            platform: listing.platform, listingLabel: listing.label,
+            propertyID: listing.propertyID
         )
     }
     let previousRef = listing.credentialRef

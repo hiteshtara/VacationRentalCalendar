@@ -637,7 +637,8 @@ final class AppState: ObservableObject {
         updated.urlStorage = .keychain
         if updated.credentialRef.isEmpty {
             updated.credentialRef = ListingRepository.credentialReference(
-                platform: listing.platform, listingLabel: listing.label
+                platform: listing.platform, listingLabel: listing.label,
+                propertyID: listing.propertyID
             )
         }
         do {
@@ -679,7 +680,7 @@ final class AppState: ObservableObject {
                         label: "\(platform.displayName) — \(name)",
                         urlStorage: .keychain,
                         credentialRef: ListingRepository.credentialReference(
-                            platform: platform, listingLabel: name
+                            platform: platform, listingLabel: name, propertyID: id
                         ),
                         autoRefreshEnabled: false
                     ))

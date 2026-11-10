@@ -292,6 +292,29 @@ public enum Migrator {
         CREATE INDEX idx_connection_events_listing
             ON listing_connection_events(listing_id, at DESC);
         """),
+        Migration(version: 13, name: "multi_property", sql: """
+        -- Archiving, not deleting. A property that is sold or taken off the
+        -- market still has to explain what happened to its past nights, so the
+        -- row and everything hanging off it stay exactly where they are and
+        -- only disappear from the active portfolio.
+        ALTER TABLE properties ADD COLUMN archived_at REAL;
+
+        CREATE INDEX IF NOT EXISTS idx_properties_archived ON properties(archived_at);
+
+        -- A credential reference identifies one Keychain item. Two listings
+        -- sharing one would mean two feeds — possibly on different properties
+        -- — backed by the same stored URL, so revoking one would silently
+        -- break the other. The old reference was derived from the platform and
+        -- the listing LABEL alone, and two properties whose listings are both
+        -- called "Airbnb" collided.
+        --
+        -- Partial, because a listing whose URL lives in the database column
+        -- legitimately has no reference at all.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_credential_ref
+            ON platform_listings(credential_ref)
+            WHERE credential_ref <> '';
+        """),
+
     ]
 
     public static var latestVersion: Int {

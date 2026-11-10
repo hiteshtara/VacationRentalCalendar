@@ -108,6 +108,7 @@ public enum TestRegistry {
             + EmptyCalendarTests.cases
             + CredentialReplacementTests.cases
             + BulkCancellationTests.cases
+            + MultiPropertyTests.cases
             + FeedEndpointTests.cases
             + SigningTests.cases
             + PostgresIntegrationTests.cases

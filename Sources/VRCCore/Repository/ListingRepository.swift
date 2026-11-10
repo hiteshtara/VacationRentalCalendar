@@ -12,12 +12,27 @@ public struct ListingRepository: Sendable {
     }
 
     /// Deterministic, readable Keychain account name.
-    public static func credentialReference(platform: RentalPlatform, listingLabel: String) -> String {
+    /// The Keychain item name for a listing's feed URL.
+    ///
+    /// Scoped by `propertyID`, which the label alone cannot do. Two properties
+    /// whose listings are both simply called "Airbnb" previously produced
+    /// `airbnb-airbnb` for both, so one Keychain item backed two feeds and
+    /// revoking one would silently break the other — across properties. A
+    /// unique index on `credential_ref` now makes that collision impossible to
+    /// store even if this function were wrong again.
+    ///
+    /// Existing references are never recomputed: `persistURL` keeps whatever a
+    /// listing already has, so 39 G Street's three live credentials are
+    /// untouched by this change.
+    public static func credentialReference(
+        platform: RentalPlatform, listingLabel: String, propertyID: Int64
+    ) -> String {
         let slug = listingLabel
             .lowercased()
             .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return "\(platform.rawValue)-\(slug.isEmpty ? UUID().uuidString.lowercased() : slug)"
+        let name = slug.isEmpty ? UUID().uuidString.lowercased() : slug
+        return "\(platform.rawValue)-p\(propertyID)-\(name)"
     }
 
     /// Decodes a row **without** touching the credential store.
@@ -70,7 +85,9 @@ public struct ListingRepository: Sendable {
             return (listing.icalURL, listing.credentialRef)
         case .keychain:
             var reference = listing.credentialRef.isEmpty
-                ? Self.credentialReference(platform: listing.platform, listingLabel: listing.label)
+                ? Self.credentialReference(
+                    platform: listing.platform, listingLabel: listing.label,
+                    propertyID: listing.propertyID)
                 : listing.credentialRef
 
             if listing.hasURL {
