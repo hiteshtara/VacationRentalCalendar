@@ -179,5 +179,57 @@ public enum PortfolioTests {
             expect.equal(rows.first?.property.id, kept.id)
             expect.ok(try store.properties.find(id: gone.id!) != nil, "but the record survives")
         },
+        // --- Portfolio month strip ---------------------------------------------
+
+        TestCase(group: "Portfolio",
+                 name: "a month strip draws one continuous bar, not one per week") { expect in
+            // The portfolio compares properties on the same DATE, so its bars
+            // run the width of the month rather than resetting every Sunday.
+            let long = event("long", .airbnb, .confirmedReservation, (2027, 6, 2), (2027, 6, 23))
+            let bars = CalendarLayout.monthStrip(
+                monthStart: day(2027, 6, 1), dayCount: 30, events: [long])
+            expect.equal(bars.count, 1, "one event, one bar")
+            expect.equal(bars.first?.startColumn, 1, "the 2nd is column 1")
+            expect.equal(bars.first?.columnSpan, 21, "2nd to 22nd inclusive — checkout excluded")
+            expect.ok(!(bars.first?.isClippedAtStart ?? true))
+            expect.ok(!(bars.first?.isClippedAtEnd ?? true))
+        },
+
+        TestCase(group: "Portfolio",
+                 name: "a bar overrunning the month is clipped and says so") { expect in
+            // Booking.com's live export runs 2027-04-01 to 2028-05-10. Viewed
+            // in any middle month it must fill the strip and be marked clipped
+            // at both ends, so the view does not cap it like a real boundary.
+            let huge = event("huge", .bookingCom, .unknownUnavailable,
+                             (2027, 4, 1), (2028, 5, 10))
+            let bars = CalendarLayout.monthStrip(
+                monthStart: day(2027, 9, 1), dayCount: 30, events: [huge])
+            expect.equal(bars.count, 1)
+            expect.equal(bars.first?.startColumn, 0)
+            expect.equal(bars.first?.columnSpan, 30, "it covers every day of September")
+            expect.ok(bars.first?.isClippedAtStart == true)
+            expect.ok(bars.first?.isClippedAtEnd == true)
+        },
+
+        TestCase(group: "Portfolio",
+                 name: "strip lanes follow the same checkout-exclusive rule") { expect in
+            let out = event("out", .airbnb, .confirmedReservation, (2027, 8, 1), (2027, 8, 5))
+            let into = event("in", .vrbo, .confirmedReservation, (2027, 8, 5), (2027, 8, 9))
+            let overlapping = event("ov", .bookingCom, .ownerBlock, (2027, 8, 3), (2027, 8, 7))
+            let bars = CalendarLayout.monthStrip(
+                monthStart: day(2027, 8, 1), dayCount: 31, events: [out, into, overlapping])
+            let byKey = Dictionary(uniqueKeysWithValues: bars.map { ($0.eventKey, $0) })
+            expect.equal(byKey["out"]?.lane, byKey["in"]?.lane,
+                         "back-to-back stays share a lane")
+            expect.ok(byKey["ov"]?.lane != byKey["out"]?.lane,
+                      "the overlapping block needs its own")
+        },
+
+        TestCase(group: "Portfolio",
+                 name: "an event outside the month produces no bar at all") { expect in
+            let elsewhere = event("x", .vrbo, .ownerBlock, (2027, 3, 1), (2027, 3, 5))
+            expect.equal(CalendarLayout.monthStrip(
+                monthStart: day(2027, 8, 1), dayCount: 31, events: [elsewhere]).count, 0)
+        },
     ] }
 }

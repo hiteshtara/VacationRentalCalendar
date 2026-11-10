@@ -17,27 +17,22 @@ struct PortfolioView: View {
     @State private var addingProperty = false
     @State private var showArchived = false
     @State private var archiveCandidate: Property?
+    @State private var mode: Mode = .properties
+
+    enum Mode: String, CaseIterable, Identifiable {
+        case properties = "Properties"
+        case calendar = "Calendar"
+        var id: String { rawValue }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider()
-            if state.portfolioRows.isEmpty && !showArchived {
-                ContentUnavailableView(
-                    "No properties yet",
-                    systemImage: "house",
-                    description: Text("Add a property to start unifying its calendars."))
+            if mode == .calendar {
+                modePicker
+                Divider()
+                PortfolioCalendarView()
             } else {
-                ScrollView {
-                    VStack(spacing: 10) {
-                        ForEach(state.portfolioRows) { row in
-                            PortfolioCard(row: row) { editing = row.property }
-                                archiveAction: { archiveCandidate = row.property }
-                        }
-                        if showArchived { archivedSection }
-                    }
-                    .padding(12)
-                }
+                propertiesBody
             }
         }
         .sheet(item: $editing) { property in
@@ -66,6 +61,40 @@ struct PortfolioView: View {
         }
     }
 
+    private var modePicker: some View {
+        Picker("", selection: $mode) {
+            ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 220)
+        .padding(12)
+    }
+
+    private var propertiesBody: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider()
+            if state.portfolioRows.isEmpty && !showArchived {
+                ContentUnavailableView(
+                    "No properties yet",
+                    systemImage: "house",
+                    description: Text("Add a property to start unifying its calendars."))
+            } else {
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(state.portfolioRows) { row in
+                            PortfolioCard(row: row) { editing = row.property }
+                                archiveAction: { archiveCandidate = row.property }
+                        }
+                        if showArchived { archivedSection }
+                    }
+                    .padding(12)
+                }
+            }
+        }
+    }
+
     private var header: some View {
         HStack {
             VStack(alignment: .leading, spacing: 1) {
@@ -75,6 +104,10 @@ struct PortfolioView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
+            Picker("", selection: $mode) {
+                ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden().frame(width: 190)
             if state.properties.contains(where: \.isArchived) {
                 Toggle("Show archived", isOn: $showArchived)
                     .toggleStyle(.checkbox).controlSize(.small)
