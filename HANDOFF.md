@@ -1856,3 +1856,112 @@ largest source of day-to-day breakage in this project.
 Recommended sequence is direct distribution first (Developer ID + notarization,
 no sandbox), then the sandbox/Keychain rewrite, then the store. Multi-tenant
 AWS is last and should not start before there are paying customers.
+
+## 22. Phase 1 UI, backup tooling, and the scanner baseline (2026-11-10)
+
+Branch `feature/multi-property`, PR #11. Commits `779e7bd`, `627909a`,
+`22a6d24`. PR #10 and the other nine remain open.
+
+### The secret scanner is green again
+
+Not by skipping the fixture file. `Scripts/secret-history-baseline.txt` records
+the **SHA-256 of each known matched string**; those exact five values are
+accepted in history and nothing else is.
+
+A path exemption was considered and rejected: it would blind the history scan
+to a real credential committed to that path later. With the baseline, a new
+finding — any file, any pattern, including a **different value of the same
+shape** — hashes differently and still fails. The baseline applies to history
+only; a baselined value sitting in the working tree is a live leak and is
+still rejected. Four tests assert exactly those properties.
+
+Two bugs surfaced while building it, both mine and both worth recording:
+
+* **`grep -o` prints "Binary file matches" on binary input instead of the
+  matches.** The first collector therefore returned nothing and produced a
+  baseline containing a single hash — of grep's own message. `-a` fixes it.
+  The same trap had already bitten this script once, via `sed`.
+* **The scanner hashes the matched SUBSTRING, not the line.** A baseline entry
+  computed from a full URL including its scheme never matches anything, and
+  fails silently rather than loudly.
+
+### Backup and restore
+
+`Scripts/backup-before-install.sh`, with `--verify` and `--restore`.
+
+Database captured via `sqlite3 .backup`, never a file copy. **No credential
+value is ever written to a backup** — only Keychain account names, read with
+`security find-generic-password` *without* `-w`, so it touches attributes only
+and cannot prompt, block or read secret material. The verifier greps its own
+output for feed-URL shapes and refuses to call the backup safe if it finds
+one. Restore sets the current database aside first, so restoring is itself
+reversible.
+
+Ten tests wreck a throwaway database the way a bad migration would, restore
+it, and check the rows and publication UIDs came back.
+
+A real backup of the live data was taken and verified today.
+
+### Phase 1 UI
+
+A **Portfolio** section: add, edit and archive properties, and a read-only
+roll-up per property — connections, observations, review queue, conflicts,
+next arrival. `RentalStore.portfolio()` computes it in VRCCore so it can be
+tested; the view renders and adds nothing. Every figure is counted per
+property; none is derived from a global total.
+
+Time zone is editable for the first time. Archiving asks first, says plainly
+that nothing is deleted, and the selection can never rest on an archived
+property.
+
+### What is automated, and what still needs eyes
+
+This matters more than usual here, because there is no XCUITest on this
+machine — Command Line Tools only — so **no UI automation is possible at all**.
+What follows is the honest split.
+
+**Automated** (`Portfolio` and `Presentation` groups):
+
+| Behaviour | Asserted as |
+|---|---|
+| Multi-week bars are continuous | only the first segment `isStart`, only the last `isEnd`, middles open both sides |
+| Month-boundary continuity | a 2026-12-28 → 2027-01-06 bar does not restart |
+| Checkout-exclusive | 1st–5th occupies four columns, not five |
+| Back-to-back stays | share one lane rather than stacking |
+| Overlapping platforms | three overlapping events keep three lanes and three identities |
+| Booking.com `CLOSED` | classified `unknownUnavailable`, needs review, never exported, **still drawn** |
+| Lane stacking and overflow | pre-existing `Presentation` tests |
+| Per-property isolation | portfolio counts, review filtering, no cross-property conflicts |
+
+**Still requires visual inspection** — none of this can be asserted here:
+
+* whether platforms are actually **distinguishable by colour**, and in dark mode
+* whether a multi-week bar *looks* continuous — the layout says it spans the
+  rows, but the 1.5pt insets and 3pt width reduction are a visual judgement
+* truncation of long property names and listing labels in the sidebar and cards
+* that the new **Portfolio** section appears, is reachable, and navigates
+* the add/edit sheet at its fixed 430pt width, and the time-zone picker
+* confirmation dialogs reading sensibly in situ (archive, withdraw approval)
+* window resizing and small-width layout
+* that the live 9 observations render where expected across November–December
+
+### Readiness for a controlled installation
+
+Ready, with these preconditions:
+
+1. **Take a backup first** — `./Scripts/backup-before-install.sh`. Verified
+   today against the live database.
+2. **Migration 13 will apply on first launch** of a new build. It is additive
+   (`archived_at`, one index) and tested as repeatable, but it has **not** been
+   run against live data. The live database is still at **v12**.
+3. The credential-reference change does **not** rewrite existing references —
+   `persistURL` keeps what a listing already has — so the three live
+   credentials are untouched. New listings get property-scoped references.
+4. Rebuilding changes the app's code hash, which **will** orphan the Keychain
+   items again. Expect to re-enter all three feed URLs after installing, or
+   run `Scripts/migrate-cloud-credential.sh` first. This is the known
+   `SecTrustedApplicationCreateFromPath` problem and is only removed by the
+   sandbox work in the App Store audit.
+
+Nothing has been installed, no migration run against live data, no AWS
+resource touched, outbound publishing still disabled.
