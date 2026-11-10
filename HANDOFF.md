@@ -596,10 +596,15 @@ next milestone is real read-only Airbnb and Vrbo imports (item 2).
    The only follow-up it produced is a question rather than a task: the
    Linux + static-credentials asymmetry in §12, which has a workaround, does not
    affect production, and has no explanation yet.
-2. **Prepare real imports (read-only):** confirm the Airbnb/Vrbo feed URLs read
-   from the Keychain via the `vrc` helper; run the live feed-diff to measure the
-   change-detection hit rate (decides the ~$5.76 vs ~$19.95/mo import cadence);
-   store source feed URLs in `vrc-staging/sources/feed-urls`.
+2. **Prepare real imports (read-only) — BLOCKED ON THE OWNER, see §13.** The
+   feed URLs were checked on 2026-11-10 and **none of the three feeds can be
+   fetched**: Airbnb and Vrbo need their URLs re-entered (the cdhash trap, which
+   macOS will not prompt about), and Booking.com needs a brand-new export URL
+   because the platform invalidated the old token. Two `vrc set-url` commands in
+   a real Terminal unblock Airbnb and Vrbo. Only then: run the live feed-diff to
+   measure the change-detection hit rate (decides the ~$5.76 vs ~$19.95/mo
+   import cadence) and store the source URLs in `vrc-staging/sources/feed-urls`,
+   which currently holds no value at all.
 3. **Reconcile** imported observations with the 7 local events and 7
    classifications, preserving the distinction between confirmed booking,
    cancellation penalty, owner block, and unknown — **never** auto-classifying
@@ -700,3 +705,99 @@ cluster lived roughly 35 minutes with one low-ACU writer and 1 GB of storage, so
 the incremental charge is **well under the $0.50 budget — on the order of
 $0.05–$0.15**. Computed from verified rates and measured lifetimes; Cost
 Explorer lags about a day and had published nothing for the period.
+
+---
+
+## 13. Real feed readiness — checked 2026-11-10. **All three feeds are blocked.**
+
+The real-import milestone cannot start until the owner acts. Nothing here is a
+code problem, and nothing is fixable from an automated session.
+
+### What each feed needs
+
+| Listing | State | What it needs |
+|---|---|---|
+| **Airbnb** — 39 G Street | `Needs the URL entered again` | the owner re-enters the URL |
+| **Vrbo** — 39 G Street (5550554) | `Needs the URL entered again` | the owner re-enters the URL |
+| **Booking.com** — Southie Beach House (17482435) | **`Disconnected by the platform`** | a **brand-new export URL generated on Booking.com** |
+
+**Airbnb and Vrbo** are the documented cdhash trap. `vrc keychain` on the
+installed build (`217f668`) reports:
+
+```
+FAIL Airbnb — 39 G Street [airbnb-1759472334611502986-v3] — refused (OSStatus -25293)
+FAIL Booking.com — … [booking-17482435]                   — refused (OSStatus -25293)
+FAIL Vrbo — 39 G Street (5550554) [vrbo-5550554-v3]       — refused (OSStatus -25293)
+ok   AWS access key id   — readable
+ok   AWS secret access key — readable
+```
+
+The AWS pair is readable because it was re-owned by this build during the
+keychain migration (§8). The three feed items never were, so their access list
+still names an older, ad-hoc-signed build by its code hash. **macOS does not
+prompt in this situation — it refuses silently.** There is no dialog to approve
+and no migration to run; re-entry is the only fix, and the app says so itself.
+
+**Booking.com is a different and worse problem.** It is not a Keychain issue:
+the platform returned **400 Invalid Token** because the calendar connection the
+export URL belonged to was deleted. Re-entering the old URL would achieve
+nothing. It is marked **needing reconnection** and requires generating a fresh
+export URL in the Booking.com extranet first. The staging API already carries
+`VRC_DISCONNECTED_SOURCES=booking_com`, so the service agrees.
+
+### A trap in the diagnostics themselves
+
+`vrc doctor` prints `ok   feed URL stored for Airbnb …` for all three. That is
+**presence of the Keychain reference, not readability**, and reading it as
+"feeds are fine" is a mistake waiting to happen. `vrc keychain` is the command
+that answers whether this build can actually read them; `vrc connection`
+explains why not and what to do.
+
+### There is no second copy of these URLs
+
+`vrc-staging/sources/feed-urls` in Secrets Manager answers
+`ResourceNotFoundException` — the secret exists but holds no value. So AWS is not
+an alternative source, and a cloud-side import is blocked for the same reason.
+
+### How the owner unblocks it
+
+In a **real Terminal** (not an automated session), or in the app under **Feeds**:
+
+```bash
+/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc set-url --listing 2   # Airbnb
+/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc set-url --listing 1   # Vrbo
+```
+
+`set-url` reads the URL from stdin with echo cleared, verifies it before saving,
+and never puts it in argv, shell history, `ps`, or a log. It writes a fresh
+Keychain entry owned by the current build and leaves the old one untouched —
+nothing is deleted and no credential is regenerated. Then
+`vrc keychain` should report all three readable, and `vrc import` becomes possible.
+
+**Never pass a feed URL as a command-line argument.** It is a bearer credential.
+
+### Local data, as it stands before any real import
+
+| | |
+|---|---|
+| Events | **7 active** — Airbnb 4, Vrbo 3, Booking.com 0 |
+| Classifications | Maintenance block 2 events (834 nights), Cancellation block 5 events (43 nights) |
+| Confirmed reservations | **none** — worth knowing before reconciliation, since none of the 7 is a booking |
+| Needs review | 0 |
+| Double bookings | 0 · other overlaps 4 |
+| Approved Vrbo decisions | 2, both **approved and not published** (Dec 10–17 and Dec 19–20, 2026) |
+| December 17–18 2026 | **free of any Vrbo block decision** |
+
+### The Mac display is already built
+
+Audited against the six distinctions wanted for real observations; all are
+already present, so no UI work is pending on this milestone:
+
+| Wanted | Where |
+|---|---|
+| Airbnb vs Vrbo observations | `Theme.swift` — per-platform colour and SF Symbol per `RentalPlatform` |
+| Confirmed reservation vs unknown block | `Theme.swift` colours every `BlockKind` separately; `EventDetailPanel` treats `confirmedReservation` specially |
+| Local vs AWS records | local calendar panes vs the Cloud pane, which labels each interval `source · basis` |
+| Conflicts requiring review | `ConflictsView`, `ReviewView`, and a review queue in `vrc status` |
+| Last successful refresh | Cloud pane renders `status.lastSuccessfulImport` (currently `never`) |
+| Duplicate-free refresh | covered by `RequiredScenarioTests` — "re-importing a feed creates no duplicates" |
