@@ -263,3 +263,57 @@ pays for itself.
 No subscriptions introduced, no production infrastructure deployed, no live
 availability changed, nothing submitted to Apple. 39 G Street and its three
 credentials are untouched.
+
+
+---
+
+# Addendum — 2026-11-10, branch `feature/distribution`
+
+Two of the ten blockers have moved. The rest stand as assessed.
+
+## Blocker 2 (Keychain) — implementation written and tested
+
+No longer "needs a verified Team ID; untested". `KeychainPolicy`,
+`KeychainItemSpec`, `DataProtectionFeedCredentialStore` and
+`CredentialMigration` exist, with 26 tests covering the policy, the `kSec*`
+translation, and migration planning and application.
+
+It is **isolated**: not wired into the running app, and no live credential has
+been touched. The one blocking dependency is unchanged — an Apple Developer
+Program membership, because without a Team ID `KeychainPolicy.isUsable` is
+false and the store refuses to write rather than creating ungrouped items.
+
+Effort revised from 1–2 weeks to **2–4 days**, and most of that is the live
+migration rehearsal rather than the code.
+
+## Blocker 3 (container relocation) — unchanged, and now the larger half
+
+With the Keychain work done, this is the biggest remaining piece of the
+sandbox move. Nothing has been written. The risk is unchanged and worth
+restating: the first sandboxed launch finds an **empty database** and looks
+like total data loss.
+
+`Scripts/backup-before-install.sh` is a prerequisite and now exists, verified,
+with a tested restore.
+
+## A note on the diagnostics
+
+Three scripts verified credential readability by grepping `vrc keychain`, a
+subcommand that **has never existed**. It failed silently, so:
+
+* `migrate-cloud-credential.sh` reported every successful migration as a
+  failure, and its "already readable" count was always zero;
+* `build-app.sh` reported "all stored credentials are readable" after every
+  install, whether they were or not.
+
+All three now use `vrc doctor`, which distinguishes *not configured* from
+*unreadable*. This matters for distribution specifically: an install script
+that always claims success is worse than one with no check, and it would have
+shipped that way.
+
+## Sequence
+
+Unchanged, and reinforced by the Keychain work landing early: Developer ID
+first, then the Keychain migration under Developer ID where rollback is a DMG,
+then sandbox, then the store, then billing. See
+[DISTRIBUTION.md](DISTRIBUTION.md).

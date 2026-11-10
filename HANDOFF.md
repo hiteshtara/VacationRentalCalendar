@@ -2184,3 +2184,73 @@ fixes are verified by unit tests rather than by prompting again. The installed
 build therefore still prints the old messages until it is next rebuilt; the
 three live references, nine observations, ten classifications, two decisions,
 two publication UIDs and ten audit rows are untouched.
+
+## 26. Distribution phase — architecture, Keychain replacement, readiness (2026-11-10)
+
+Branch `feature/distribution`. Nothing rebuilt, nothing installed, no live
+credential or database touched.
+
+### The Keychain replacement exists and is tested
+
+`KeychainPolicy` → `KeychainItemSpec` → `DataProtectionFeedCredentialStore`,
+plus `CredentialMigration`. **26 tests.** Isolated: not wired into the app.
+
+Policy is deliberately separate from the `kSec*` plumbing, so the rules —
+data protection keychain, access group, accessibility class, never
+synchronised, never an ACL — are asserted on every platform including Linux,
+and the Security translation is checked once where it can run.
+
+The access group is the whole idea: a file-keychain ACL identifies code by its
+designated requirement, which here has meant the code hash, so every rebuild
+orphans every credential. An access group belongs to the signing **team**, so
+the app and its helper share one and rebuilding changes nothing. It is also
+the only scheme a sandboxed build can use, which makes this the same work as
+the App Store move rather than a separate project.
+
+`CredentialMigration` plans before it writes — every credential incident here
+came from a write whose effect nobody checked. Four outcomes per reference,
+`alreadyPresent` so it is repeatable, `sourceUnreadable` named rather than
+guessed at, and `notConfigured` kept distinct from broken. Applying it reads
+the copy back before counting it migrated, never deletes a source entry, and
+its description carries a 12-character digest rather than the value.
+
+**Blocking dependency, unchanged:** an Apple Developer Program membership.
+Without a Team ID `KeychainPolicy.isUsable` is false and the store refuses to
+write rather than creating ungrouped items only the creating binary can read —
+which would be the original bug wearing a new name.
+
+### The `vrc keychain` bug had a third instance
+
+`Scripts/build-app.sh` also grepped `vrc keychain`, a subcommand that has
+never existed. It failed silently, grep counted zero, and the installer
+reported **"all stored credentials are readable by this build"** after every
+install regardless of the truth.
+
+That is worse than the migration script's version, because it would have
+shipped as part of the install flow. All three call sites now use `vrc doctor`.
+
+### Documents
+
+* [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) — the audit as facts, the two
+  distribution paths and what actually differs, the five-stage sequence, the
+  Keychain design, and the commercial packaging plan including the free-tier
+  gate and an upgrade flow that is deliberately inert.
+* [docs/APP-STORE-READINESS.md](docs/APP-STORE-READINESS.md) — addendum
+  revising blocker 2 from "untested" to implemented, and noting that container
+  relocation is now the larger half of the sandbox move.
+
+### The sequencing argument
+
+Developer ID first, unsandboxed; then the Keychain migration under Developer
+ID where rollback is a DMG and the blast radius is one machine; then sandbox
+and the container move; then the store; then billing.
+
+Every stage is shippable and each de-risks the next. **Nothing in stages 1–3
+is wasted if the App Store never happens** — the Keychain work alone removes
+the single largest source of day-to-day breakage in this project.
+
+### Not done
+
+No membership purchased, no entitlements added, no sandbox enabled, no
+container migration written, no StoreKit, nothing submitted. PRs #10 and #11
+remain open and unmerged.

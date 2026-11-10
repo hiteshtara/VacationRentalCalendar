@@ -203,8 +203,16 @@ if [ "${INSTALL}" = true ]; then
     # status is not evidence: it reflects the last fetch, which may predate
     # this install. Only an actual read proves anything.
     step "Verifying credential readability (not stored status)"
-    UNREADABLE="$("/Applications/${APP_NAME}.app/Contents/MacOS/vrc" keychain 2>/dev/null \
-                  | grep -c "^  FAIL" || true)"
+    # `vrc doctor`, not `vrc keychain` — there has never been a `keychain`
+    # subcommand. The old call failed silently, grep counted zero, and this
+    # reported "all stored credentials are readable" after every install,
+    # whether they were or not. The same dead call appeared twice in
+    # Scripts/migrate-cloud-credential.sh and misreported every migration.
+    #
+    # doctor distinguishes never-configured listings from unreadable ones, so
+    # an unconfigured property no longer counts as a failure here either.
+    UNREADABLE="$("/Applications/${APP_NAME}.app/Contents/MacOS/vrc" doctor 2>/dev/null \
+                  | grep -c "FAIL feed URL readable" || true)"
     if [ "${UNREADABLE:-0}" -gt 0 ]; then
         echo "  ${UNREADABLE} stored credential(s) are NOT readable by this build."
         echo "  This is expected after a rebuild and is NOT a failed install."
