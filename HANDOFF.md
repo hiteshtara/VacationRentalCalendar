@@ -910,3 +910,116 @@ this means new decisions or an explicit reinstatement, and **neither has been
 done**. CLAUDE.md lists these two under "Data that must survive"; the rows and
 UIDs survive, their *approved* status does not, and that note should be reworded
 once the owner says which state is intended.
+
+---
+
+## 15. Booking.com outbound feed — inspection and proposal (2026-11-10)
+
+**Nothing here is built or deployed.** This is the inspection asked for before
+proposing components, and the finding is that most of it already exists.
+
+### What already works, with no new code
+
+Proved today by running the existing CLI, not by reading it:
+
+```
+vrc feed   --property 1 --to booking_com --raw
+vrc export --property 1 --to booking_com --write booking.ics
+```
+
+produces a **valid, empty** Booking.com feed — 297 bytes, 0 `VEVENT`s — and
+names all seven held-back events with a reason each. Served over local HTTP and
+parsed with an independent (non-Swift) parser it checks out: CRLF line endings,
+`BEGIN`/`VERSION`/`PRODID`/`END` present, every line ≤ 75 octets, no
+`ATTENDEE`/`ORGANIZER`/`CONTACT`/`DESCRIPTION`, `Content-Type: text/calendar`.
+
+| Requirement | Where it already lives |
+|---|---|
+| Per-destination filtering | `CalendarFeedGenerator` matches `decision.destination == destination` — a Vrbo approval is **already** not a Booking.com approval |
+| Only approved blocks | `FeedPublicationScope.approvedManualBlocksOnly`, already the stored `app_settings` value |
+| No cancellation blocks / unknowns | `ExportPolicy` allow-list; today it holds back 5 cancellation blocks and 1 unapproved maintenance block |
+| No guest information | `summaryForSource` emits only "Reserved" / "Not available" |
+| Stable UIDs | `stableUID(forSourceKey:destination:)`, salted per destination so platforms cannot correlate feeds |
+| Checkout-exclusive dates | `ICalWriter` writes `DTSTART;VALUE=DATE` / `DTEND;VALUE=DATE` |
+| Empty feed ≠ permission to reopen | `FeedPublicationSafety` classifies *why* a feed shrank, and treats a lost or stale inbound feed as a reason **not** to reopen |
+| Token rotation | `feed_tokens` has `version` + `retired_at` (currently empty) |
+| Circular-import protection | see below — two layers, one of which does not depend on Booking.com's behaviour |
+
+### What is genuinely missing
+
+1. **No HTTPS surface.** `vrc-staging-feeds-f79de5f0` exists but is empty and
+   fully private (all four public-access blocks on, no bucket policy).
+2. **No token issued.** `feed_tokens` is empty.
+3. **Publication is unwired on purpose.** `vrc-lambda-publish` returns
+   `"the gate is open but live publication is not yet wired, by design"`.
+4. **`OutboundSyncGate.isEnabled = false`** — a reviewed code change, never a
+   toggle.
+5. **Zero Booking.com decisions exist**, so today's feed is *legitimately*
+   empty. That is the correct starting point, not a defect.
+
+### Circular imports — the part worth reading
+
+The generator drops any inbound event whose UID carries `vrc-` or our UID
+domain. **That guard only works if Booking.com preserves our UID when it
+re-exports** — and it probably does not: Booking.com relabels everything
+`CLOSED - Not available` (docs/PLATFORM-SYNC-RESEARCH.md calls it the worst
+case).
+
+The protection that actually holds is the second one: Booking.com's `CLOSED` is
+classified **unknown**, and unknown is not in the export allow-list. So a block
+of ours returning through Booking.com's export can never be re-published, no
+matter what UID it carries. The UID guard is a useful first line; the
+classifier is the one that does not depend on a platform behaving well.
+
+### Hosting — comparison
+
+| Option | New infra | Monthly cost | Verdict |
+|---|---|---|---|
+| **A. Small dedicated public bucket, one prefix** | 1 S3 bucket + policy | **≈ $0.00** | **Recommended** |
+| B. Make the existing feeds bucket public | none, but disables its public-access blocks | ≈ $0.00 | Rejected — widens the blast radius of the bucket the publish Lambda writes to |
+| C. Unauthenticated API Gateway route | 1 route + Lambda | ≈ $0.00 | Workable fallback |
+| D. CloudFront + custom domain | distribution + DNS | ~$10/yr domain + CF | Rejected — explicitly to be avoided |
+| E. S3 presigned URL | none | $0 | **Not viable** — presigned URLs expire; Booking.com needs a durable URL |
+
+Booking.com re-reads roughly every 2 hours → ~360 GET/month. At S3's
+$0.0004/1,000 GET that is **$0.00014/month**, plus a few KB of storage and
+transfer. Effectively free either way.
+
+**"Can we serve public HTTPS without exposing the authenticated API?"** Yes —
+and option A does it by not touching the API at all. The API keeps its single
+`ANY /{proxy+}` route on `AWS_IAM`; the feed lives on a different service with
+its own certificate. Option C would also work (a more specific route wins over
+the catch-all proxy, so the IAM surface stays protected) but puts an
+unauthenticated door on the authenticated API, which is a worse shape for the
+same price.
+
+**When the Mac is off:** the feed is a static object, so S3 keeps serving it
+regardless. It simply stops being *updated*, and stale-in-the-blocking-direction
+is the safe failure: existing blocks keep blocking and nothing reopens by
+itself, which is exactly what `FeedPublicationSafety` is built to preserve.
+
+### Security
+
+The URL **is** the credential — a bearer token in a query-free path. 128 bits of
+randomness makes it unguessable; it must never appear in Git, logs, `ps` or a
+command line, which is why it belongs in the Keychain/`feed_tokens` path like
+every other feed URL. Rotation is: write the new key, update Booking.com, delete
+the old object, mark the old row `retired_at`. Revocation is deleting the object.
+
+The feed leaks only *dates we chose to publish* — no names, no prices, no
+contact details. Worst case on disclosure is that someone learns which nights
+39 G Street is blocked on Booking.com.
+
+### Proposed activation order, after approval
+
+1. Record a Booking.com `AvailabilityDecision`, approve it deliberately.
+2. `vrc feed --property 1 --to booking_com --raw` and read the audit text.
+3. Create the public bucket + prefix-scoped policy (Terraform, plan first).
+4. Issue a token into `feed_tokens`; publish the object.
+5. Fetch the public URL from outside AWS; confirm `text/calendar` and content.
+6. Only then paste the URL into Booking.com, and only then consider the gate.
+
+Steps 1–2 need no infrastructure and can be done today. Nothing past step 2
+happens without explicit approval, and `OutboundSyncGate` stays `false`
+throughout — note that publishing a *file* and opening the *gate* are separate
+decisions.
