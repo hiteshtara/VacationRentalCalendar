@@ -40,6 +40,7 @@ func runHelp() {
     USAGE
       vrc seed                     Insert the configured properties and listings
       vrc set-url --listing <id>   Store a feed URL (read from stdin, never argv)
+                                   --stdin for authorized migration (no prompt)
       vrc status                   Show properties, listings, events, review queue
       vrc import [--listing <id>]  Fetch feeds read-only and reconcile
       vrc review                   List everything awaiting your decision
@@ -63,6 +64,10 @@ func runHelp() {
                                    Run the publication pipeline in a sandbox
       vrc connection [--listing <id>] [--state <state>] [--detail "..."]
                                    Show or change a feed's connection state
+      vrc cloud [status|check]     Show or test the AWS staging connection
+      vrc cloud set-endpoint <url> [--region us-east-1]
+      vrc cloud set-credentials    Store an AWS access key (read without echo)
+      vrc keychain                 Report which stored items this build can read
       vrc doctor                   Check the database, Keychain and outbound gate
 
     KINDS
@@ -79,35 +84,155 @@ func runHelp() {
 
 /// Reads a feed URL from stdin so the secret never appears in a command line,
 /// a shell history or a process list.
-func runSetURL() {
+/// Replaces a listing's calendar feed URL.
+///
+/// The URL is read with echo suppressed and is **verified before it is
+/// stored**: a credential that is saved and only then discovered to be broken
+/// leaves the app in the state this command exists to repair. So the order is
+/// paste, fetch, parse, show what was found, confirm, and only then save.
+///
+/// Nothing prints the URL. Not on success, not on failure, not truncated.
+func runSetURL() async {
     let store = makeStore()
+    let dryRun = flags.contains("--dry-run")
+    // Non-interactive mode, for Scripts/migrate-cloud-credential.sh only. The
+    // terminal requirement below exists to stop a URL being echoed as it is
+    // typed; a pipe echoes nothing, so the protection is not weakened. Every
+    // other check — https, fetch, parse — still applies, and the URL is still
+    // never in argv.
+    let fromStdin = flags.contains("--stdin")
+
     guard let listingID = value(for: "--listing").flatMap(Int64.init) else {
         bail("--listing <id> is required (see `vrc status`)")
     }
     guard let listing = try? store.listings.find(id: listingID), listing.id != nil else {
         bail("no listing with id \(listingID)")
     }
-    FileHandle.standardError.write(Data("Paste the iCal export URL, then press Return:\n".utf8))
-    guard let line = readLine(strippingNewline: true)?
-        .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
+
+    print("Replacing the calendar feed URL for \(listing.label)")
+    print("")
+    print("  Where to find it:")
+    switch listing.platform {
+    case .airbnb:
+        print("    Airbnb → Calendar → Availability → Connect to another website")
+        print("            → Export calendar")
+    case .vrbo:
+        print("    Vrbo → Calendar → Import/Export → Export calendar")
+    case .bookingCom:
+        // The control is "Skip to export", not "Skip this step". The older
+        // label is still repeated by third-party guides, and looking for it
+        // is why this step appears impossible: the import form seems to
+        // demand another calendar's URL with no way past it.
+        print("    Booking.com → Rates & Availability → Sync calendars")
+        print("            → Add calendar connection, or \"Complete setup\" on a")
+        print("              connection already showing \"Activating\"")
+        print("            → in the import form, click \"Skip to export\"")
+        print("            → copy the export link, then \"Done\"")
+        print("      The connection should then read \"Export only\".")
+    case .other:
+        print("    Use the platform's calendar export (not import) URL.")
+    }
+    print("")
+    print("  Your typing will not be shown. The URL is never printed, never")
+    print("  written to the database, and never stored in this project.")
+    if !SecureInput.standardInputIsTerminal && !fromStdin {
+        print("")
+        print("  NOTE: standard input is not a terminal, so echo cannot be")
+        print("        suppressed. Saving is refused in this mode — run this")
+        print("        command directly in Terminal.")
+    }
+    print("")
+
+    let pastedOrNil = fromStdin
+        ? readLine(strippingNewline: true)
+        : SecureInput.readLine(prompt: "  Paste the iCal export URL, then press Return: ")
+    guard let pasted = pastedOrNil else {
         bail("no URL supplied")
     }
-    guard line.lowercased().hasPrefix("https://") || line.lowercased().hasPrefix("webcal://") else {
-        bail("the URL must use https (or webcal) — a plain http feed would leak your calendar token")
+    let url = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !url.isEmpty else { bail("no URL supplied") }
+
+    let lowered = url.lowercased()
+    let allowFile = flags.contains("--allow-file")
+    guard lowered.hasPrefix("https://") || lowered.hasPrefix("webcal://")
+            || (allowFile && lowered.hasPrefix("file://")) else {
+        bail("the URL must use https (or webcal) — a plain http feed would leak "
+            + "your calendar token to anyone on the network")
     }
+
+    print("  Received: \(SecureInput.redact(url))")
+    print("")
+    print("── Verifying before saving")
+
+    let fetcher = URLSessionFeedFetcher(allowFileURLs: flags.contains("--allow-file"))
+    let parsed: ICalParseResult
+    do {
+        let response = try await fetcher.fetch(urlString: url)
+        let status = response.httpStatus.map(String.init) ?? "(no status)"
+        print("   HTTP \(status)")
+        parsed = try ICalParser.parse(response.text)
+        print("   parsed \(parsed.events.count) event(s), producer "
+            + (parsed.productID.isEmpty ? "(unstated)" : parsed.productID))
+        for warning in parsed.warnings.prefix(3) { print("   note: \(warning)") }
+    } catch {
+        let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        print("   FAILED: \(detail)")
+        print("")
+        bail("not saved — the URL was not stored, and your existing entry is untouched")
+    }
+
+    if dryRun {
+        print("")
+        print("   --dry-run: verified but NOT saved. Nothing was written.")
+        return
+    }
+
+    guard SecureInput.standardInputIsTerminal || fromStdin else {
+        bail("refusing to save a credential read without echo suppression — "
+            + "run this in Terminal")
+    }
+
+    if !fromStdin {
+        print("")
+        FileHandle.standardError.write(Data("  Save this URL to the Keychain? [y/N] ".utf8))
+        let answer = (readLine(strippingNewline: true) ?? "").lowercased()
+        guard answer.hasPrefix("y") else {
+            print("  Not saved. Your existing entry is untouched.")
+            return
+        }
+    }
+
     var updated = listing
-    updated.icalURL = line
+    updated.icalURL = url
     updated.urlStorage = .keychain
     if updated.credentialRef.isEmpty {
         updated.credentialRef = ListingRepository.credentialReference(
             platform: listing.platform, listingLabel: listing.label
         )
     }
+    let previousRef = listing.credentialRef
+
     do {
         try store.listings.update(updated)
-        print("Stored for \(listing.label) in \(store.credentials.storageDescription).")
-        print("Reference: \(updated.credentialRef)")
-        print("The URL is not written to the database or to any file in the project.")
+        let saved = try store.listings.find(id: listingID)
+        print("")
+        print("  Stored in \(store.credentials.storageDescription).")
+        if let saved, saved.credentialRef != previousRef {
+            print("  New Keychain reference: \(saved.credentialRef)")
+            print("  The previous entry (\(previousRef)) was left in place and not deleted.")
+        } else {
+            print("  Keychain reference: \(previousRef)")
+        }
+        print("  The URL is not written to the database or to any file in the project.")
+
+        // Clear the unreadable state only after a verified, saved credential.
+        if listing.connectionState == .credentialUnreadable {
+            try store.listings.setConnectionState(
+                listingID: listingID, to: .connected,
+                detail: "URL re-entered and verified", actor: "owner", at: Date()
+            )
+            print("  Connection state: credential_unreadable → connected")
+        }
     } catch {
         bail("could not store the URL: \(error)")
     }
@@ -139,7 +264,9 @@ func runStatus() {
 
         print("Schema version: \(try Migrator.currentVersion(store.database)) "
             + "of \(Migrator.latestVersion)")
-        print("Database:       \(store.database.path)")
+        // The CLI only ever runs against the local SQLite file; the cloud
+        // store is reached by the Lambdas, not from here.
+        print("Database:       \((store.database as? Database)?.path ?? "(not a local file)")")
         print("Feed URLs:      \(store.credentials.storageDescription)")
         print("Outbound sync:  \(OutboundSyncGate.isEnabled ? "ENABLED" : "disabled (hard-coded)")")
         print("")
@@ -809,13 +936,23 @@ func runDoctor() {
         }
         print("")
         let signature = CodeSignatureInfo.current()
-        check("code signature survives a rebuild", signature.kind.survivesRebuild,
+        check("code identity is stable across rebuilds", signature.kind.identityIsStable,
               signature.kind.rawValue
                   + (signature.authority.map { " — \($0)" } ?? ""))
-        if !signature.kind.survivesRebuild {
-            print("     Run ./Scripts/fix-signing.sh once to stop the repeated")
-            print("     Keychain prompts after every rebuild.")
+        if !signature.kind.identityIsStable {
+            print("     Run ./Scripts/fix-signing.sh once for a stable identity.")
         }
+        // Readability is a separate question from identity, and the only one
+        // that matters operationally. `vrc doctor` previously reported the
+        // presence of a Keychain REFERENCE as though it were access.
+        let unreadable = (try? store.listings.all())?.filter {
+            !$0.credentialRef.isEmpty
+                && (try? store.credentials.url(reference: $0.credentialRef)) == nil
+        }.count ?? 0
+        check("this build can actually READ its stored credentials", unreadable == 0,
+              unreadable == 0
+                  ? "all readable"
+                  : "\(unreadable) unreadable — run ./Scripts/migrate-cloud-credential.sh")
         print("")
         print("Credential store: \(store.credentials.storageDescription)")
         print("Code signature:   \(signature.kind.rawValue)"
@@ -827,11 +964,315 @@ func runDoctor() {
     exit(problems == 0 ? 0 : 1)
 }
 
+
+// MARK: - feed-diff
+
+/// Fetches each authorised feed twice and compares the semantic hash, to settle
+/// whether change detection can work against the real platforms.
+///
+/// Deliberately prints nothing that identifies a guest, a reservation, or a
+/// credential: source name, HTTP status, byte count, event count, a truncated
+/// hash, and — when a difference is found — the NAMES of the fields that moved.
+/// Never a URL, a token, a UID, a summary or a date.
+func runFeedDiff() async {
+    let store = makeStore()
+    let gap = Double(value(for: "--gap") ?? "") ?? 300
+    let fetcher = URLSessionFeedFetcher()
+
+    do {
+        let listings = try store.listings.all().filter { $0.connectionState.shouldAttemptImport }
+        guard !listings.isEmpty else { bail("no connected listings to test") }
+
+        print("Feed-diff experiment")
+        print("  Fetches each connected feed twice, \(Int(gap))s apart, and compares the")
+        print("  semantic hash. Excluded from the hash: \(SemanticFeedHash.excludedProperties.joined(separator: ", ")).")
+        print("  No URL, token, UID, summary or date is printed.\n")
+
+        var firstPass: [Int64: (hash: String, events: [ICalEvent], bytes: Int, status: Int?)] = [:]
+
+        for pass in 1...2 {
+            if pass == 2 {
+                print("  waiting \(Int(gap))s before the second fetch…\n")
+                try? await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000))
+            }
+            print("── pass \(pass)")
+            for listing in listings {
+                guard let id = listing.id else { continue }
+                let name = listing.platform.displayName
+                do {
+                    let resolved = try store.listings.resolveURL(for: listing)
+                    let response = try await fetcher.fetch(urlString: resolved)
+                    let parsed = try ICalParser.parse(response.text)
+                    let digest = SemanticFeedHash.hash(parsed.events)
+                    let label: String = name.padding(toLength: 12, withPad: " ", startingAt: 0)
+                    let status: String = response.httpStatus.map(String.init) ?? "?"
+                    let bytes: Int = response.text.utf8.count
+                    let count: Int = parsed.events.count
+                    let short: String = String(digest.prefix(16))
+                    print("   \(label) HTTP \(status)  \(bytes) bytes  \(count) events  hash \(short)")
+                    if pass == 1 {
+                        firstPass[id] = (digest, parsed.events, response.text.utf8.count,
+                                         response.httpStatus)
+                    } else if let before = firstPass[id] {
+                        if before.hash == digest {
+                            print("     → IDENTICAL hash. Change detection works for this source.")
+                            let nowBytes: Int = response.text.utf8.count
+                            if before.bytes != nowBytes {
+                                let was: Int = before.bytes
+                                print("     → note: raw byte count changed (\(was) → \(nowBytes)),")
+                                print("       so a raw-bytes checksum WOULD have reported a false change.")
+                            }
+                        } else {
+                            let names = SemanticFeedHash.changedFieldNames(
+                                from: before.events, to: parsed.events)
+                            print("     → HASH DIFFERS between two fetches.")
+                            print("     → fields that moved: "
+                                + (names.isEmpty ? "(none in common events — the UID set changed)"
+                                                 : names.joined(separator: ", ")))
+                        }
+                    }
+                } catch {
+                    let detail = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    print("   \(name): could not fetch — \(detail)")
+                }
+            }
+            print("")
+        }
+
+        print("── synthetic control (offline, proves the hash is not simply constant)")
+        let base = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+            + "DTSTAMP:20261108T090000Z\r\nUID:control@test\r\n"
+            + "DTSTART;VALUE=DATE:20261210\r\nDTEND;VALUE=DATE:20261217\r\n"
+            + "SUMMARY:Reserved\r\nEND:VEVENT\r\nEND:VCALENDAR"
+        let restamped = base.replacingOccurrences(
+            of: "DTSTAMP:20261108T090000Z", with: "DTSTAMP:20261108T094500Z")
+        let moved = base.replacingOccurrences(
+            of: "DTEND;VALUE=DATE:20261217", with: "DTEND;VALUE=DATE:20261218")
+        let h0 = SemanticFeedHash.hash(try ICalParser.parse(base).events)
+        let h1 = SemanticFeedHash.hash(try ICalParser.parse(restamped).events)
+        let h2 = SemanticFeedHash.hash(try ICalParser.parse(moved).events)
+        print("   DTSTAMP changed only       → \(h0 == h1 ? "same hash (correct)" : "DIFFERENT (wrong)")")
+        print("   check-out date changed     → \(h0 != h2 ? "different hash (correct)" : "SAME (wrong)")")
+    } catch {
+        bail("feed-diff failed: \(error)")
+    }
+}
+
+// MARK: - Cloud
+
+/// Configures and inspects the AWS staging service.
+///
+/// The access key and secret are read with echo suppressed, stored in the
+/// Keychain, and never printed, logged or written to the database -- the same
+/// treatment feed URLs get.
+func runCloud() async {
+    let store = makeStore()
+    let connection = CloudConnection(settings: store.settings, credentials: store.credentials)
+    let subcommand = arguments.count > 1 ? arguments[1] : "status"
+
+    switch subcommand {
+    case "status":
+        print("AWS staging configuration")
+        print("")
+        switch connection.availability() {
+        case .configured(let endpoint, let region):
+            print("  endpoint    \(endpoint.absoluteString)")
+            print("  region      \(region)")
+            print("  credentials present in the Keychain and readable")
+        case .notConfigured(let missing):
+            print("  not configured — missing \(missing.joined(separator: ", "))")
+            print("")
+            print("  vrc cloud set-endpoint https://<id>.execute-api.<region>.amazonaws.com")
+            print("  vrc cloud set-credentials")
+        case .insecureEndpoint(let text):
+            print("  stored endpoint is not https and will not be used: \(text)")
+        case .credentialUnreadable(let detail):
+            print("  credentials are stored but could not be read: \(detail)")
+        }
+
+    case "set-endpoint":
+        guard arguments.count > 2 else {
+            bail("usage: vrc cloud set-endpoint <https url> [--region us-east-1]")
+        }
+        let region = value(for: "--region") ?? "us-east-1"
+        do {
+            try connection.setEndpoint(arguments[2], region: region)
+            print("Stored. endpoint \(arguments[2]) · region \(region)")
+        } catch {
+            bail("\(error)")
+        }
+
+    case "set-credentials":
+        // Non-interactive path for piping straight from `aws iam
+        // create-access-key`, so the secret never reaches a terminal, a shell
+        // history or a log. Two lines: key id, then secret.
+        if flags.contains("--stdin") {
+            guard let keyID = Swift.readLine(strippingNewline: true),
+                  let secret = Swift.readLine(strippingNewline: true),
+                  !keyID.isEmpty, !secret.isEmpty else {
+                bail("--stdin expects two lines: access key id, then secret")
+            }
+            do {
+                try connection.setCredentials(accessKeyID: keyID, secretAccessKey: secret)
+                print("Stored in the Keychain (\(keyID.count)-character key id).")
+            } catch {
+                bail("\(error)")
+            }
+            return
+        }
+
+        print("Storing an AWS access key for the staging API.")
+        print("")
+        print("  Your typing will not be shown. Neither value is printed, written")
+        print("  to the database, or stored in this project.")
+        if !SecureInput.standardInputIsTerminal {
+            print("")
+            print("  NOTE: standard input is not a terminal, so echo cannot be")
+            print("        suppressed. Saving is refused — run this in Terminal.")
+            exit(1)
+        }
+        print("")
+        guard let keyID = SecureInput.readLine(prompt: "  Access key ID: "),
+              !keyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            bail("no access key ID supplied")
+        }
+        guard let secret = SecureInput.readLine(prompt: "  Secret access key: "),
+              !secret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            bail("no secret access key supplied")
+        }
+        do {
+            try connection.setCredentials(
+                accessKeyID: keyID.trimmingCharacters(in: .whitespacesAndNewlines),
+                secretAccessKey: secret.trimmingCharacters(in: .whitespacesAndNewlines))
+            // Only the identifier's length is reported. Printing any part of
+            // either value would defeat reading them without echo.
+            print("")
+            print("Stored in the Keychain (\(keyID.count)-character key id).")
+        } catch {
+            bail("\(error)")
+        }
+
+    case "check":
+        // --json is the GUI's entry point. It prints exactly one line of
+        // sanitized JSON to stdout and nothing else there; every human message
+        // and every error goes to stderr. The GUI reads stdout only, so a
+        // stray diagnostic can never be parsed as status, and a secret can
+        // never reach stdout because only CloudStatusPayload is written there.
+        let asJSON = flags.contains("--json")
+
+        func emit(_ payload: CloudStatusPayload) -> Never {
+            if asJSON {
+                print(payload.encoded())
+                exit(payload.ok ? 0 : 0)   // JSON mode: the payload carries ok
+            }
+            exit(payload.ok ? 0 : 1)
+        }
+
+        guard let client = connection.makeClient() else {
+            switch connection.availability() {
+            case .insecureEndpoint(let text):
+                if asJSON { emit(.failure(.insecureEndpoint,
+                    "The stored endpoint is not https.")) }
+                bail("stored endpoint is not https: \(text)")
+            case .credentialUnreadable(let detail):
+                if asJSON { emit(.failure(.notConfigured,
+                    "The helper cannot read its AWS credential. Re-run vrc cloud set-credentials.")) }
+                bail(detail)
+            default:
+                if asJSON { emit(.failure(.notConfigured,
+                    "No AWS endpoint or credentials stored.")) }
+                bail("not configured — run `vrc cloud status`")
+            }
+        }
+        if asJSON {
+            do {
+                let status = try client.status()
+                let intervals = (try? client.availability()) ?? []
+                emit(.reached(status, intervals: intervals))
+            } catch {
+                // The error text from CloudSyncClient is secret-free by design
+                // (status codes and service messages, never the credential),
+                // but the GUI is given a fixed sentence regardless.
+                FileHandle.standardError.write(Data("could not reach the service: \(error)\n".utf8))
+                emit(.failure(.unreachable, "Could not reach the AWS service."))
+            }
+        }
+        do {
+            let status = try client.status()
+            print("Reached the service.")
+            print("")
+            print("  live source events     \(status.liveSourceEvents)")
+            print("  approved decisions     \(status.approvedDecisions)")
+            print("  published decisions    \(status.publishedDecisions)")
+            print("  open conflicts         \(status.openConflicts)")
+            print("  last successful import \(status.lastSuccessfulImport)")
+            print("  outbound enabled       \(status.outboundEnabled)")
+            print("  platforms confirmed    \(status.remoteSynchronised)")
+            for (source, reason) in status.failingSources.sorted(by: { $0.key < $1.key }) {
+                print("  FAILING \(source): \(reason)")
+            }
+            for (source, reason) in status.staleSources.sorted(by: { $0.key < $1.key }) {
+                print("  STALE   \(source): \(reason)")
+            }
+            let intervals = (try? client.availability()) ?? []
+            print("")
+            print("  \(intervals.count) blocking interval(s)")
+            for interval in intervals {
+                print("    \(interval.from) → \(interval.to)  "
+                      + "\(interval.source) · \(interval.basis)")
+            }
+        } catch {
+            bail("could not reach the service: \(error)")
+        }
+
+    default:
+        bail("unknown: vrc cloud \(subcommand) — try status, set-endpoint, set-credentials, check")
+    }
+}
+
+// MARK: - Keychain
+
+/// Reports, per stored item, whether this executable can read it — and when it
+/// cannot, the actual reason.
+///
+/// Values are never printed. The point is the status, because "refused" and
+/// "wants to ask" need opposite fixes and a timeout cannot tell them apart.
+func runKeychain() {
+    let store = makeStore()
+    var references: [(String, String)] = []
+    for listing in (try? store.listings.all()) ?? [] where !listing.credentialRef.isEmpty {
+        references.append((listing.label, listing.credentialRef))
+    }
+    references.append(("AWS access key id", CloudConnection.accessKeyReference))
+    references.append(("AWS secret access key", CloudConnection.secretKeyReference))
+
+    print("Keychain readability for this executable")
+    print("  \(Bundle.main.executablePath ?? CommandLine.arguments[0])")
+    print("")
+    var unreadable = 0
+    for (label, reference) in references {
+        let probe = KeychainDiagnostics.probe(reference: reference)
+        let mark = probe.isReadable ? "ok  " : "FAIL"
+        print("  \(mark) \(label) [\(reference)] — \(probe.detail)")
+        if !probe.isReadable, probe.outcome != .absent { unreadable += 1 }
+    }
+    print("")
+    if unreadable == 0 {
+        print("Every stored item is readable by this executable.")
+    } else {
+        print("\(unreadable) item(s) unreadable. The access list names code by its")
+        print("designated requirement; an item created by a differently signed")
+        print("build is not covered by it.")
+        exit(1)
+    }
+}
+
 // MARK: - Dispatch
 
 switch command {
 case "seed": runSeed()
-case "set-url": runSetURL()
+case "set-url": await runSetURL()
 case "status": runStatus()
 case "import": await runImport()
 case "review": runReview()
@@ -846,6 +1287,9 @@ case "approve": runApprove()
 case "rehearse": await runRehearsal()
 case "export": runExport()
 case "doctor": runDoctor()
+case "feed-diff": await runFeedDiff()
+case "cloud": await runCloud()
+case "keychain": runKeychain()
 case "help", "--help", "-h": runHelp()
 default:
     runHelp()

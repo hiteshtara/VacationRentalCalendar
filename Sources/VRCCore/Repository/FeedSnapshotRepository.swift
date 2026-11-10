@@ -3,8 +3,8 @@ import Foundation
 /// Stores served feeds so a proposal can be diffed against reality, and so a
 /// bad publication can be rolled back to something known to work.
 public struct FeedSnapshotRepository: Sendable {
-    let database: Database
-    public init(database: Database) { self.database = database }
+    let database: DataStore
+    public init(database: DataStore) { self.database = database }
 
     private func decode(_ row: Row) -> FeedSnapshot {
         let uids = row.stringValue("entry_uids")
@@ -117,10 +117,10 @@ public struct FeedSnapshotRepository: Sendable {
 /// only its version and the Keychain reference, so rotation is auditable
 /// without the secret ever reaching the database, a log, or git.
 public struct FeedTokenRepository: Sendable {
-    let database: Database
+    let database: DataStore
     let credentials: FeedCredentialStore
 
-    public init(database: Database, credentials: FeedCredentialStore) {
+    public init(database: DataStore, credentials: FeedCredentialStore) {
         self.database = database
         self.credentials = credentials
     }

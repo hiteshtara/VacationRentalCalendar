@@ -1,5 +1,11 @@
 # Phase 1 — central booking system architecture
 
+> **Superseded.** The schema this document describes was replaced because the
+> repositories could not query it. See
+> [`Migrations/postgres/superseded/README.md`](../Migrations/postgres/superseded/README.md)
+> and the generated replacement, `010_repository_schema.sql`.
+
+
 **Design for review. No AWS resources were created, no DNS changed, nothing
 deployed, no production data touched.** `OutboundSyncGate.isEnabled` is still
 `false`; the two approved Vrbo decisions and all seven classifications are
@@ -9,7 +15,7 @@ Google Calendar.
 Prepared 2026-11-08. Region `us-east-1`. Branch `feature/central-booking-system`.
 
 Companion documents: [MIGRATION-PLAN.md](MIGRATION-PLAN.md) and the schema
-itself, [`Migrations/postgres/001_central_schema.sql`](../Migrations/postgres/001_central_schema.sql).
+itself, [`Migrations/postgres/001_central_schema.sql`](../Migrations/postgres/superseded/001_central_schema.sql).
 
 ---
 

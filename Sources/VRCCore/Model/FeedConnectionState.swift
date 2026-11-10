@@ -56,6 +56,27 @@ public enum FeedConnectionState: String, CaseIterable, Sendable, Identifiable {
         }
     }
 
+    /// Whether supplying a new URL should give this connection another chance.
+    ///
+    /// Not retrying a dead credential is right, but the latch has to be
+    /// released by the one event that genuinely changes the answer: the owner
+    /// entering a **different** URL. The platform's verdict was about the old
+    /// token and says nothing about the new one.
+    ///
+    /// Every state that blocks importing qualifies, with one exception — a
+    /// connection the owner switched off deliberately stays off. Typing a URL
+    /// is not the same as asking for it to be turned back on, and silently
+    /// re-enabling a feed the owner disabled would be the app overruling them.
+    ///
+    /// Expressed as a rule over `shouldAttemptImport` rather than a list of
+    /// cases, so a state added later is governed rather than forgotten. An
+    /// earlier version named `credentialUnreadable` alone, which left a
+    /// `revoked` feed permanently dead no matter how many times its URL was
+    /// replaced.
+    public var isClearedByANewURL: Bool {
+        !shouldAttemptImport && self != .disconnectedByOwner
+    }
+
     /// Whether this is a deliberate, settled disconnection as opposed to a
     /// malfunction.
     public var isDisconnected: Bool {

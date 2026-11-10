@@ -286,8 +286,35 @@ public enum AvailabilityTests {
             let cleared = try setup.store.availabilityManager.cancelPending(
                 propertyID: setup.propertyID
             )
-            expect.equal(cleared, 2)
+            expect.equal(cleared.cancelled, 2)
+            expect.equal(cleared.keptApproved, 0)
             expect.equal(try setup.store.availability.pending().count, 0)
+        },
+
+        // The behaviour this used to pin — "Cancel all" sweeping up approved
+        // decisions — was the bug, not the design. It is fixed, and the
+        // regression suite for it lives in `Bulk cancellation`. What remains
+        // here is the reason the two predicates must stay distinct.
+        TestCase(group: "Availability",
+                 name: "an approved decision still counts as pending for conflict checks") { expect in
+            let setup = try makeStore()
+            let submitted = try setup.store.availabilityManager.submit(
+                plan(setup.propertyID, [.vrbo: .block])
+            )
+            let id = submitted[0].id!
+            let approved = try setup.store.availabilityManager.approve(decisionID: id)
+            expect.equal(approved.status, .approved)
+            expect.ok(AvailabilityStatus.approved.isPending,
+                      "it still occupies those nights, so an overlap must be refused")
+            expect.ok(!AvailabilityStatus.approved.isDiscardableInBulk,
+                      "but a bulk sweep must not discard it")
+
+            let cleared = try setup.store.availabilityManager.cancelPending(
+                propertyID: setup.propertyID
+            )
+            expect.equal(cleared.cancelled, 0)
+            expect.equal(cleared.keptApproved, 1)
+            expect.equal(try setup.store.availability.find(id: id)?.status, .approved)
         },
 
         TestCase(group: "Availability", name: "every status transition is audited") { expect in

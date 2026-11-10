@@ -59,6 +59,226 @@
             "target": "vrc",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release vrc"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-parity",
+            "target": "vrc-parity",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-parity"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-parity",
+            "target": "vrc-parity",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-parity"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-lambda-fetch",
+            "target": "vrc-lambda-fetch",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-lambda-fetch"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-lambda-fetch",
+            "target": "vrc-lambda-fetch",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-lambda-fetch"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-lambda-process",
+            "target": "vrc-lambda-process",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-lambda-process"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-lambda-process",
+            "target": "vrc-lambda-process",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-lambda-process"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-lambda-publish",
+            "target": "vrc-lambda-publish",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-lambda-publish"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-lambda-publish",
+            "target": "vrc-lambda-publish",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-lambda-publish"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-lambda-api",
+            "target": "vrc-lambda-api",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-lambda-api"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-lambda-api",
+            "target": "vrc-lambda-api",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-lambda-api"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-lambda-sweeper",
+            "target": "vrc-lambda-sweeper",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-lambda-sweeper"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-lambda-sweeper",
+            "target": "vrc-lambda-sweeper",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-lambda-sweeper"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-schema-dump",
+            "target": "vrc-schema-dump",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-schema-dump"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-schema-dump",
+            "target": "vrc-schema-dump",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-schema-dump"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-verify-sigv4",
+            "target": "vrc-verify-sigv4",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-verify-sigv4"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-verify-sigv4",
+            "target": "vrc-verify-sigv4",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-verify-sigv4"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-dq-probe",
+            "target": "vrc-dq-probe",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-dq-probe"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-dq-probe",
+            "target": "vrc-dq-probe",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-dq-probe"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-migrate",
+            "target": "vrc-migrate",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-migrate"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-migrate",
+            "target": "vrc-migrate",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-migrate"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-lambda-feed",
+            "target": "vrc-lambda-feed",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-lambda-feed"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-lambda-feed",
+            "target": "vrc-lambda-feed",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-lambda-feed"
         }
     ]
 }

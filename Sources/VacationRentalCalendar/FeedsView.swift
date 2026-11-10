@@ -57,9 +57,9 @@ struct FeedsView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 6) {
-                Image(systemName: state.signature.kind.survivesRebuild
+                Image(systemName: state.signature.kind.identityIsStable
                       ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(state.signature.kind.survivesRebuild ? .green : .orange)
+                    .foregroundStyle(state.signature.kind.identityIsStable ? .green : .orange)
                 Text(state.signature.explanation)
                     .font(.caption)
                     .fixedSize(horizontal: false, vertical: true)

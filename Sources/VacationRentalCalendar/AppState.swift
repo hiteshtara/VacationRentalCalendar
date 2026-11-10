@@ -46,6 +46,15 @@ final class AppState: ObservableObject {
     @Published private(set) var hasAskedForNotifications = false
     @Published private(set) var signature: CodeSignatureInfo = .init(kind: .unsigned)
     @Published private(set) var storeFailure: String?
+
+    // MARK: Cloud (AWS staging)
+    //
+    // Read-only. Nothing here publishes, approves, or enables a schedule --
+    // the app can look at the cloud service and nothing more.
+    @Published private(set) var cloud: CloudSnapshot = .unknown
+    @Published private(set) var isCloudRefreshing = false
+    @Published private(set) var cloudConfiguration: CloudConnection.Availability =
+        .notConfigured(missing: ["endpoint"])
     /// How many long periods the one-off sweep brought back for review.
     private(set) var longPeriodsFlagged = 0
 
@@ -58,7 +67,7 @@ final class AppState: ObservableObject {
     private var refreshTask: Task<Void, Never>?
 
     enum Section: String, CaseIterable, Identifiable, Hashable {
-        case calendar, reservations, availability, review, settings
+        case calendar, reservations, availability, review, cloud, settings
         var id: String { rawValue }
 
         var title: String {
@@ -67,6 +76,7 @@ final class AppState: ObservableObject {
             case .reservations: return "Reservations"
             case .availability: return "Availability"
             case .review: return "Needs Review"
+            case .cloud: return "Cloud"
             case .settings: return "Settings"
             }
         }
@@ -77,6 +87,7 @@ final class AppState: ObservableObject {
             case .reservations: return "bed.double"
             case .availability: return "slider.horizontal.3"
             case .review: return "questionmark.circle"
+            case .cloud: return "cloud"
             case .settings: return "gearshape"
             }
         }
@@ -108,9 +119,142 @@ final class AppState: ObservableObject {
         self.signature = CodeSignatureInfo.current()
         self.reload()
         loadSettings()
+        refreshCloudConfiguration()
     }
 
     var isReady: Bool { store != nil }
+
+    // MARK: - Cloud
+
+    /// Endpoint configuration, read from SQLite only.
+    ///
+    /// The GUI never reads the AWS credential from the Keychain -- it cannot, on
+    /// this machine (see docs/KEYCHAIN.md). Whether the credential is actually
+    /// usable is answered by the helper on refresh, not here. This only reports
+    /// whether an endpoint has been stored and whether the helper is present.
+    func refreshCloudConfiguration() {
+        guard let store else { return }
+        let endpoint = ((try? store.settings.string(CloudConnection.endpointSettingKey)) ?? nil) ?? ""
+        let region = ((try? store.settings.string(CloudConnection.regionSettingKey)) ?? nil) ?? "us-east-1"
+        if endpoint.isEmpty {
+            cloudConfiguration = .notConfigured(missing: ["endpoint"])
+        } else if HelperCloudClient.helperURL() == nil {
+            cloudConfiguration = .credentialUnreadable("The bundled vrc helper is missing.")
+        } else if let url = URL(string: endpoint), CloudConnection.isSecure(endpoint) {
+            cloudConfiguration = .configured(endpoint: url, region: region)
+        } else {
+            cloudConfiguration = .insecureEndpoint(endpoint)
+        }
+        if case .configured = cloudConfiguration {} else if cloud.status == nil {
+            cloud = CloudSnapshot(health: .notConfigured(cloudConfiguration.summary))
+        }
+    }
+
+    var isCloudConfigured: Bool {
+        if case .configured = cloudConfiguration { return true }
+        return false
+    }
+
+    /// Asks the AWS service for its status, through the bundled helper.
+    ///
+    /// Read-only: the helper calls GET /status and GET /availability and
+    /// nothing else. It cannot publish, approve a decision, or enable a
+    /// schedule. The helper returns only CloudStatusPayload -- no secret ever
+    /// crosses back into this process.
+    func refreshFromCloud() {
+        guard !isCloudRefreshing else { return }
+        refreshCloudConfiguration()
+        guard isCloudConfigured else {
+            cloud = CloudSnapshot(health: .notConfigured(cloudConfiguration.summary))
+            return
+        }
+
+        isCloudRefreshing = true
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                HelperCloudClient.statusWakingSleepingCluster()
+            }.value
+
+            await MainActor.run {
+                guard let self else { return }
+                self.isCloudRefreshing = false
+                switch result {
+                case .success(let payload):
+                    self.cloud = Self.snapshot(from: payload)
+                case .failure(let failure):
+                    // The failure is kept and shown. An indicator that can only
+                    // say "fine" is worse than none.
+                    self.cloud = CloudSnapshot(
+                        health: .unreachable(Self.describe(failure)),
+                        status: self.cloud.status,
+                        intervals: self.cloud.intervals,
+                        checkedAt: Date())
+                }
+            }
+        }
+    }
+
+    /// Maps the helper's sanitized payload onto the snapshot the interface
+    /// shows. The reconstructed Status carries only the payload's fields.
+    private static func snapshot(from payload: CloudStatusPayload) -> CloudSnapshot {
+        let health: CloudSnapshot.Health
+        switch payload.health {
+        case .healthy: health = .healthy
+        case .degraded: health = .degraded(payload.message)
+        case .unreachable: health = .unreachable(payload.message)
+        case .insecureEndpoint: health = .unreachable(payload.message)
+        case .notConfigured: health = .notConfigured(payload.message)
+        }
+
+        guard payload.ok else {
+            return CloudSnapshot(health: health, checkedAt: Date())
+        }
+
+        let status = CloudSyncClient.Status(
+            liveSourceEvents: payload.liveSourceEvents ?? 0,
+            approvedDecisions: payload.approvedDecisions ?? 0,
+            publishedDecisions: payload.publishedDecisions ?? 0,
+            openConflicts: payload.openConflicts ?? 0,
+            lastSuccessfulImport: payload.lastSuccessfulImport ?? "",
+            outboundEnabled: payload.outboundEnabled ?? false,
+            remoteSynchronised: payload.remoteSynchronised ?? false,
+            failingSources: payload.failingSources,
+            staleSources: payload.staleSources)
+        let intervals = payload.intervals.map {
+            CloudSyncClient.BlockingInterval(
+                property: $0.property, from: $0.from, to: $0.to,
+                basis: $0.basis, source: $0.source)
+        }
+        return CloudSnapshot(health: health, status: status,
+                             intervals: intervals, checkedAt: Date())
+    }
+
+    private static func describe(_ failure: HelperCloudClient.Failure) -> String {
+        switch failure {
+        case .helperMissing: return "The bundled vrc helper is missing."
+        case .timedOut: return "The helper did not respond in time."
+        case .noOutput: return "The helper returned nothing."
+        case .unreadableOutput: return "The helper returned an unreadable result."
+        }
+    }
+
+    /// Cloud intervals that have no counterpart in the local calendar, so the
+    /// interface can show what the cloud knows and the Mac does not.
+    var cloudOnlyIntervals: [CloudSyncClient.BlockingInterval] {
+        let localNights: Set<String> = Set(events.flatMap { item -> [String] in
+            var nights: [String] = []
+            var day = item.event.checkIn
+            while day < item.event.checkOut {
+                nights.append(DayMath.icalDateString(day))
+                day = DayMath.adding(days: 1, to: day)
+            }
+            return nights
+        })
+        return cloud.intervals.filter { interval in
+            guard let from = CloudInterval.day(interval.from) else { return true }
+            return !localNights.contains(DayMath.icalDateString(from))
+        }
+    }
 
     func start() {
         Task { [weak self] in await self?.refreshNotificationStatus() }
@@ -638,16 +782,48 @@ final class AppState: ObservableObject {
 
     func cancel(decisionID: Int64) {
         guard let store else { return }
-        try? store.availabilityManager.cancel(decisionID: decisionID)
+        do {
+            _ = try store.availabilityManager.cancel(decisionID: decisionID)
+            statusMessage = "Change cancelled."
+        } catch let error as AvailabilityError {
+            // An approved decision refuses a plain cancel. Say so rather than
+            // failing silently, which is how the old `try?` behaved.
+            statusMessage = error.errorDescription ?? "That change could not be cancelled."
+        } catch {
+            statusMessage = "That change could not be cancelled."
+        }
         reload()
-        statusMessage = "Change cancelled."
+    }
+
+    /// Deliberately withdrawing an approval. The view asks for confirmation
+    /// first; this is only reached after the owner says yes.
+    func withdrawApproved(decisionID: Int64) {
+        guard let store else { return }
+        do {
+            _ = try store.availabilityManager.withdrawApproved(
+                decisionID: decisionID, confirmation: .ownerConfirmedWithdrawal)
+            statusMessage = "Approval withdrawn. The nights go back on sale here."
+        } catch {
+            statusMessage = "That approval could not be withdrawn."
+        }
+        reload()
     }
 
     func cancelAllPending() {
         guard let store, let propertyID = selectedPropertyID else { return }
-        let count = (try? store.availabilityManager.cancelPending(propertyID: propertyID)) ?? 0
+        guard let result = try? store.availabilityManager.cancelPending(propertyID: propertyID)
+        else { return }
         reload()
-        statusMessage = "Cleared \(count) pending change\(count == 1 ? "" : "s")."
+        var message = "Cleared \(result.cancelled) pending change"
+            + (result.cancelled == 1 ? "." : "s.")
+        if result.keptApproved > 0 {
+            // Saying what was KEPT is the point. A sweep that quietly does
+            // less than the button implies is its own surprise.
+            message += " \(result.keptApproved) approved change"
+                + (result.keptApproved == 1 ? " was" : "s were")
+                + " kept — withdraw those individually if you meant to."
+        }
+        statusMessage = message
     }
 
     var decisionsForSelectedProperty: [AvailabilityDecision] {

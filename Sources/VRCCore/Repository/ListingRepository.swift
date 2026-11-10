@@ -3,10 +3,10 @@ import Foundation
 /// Reads and writes listings, routing the iCal URL through the credential store
 /// whenever the listing is marked as Keychain-backed.
 public struct ListingRepository: Sendable {
-    let database: Database
+    let database: DataStore
     let credentials: FeedCredentialStore
 
-    public init(database: Database, credentials: FeedCredentialStore) {
+    public init(database: DataStore, credentials: FeedCredentialStore) {
         self.database = database
         self.credentials = credentials
     }
@@ -88,10 +88,18 @@ public struct ListingRepository: Sendable {
                 // The old item is left untouched. Nothing is deleted and no
                 // credential is regenerated.
                 //
-                // Scoped to listings already known to be unreadable, so a
+                // Scoped to connections a new URL is meant to revive, so a
                 // working entry keeps its reference and the grant the owner
                 // gave it. Readability is never tested by reading.
-                if listing.connectionState == .credentialUnreadable,
+                //
+                // This is the same rule as the state reset below, and for the
+                // same reason. Keying it to `credentialUnreadable` alone meant
+                // a REVOKED feed wrote into its existing item and inherited an
+                // access list naming an older build — the write succeeded,
+                // because writing and reading are authorised separately, and
+                // the next import then failed as unreadable. The owner had to
+                // paste the same URL twice before it took.
+                if listing.connectionState.isClearedByANewURL,
                    credentials.exists(reference: reference) {
                     reference = Self.nextReference(after: reference)
                 }
@@ -129,7 +137,7 @@ public struct ListingRepository: Sendable {
         guard let id = listing.id else { return }
         let (column, reference) = try persistURL(listing)
         // A freshly entered URL supersedes whatever was wrong before.
-        if listing.hasURL, listing.connectionState == .credentialUnreadable {
+        if listing.hasURL, listing.connectionState.isClearedByANewURL {
             try? setConnectionState(
                 listingID: id, to: .unknown,
                 detail: "A new URL was entered.", actor: "owner"

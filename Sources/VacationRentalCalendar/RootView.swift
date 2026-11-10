@@ -112,6 +112,7 @@ struct RootView: View {
             case .review: ReviewView()
             case .reservations: ReservationsView()
             case .availability: AvailabilityPane()
+            case .cloud: CloudPane()
             case .settings: SettingsPane()
             }
             statusBar
@@ -221,6 +222,15 @@ struct RootView: View {
 
     // MARK: - Status bar (requirement: last sync time and any errors)
 
+    private var cloudIndicatorText: String {
+        switch state.cloud.health {
+        case .healthy: return "AWS staging"
+        case .degraded: return "AWS degraded"
+        case .unreachable: return "AWS unreachable"
+        case .notConfigured: return "AWS off"
+        }
+    }
+
     private var statusBar: some View {
         VStack(spacing: 0) {
             Divider()
@@ -251,6 +261,23 @@ struct RootView: View {
                         }
                     }
                 }
+                // Visible from every section, so the state of the cloud
+                // connection is never something you have to go looking for.
+                Button {
+                    state.selectedSection = .cloud
+                } label: {
+                    HStack(spacing: 4) {
+                        if state.isCloudRefreshing {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            CloudHealthDot(health: state.cloud.health)
+                        }
+                        Text(cloudIndicatorText).font(.caption2)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(state.cloud.label)
+
                 Text(OutboundSyncGate.isEnabled ? "Outbound ON" : "Outbound off")
                     .font(.caption2.weight(.medium))
                     .padding(.horizontal, 6).padding(.vertical, 2)
@@ -282,6 +309,17 @@ struct RootView: View {
             }
             .disabled(state.isRefreshing)
             .keyboardShortcut("r")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                state.refreshFromCloud()
+            } label: {
+                Label("Refresh from AWS", systemImage: "arrow.clockwise.icloud")
+            }
+            .disabled(state.isCloudRefreshing || !state.isCloudConfigured)
+            .help(state.isCloudConfigured
+                  ? "Read status and availability from the AWS staging service"
+                  : "No AWS endpoint or credentials stored")
         }
         ToolbarItem(placement: .automatic) {
             Button {

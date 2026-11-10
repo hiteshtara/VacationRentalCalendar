@@ -1,5 +1,11 @@
 # Phase 2 preflight validation
 
+> **Superseded.** The schema this document describes was replaced because the
+> repositories could not query it. See
+> [`Migrations/postgres/superseded/README.md`](../Migrations/postgres/superseded/README.md)
+> and the generated replacement, `010_repository_schema.sql`.
+
+
 **No AWS resources created. `terraform apply` was not run.** `terraform plan`
 reports 55 to add, 0 to change, 0 to destroy. Outbound synchronisation is still
 disabled. No live reservation or calendar block was modified. No PR merged.
@@ -117,7 +123,7 @@ nothing and runs before any AWS resource exists.
 
 ## 2. Database safety test results
 
-[`Migrations/postgres/002_withdrawal_protection.sql`](../Migrations/postgres/002_withdrawal_protection.sql),
+[`Migrations/postgres/002_withdrawal_protection.sql`](../Migrations/postgres/superseded/002_withdrawal_protection.sql),
 branch `backend/withdrawal-protection`. Three guards, each refusing by default.
 
 **19 tests, all passing against PostgreSQL 17.** Each runs its statement,

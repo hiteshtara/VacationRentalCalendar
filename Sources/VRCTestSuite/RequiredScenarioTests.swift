@@ -298,7 +298,7 @@ public enum RequiredScenarioTests {
                     eventKey: eventKey, kind: .cancellationBlock,
                     note: "Host cancellation penalty — keep sellable elsewhere"
                 )
-                setup.store.database.close()
+                if let sqlite = setup.store.database as? Database { sqlite.close() }
             }
 
             // --- Second run: a fresh process would see exactly this. ---
@@ -332,7 +332,7 @@ public enum RequiredScenarioTests {
                 propertyID: try reopened.properties.all().first!.id!, destination: .vrbo
             )
             expect.equal(plan.included.count, 0)
-            reopened.database.close()
+            if let sqlite = reopened.database as? Database { sqlite.close() }
         },
     ] }
 }

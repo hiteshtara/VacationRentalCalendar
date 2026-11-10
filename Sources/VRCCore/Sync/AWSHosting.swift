@@ -1,5 +1,16 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+// swift-crypto provides the same API surface under a different module name.
+// SHA256, HMAC and SymmetricKey are source-compatible, so nothing below
+// changes shape -- which matters, because an AWS SigV4 signature that differs
+// by a byte is simply rejected, and the iCal event keys are persisted.
+import Crypto
+#endif
 
 /// AWS SigV4, shared by the R2 and S3 clients — R2's API is S3-compatible, so
 /// the signing is identical apart from the region and service names.
@@ -16,7 +27,21 @@ public struct SigV4Signer: Sendable {
         self.service = service
     }
 
-    public func sign(_ request: inout URLRequest, payload: Data, now: Date = Date()) throws {
+    /// Signs `request` in place.
+    ///
+    /// `alsoSign` names extra headers to bring inside the signature. The
+    /// default set is deliberately small: every signed header must be present
+    /// on the wire exactly as it was at signing time, and URLSession adds some
+    /// of its own (User-Agent, Accept-Encoding) after we are done — so signing
+    /// everything present would produce intermittent signature mismatches.
+    /// Headers that carry meaning, such as an idempotency key, are opted in by
+    /// the caller so they cannot be altered in transit.
+    public func sign(
+        _ request: inout URLRequest,
+        payload: Data,
+        now: Date = Date(),
+        alsoSign: [String] = []
+    ) throws {
         guard let url = request.url, let host = url.host else {
             throw HostingError.notConfigured
         }
@@ -33,7 +58,7 @@ public struct SigV4Signer: Sendable {
             ("x-amz-content-sha256", payloadHash),
             ("x-amz-date", amzDate),
         ]
-        for name in ["Content-Type", "Cache-Control"] {
+        for name in ["Content-Type", "Cache-Control"] + alsoSign {
             if let value = request.value(forHTTPHeaderField: name) {
                 headers.append((name.lowercased(), value))
             }

@@ -1,8 +1,8 @@
 import Foundation
 
 public struct ClassificationRepository: Sendable {
-    let database: Database
-    public init(database: Database) { self.database = database }
+    let database: DataStore
+    public init(database: DataStore) { self.database = database }
 
     private func decode(_ row: Row) -> EventClassification {
         EventClassification(
