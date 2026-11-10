@@ -112,8 +112,16 @@ func runSetURL() async {
     case .vrbo:
         print("    Vrbo → Calendar → Import/Export → Export calendar")
     case .bookingCom:
+        // The control is "Skip to export", not "Skip this step". The older
+        // label is still repeated by third-party guides, and looking for it
+        // is why this step appears impossible: the import form seems to
+        // demand another calendar's URL with no way past it.
         print("    Booking.com → Rates & Availability → Sync calendars")
-        print("            → Add calendar connection → \"Skip this step\" → Export Calendar")
+        print("            → Add calendar connection, or \"Complete setup\" on a")
+        print("              connection already showing \"Activating\"")
+        print("            → in the import form, click \"Skip to export\"")
+        print("            → copy the export link, then \"Done\"")
+        print("      The connection should then read \"Export only\".")
     case .other:
         print("    Use the platform's calendar export (not import) URL.")
     }
