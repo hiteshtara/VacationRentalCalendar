@@ -477,3 +477,83 @@ nowhere else in the product and delete what they write.
 * [Creating Distribution-Signed Code for Mac](https://developer.apple.com/forums/thread/701514) — which entitlements are unrestricted, profile sealed by the signature, non-bundled executables need an app-like structure
 * [Signing a Daemon with a Restricted Entitlement](https://developer.apple.com/documentation/xcode/signing-a-daemon-with-a-restricted-entitlement) — the app-like structure technique
 * [Technical Note TN2415: Entitlements Troubleshooting](https://developer.apple.com/library/archive/technotes/tn2415/_index.html) — access group format `<prefix>.<identifier>`
+
+---
+
+# Verified on hardware — 2026-11-10
+
+The profile was issued with **no capability selected**, exactly as predicted,
+and authorizes the group by wildcard:
+
+```
+name          VRC Developer ID
+App ID name   Vacation Rental Calendar
+team          26JLFSV9YS (hitesh tara)
+platform      OSX
+expires       Sat Nov 05 2044
+kind          Developer ID / distribution (provisions all devices)
+
+Entitlements:
+  keychain-access-groups          = [ 26JLFSV9YS.* ]
+  com.apple.application-identifier = 26JLFSV9YS.com.vacationrentalcalendar.app
+  com.apple.developer.team-identifier = 26JLFSV9YS
+
+ok  "26JLFSV9YS.*" covers 26JLFSV9YS.com.vacationrentalcalendar.shared
+```
+
+That settles the one thing the documentation did not state for Developer ID
+specifically: the wildcard **is** issued, and it **does** cover a group that
+has no corresponding App ID.
+
+## Tests A–F — 16 of 16 passed
+
+| | Result |
+|---|---|
+| **A** rebuild with a genuinely different code hash | wrote 0.45s, read back **0.22s** |
+| **B** ten distinct rebuilds | all ten read the same item; slowest **0.54s** |
+| **C** differently *named* bundles (GUI ↔ helper), both directions | **0.18s** / **0.02s** |
+| **D** fresh process after the writer exited | **0.02s** |
+| **E** all **10 cores** saturated | **0.04s** — against a 20s deadline |
+| **F** update: v2 installed over v1 at the same path | **0.19s** |
+
+**No authorization prompt appeared anywhere.** That is asserted, not observed:
+a prompt blocks indefinitely, so every read being sub-second is proof none was
+raised. Under the file-keychain ACL scheme, A, C and F are precisely the cases
+that failed — repeatedly, on this machine, today.
+
+Test E deserves emphasis. The 4-second deadline failed that exact scenario in
+production this evening, silently disconnecting three working feeds and
+causing a real Airbnb reservation to go unimported for an hour. The same
+operation now completes in **0.04s under full load**, and the data protection
+keychain does not prompt at all, which removes the cause rather than widening
+the bound.
+
+## Isolation
+
+The probes used service `com.vacationrentalcalendar.keychain-integration-test`
+— a name that exists nowhere else in the product — and a dummy value pointing
+at `example.invalid`. All four items created were deleted; a follow-up query
+returns `errSecItemNotFound`.
+
+**No live credential was read, written, migrated or deleted.** All 18 legacy
+items remain in the file keychain, the three feeds are still `connected` on
+`-v6`/`-v3`, and the installed application is untouched at `908c588`.
+
+## What this clears, and what it does not
+
+**Cleared:** the mechanism works, on this hardware, with this team, under
+every failure mode that has actually bitten this project.
+
+**Not cleared, and still required before live migration:**
+
+1. The `vrc` helper is a bare executable in `Contents/MacOS/` and **cannot**
+   carry the entitlement. Test C proves two *bundles* can share; it does not
+   make a non-bundled binary eligible. Either move credential access
+   in-process (recommended) or wrap the helper in an app-like structure with
+   its own profile.
+2. `/usr/bin/security` cannot see data protection items, so the presence
+   checks in `backup-before-install.sh` and `migrate-cloud-credential.sh` must
+   move to a `vrc` subcommand **before** migrating, or both scripts will keep
+   running and report the wrong answer.
+3. A full logout/reboot has not been exercised.
+4. Rollback (test H) has not been rehearsed against live credentials.
