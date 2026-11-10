@@ -102,6 +102,41 @@ enum HelperCloudClient {
         }
         return .success(payload)
     }
+
+    /// `status()`, but giving a sleeping cluster the one chance it needs.
+    ///
+    /// Aurora Serverless v2 is at minimum capacity 0 with a 300s auto-pause,
+    /// so the first call after an idle spell is the one that wakes it and is
+    /// expected to fail. Without this the Cloud pane reports "Could not reach
+    /// the AWS service" every time it is opened on a cold cluster — reliably,
+    /// not occasionally. See `CloudRetryPolicy`.
+    ///
+    /// `sleep` and `attempt` are injectable so the sequencing can be exercised
+    /// without a five-second pause or a real cluster.
+    static func statusWakingSleepingCluster(
+        timeout: TimeInterval = 25,
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        attempt: (TimeInterval) -> Result<CloudStatusPayload, Failure> = {
+            status(timeout: $0)
+        }
+    ) -> Result<CloudStatusPayload, Failure> {
+        let first = attempt(timeout)
+        let worthRetrying: Bool
+        switch first {
+        case .success(let payload):
+            worthRetrying = CloudRetryPolicy.shouldRetry(payload.health)
+        case .failure(.timedOut):
+            // The helper itself ran out of time, which on a cold cluster means
+            // the same thing: the database was still waking.
+            worthRetrying = true
+        case .failure(.helperMissing), .failure(.noOutput), .failure(.unreadableOutput):
+            // Nothing about these improves by asking again.
+            worthRetrying = false
+        }
+        guard worthRetrying else { return first }
+        sleep(CloudRetryPolicy.delay)
+        return attempt(timeout)
+    }
 }
 
 private final class DataBox: @unchecked Sendable {

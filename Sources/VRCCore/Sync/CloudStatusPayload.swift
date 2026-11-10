@@ -13,7 +13,7 @@ import Foundation
 /// pane already displays. A reviewer can confirm the no-secret property by
 /// reading the field list.
 public struct CloudStatusPayload: Codable, Sendable, Equatable {
-    public enum Health: String, Codable, Sendable {
+    public enum Health: String, Codable, Sendable, CaseIterable {
         case healthy, degraded, unreachable, notConfigured, insecureEndpoint
     }
 
@@ -106,5 +106,43 @@ public struct CloudStatusPayload: Codable, Sendable, Equatable {
 
     public static func decode(_ data: Data) -> CloudStatusPayload? {
         try? JSONDecoder().decode(CloudStatusPayload.self, from: data)
+    }
+}
+
+
+/// Whether asking the cloud service again, a few seconds later, could
+/// plausibly give a different answer.
+///
+/// This exists because of a real and reproducible failure. Aurora Serverless
+/// v2 runs at minimum capacity 0 with a 300s auto-pause, so after five idle
+/// minutes the database is genuinely switched off and takes 15-30s to wake.
+/// The first request is what wakes it — so the first request is *expected* to
+/// fail, and the one after it to succeed in well under a second.
+///
+/// Observed 2026-11-10: the cluster sat at 0.0 ACU for twenty minutes, the
+/// owner's status check failed, and two calls immediately afterwards returned
+/// in 1s and 0s.
+///
+/// Without a retry the Cloud pane reports "Could not reach the AWS service"
+/// every single time it is opened on a cold cluster — not intermittently, but
+/// deterministically, because the client gives up before the database can
+/// possibly answer. One retry converts that into a short pause.
+///
+/// Only `unreachable` qualifies. The others are settled facts, and retrying
+/// them would hide a real problem behind a spinner while telling the owner
+/// nothing — the same reasoning that makes `FeedConnectionState` refuse to
+/// re-poll a revoked credential.
+public enum CloudRetryPolicy {
+    /// Long enough for the cluster to be meaningfully further along, short
+    /// enough that the pane does not look frozen.
+    public static let delay: TimeInterval = 5
+
+    public static func shouldRetry(_ health: CloudStatusPayload.Health) -> Bool {
+        switch health {
+        case .unreachable:
+            return true
+        case .healthy, .degraded, .notConfigured, .insecureEndpoint:
+            return false
+        }
     }
 }

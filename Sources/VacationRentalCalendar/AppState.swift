@@ -172,7 +172,7 @@ final class AppState: ObservableObject {
         isCloudRefreshing = true
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
-                HelperCloudClient.status()
+                HelperCloudClient.statusWakingSleepingCluster()
             }.value
 
             await MainActor.run {

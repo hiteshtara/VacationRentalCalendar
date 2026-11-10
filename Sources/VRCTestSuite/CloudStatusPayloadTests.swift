@@ -80,5 +80,48 @@ public enum CloudStatusPayloadTests {
             expect.equal(decoded?.health, .unreachable)
             expect.ok(decoded?.intervals.isEmpty == true)
         },
+
+        // --- Waking a paused Aurora cluster ---
+
+        TestCase(group: "Cloud status payload",
+                 name: "an unreachable service is worth one retry") { expect in
+            // Aurora Serverless v2 at minimum capacity 0 is switched off after
+            // 300s idle and takes 15-30s to wake. The first call is what wakes
+            // it, so it is EXPECTED to fail and the next one to succeed. That
+            // is the only case where asking again changes the answer.
+            expect.ok(CloudRetryPolicy.shouldRetry(.unreachable),
+                      "unreachable may just be a sleeping cluster")
+        },
+
+        TestCase(group: "Cloud status payload",
+                 name: "a settled answer is never retried") { expect in
+            // Retrying these would hide a real problem behind a spinner and
+            // tell the owner nothing. Same reasoning as FeedConnectionState:
+            // a settled rejection is a fact, not a flaky network.
+            for health in [CloudStatusPayload.Health.healthy,
+                           .degraded, .notConfigured, .insecureEndpoint] {
+                expect.ok(!CloudRetryPolicy.shouldRetry(health),
+                          "\(health.rawValue) is settled — asking again changes nothing")
+            }
+        },
+
+        TestCase(group: "Cloud status payload",
+                 name: "the retry waits long enough to matter but not to annoy") { expect in
+            expect.ok(CloudRetryPolicy.delay >= 3,
+                      "shorter than this and the cluster is still waking")
+            expect.ok(CloudRetryPolicy.delay <= 8,
+                      "longer than this and the pane just looks frozen")
+        },
+
+        TestCase(group: "Cloud status payload",
+                 name: "every health case is decided explicitly") { expect in
+            // A new Health case must force a decision here rather than
+            // inheriting one silently.
+            for health in CloudStatusPayload.Health.allCases {
+                let retried = CloudRetryPolicy.shouldRetry(health)
+                expect.equal(retried, health == .unreachable,
+                             "\(health.rawValue) retry=\(retried)")
+            }
+        },
     ] }
 }
