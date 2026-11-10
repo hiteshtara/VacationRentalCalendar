@@ -1681,10 +1681,10 @@ Now expressed as a rule over `shouldAttemptImport`, with `disconnectedByOwner`
 excluded: typing a URL is not the same as asking for a feed to be switched
 back on.
 
-### Bug 2 — the credential reference is not versioned for a revoked feed
+### Bug 2 — the credential reference was not versioned for a revoked feed
 
-**Still open.** `ListingRepository.swift:94` gates reference versioning on the
-same single state:
+**Fixed.** `ListingRepository` gated reference versioning on the same single
+state:
 
 ```swift
 if listing.connectionState == .credentialUnreadable,
@@ -1700,7 +1700,18 @@ Observable consequence: the first paste appears to fail, and the owner has to
 paste a second time. That is exactly what happened today; the ref only became
 `booking-17482435-v2` on the second attempt.
 
-The fix is the same `isClearedByANewURL` rule already added for Bug 1.
+The fix is the same `isClearedByANewURL` rule already added for Bug 1 — one
+rule, both places, so the two cannot drift apart again.
+
+Five further tests, and three of them exist to bound the change rather than
+prove it: a `connected`, `failing` or `unknown` listing keeps its reference so
+the owner's Keychain grant is not thrown away; `disconnectedByOwner` keeps its
+reference too; and the superseded entry is left in place holding its old
+value, never deleted, so a wrong new URL is recoverable. Versioning also
+increments (`-v5` → `-v6`) rather than stacking suffixes.
+
+All five failed against the old implementation, including one that showed the
+precise harm: the old reference's stored value was *overwritten in place*.
 
 ### A trap that nearly produced a false green
 
@@ -1733,14 +1744,40 @@ Suite: **412 tests**. Parity digest unchanged, macOS and Linux identical.
 
 ### Open items
 
-1. **Bug 2 above** — one-line condition change, same rule as Bug 1.
-2. **"Decide what to export"** is still *Booked and closed dates*. Switching it
+1. **"Decide what to export"** is still *Booked and closed dates*. Switching it
    to *Booked dates only* would make everything we receive unambiguously a real
    reservation. Owner's decision; it affects all connections.
-3. **The secret scanner's history scan is still red** (see §19) from the
+2. **The secret scanner's history scan is still red** (see §19) from the
    synthetic fixtures in `d262eda`, already on the public remote. Working-tree
    scan is clean.
-4. The app surfaces no last-fetch time and **discards parser warnings**
+3. The app surfaces no last-fetch time and **discards parser warnings**
    entirely — `ImportService` collects them and only the CLI prints them. That
    is why "is it broken or is there nothing new?" was unanswerable from the UI
    and needed a database query to settle.
+
+### Verified connected — all three platforms (2026-11-10 17:02Z)
+
+Confirmed by real fetches recorded in `sync_runs`, not by stored status:
+
+| Platform | HTTP | Events | Credential reference |
+|---|---|---|---|
+| Airbnb | **200** | **4** | `airbnb-1759472334611502986-v5` |
+| Vrbo | **200** | **3** | `vrbo-5550554-v5` |
+| Booking.com | **200** | **2** | `booking-17482435-v2` |
+
+And outbound: Booking.com's connection shows **OK**, "Last exported: Just
+now", having fetched our Lambda feed at 16:43:15Z — two seconds after the
+import form was submitted.
+
+Booking.com's two events are both `CLOSED - Not available`, classified
+`unknownUnavailable`, sitting in the review queue. Neither propagates. That is
+the designed behaviour, not an incomplete import.
+
+Suite after both fixes: **417 tests**, 1396 assertions. Parity digest
+`b3398471…` **identical on macOS and Linux**. Scanner behaviour tests 11/11;
+working-tree scan clean, history scan still red per §19.
+
+`OutboundSyncGate.isEnabled` remains `false` (`ExportPolicy.swift:133`), and
+`vrc-staging-import` and `vrc-staging-hold-sweeper` both remain `DISABLED`.
+The Mac app has **not** been rebuilt, so both fixes reach it at the next build;
+today's recovery came from the database and from re-entering the URL.
