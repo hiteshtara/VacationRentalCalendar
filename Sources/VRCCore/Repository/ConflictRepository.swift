@@ -4,8 +4,8 @@ import Foundation
 /// stored conflict can go stale the moment a feed changes. Only the owner's
 /// acknowledgement is persisted.
 public struct ConflictRepository: Sendable {
-    let database: Database
-    public init(database: Database) { self.database = database }
+    let database: DataStore
+    public init(database: DataStore) { self.database = database }
 
     public func acknowledge(conflictID: String, note: String = "") throws {
         try database.run("""

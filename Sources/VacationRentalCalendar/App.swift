@@ -41,8 +41,38 @@ final class LoginItemController: ObservableObject {
 
 @main
 struct VacationRentalCalendarApp: App {
+    // A headless self-check, used to verify end-to-end that THIS code object
+    // (the GUI app binary, not the CLI) can drive the helper and read back a
+    // sanitized status. It runs the exact HelperCloudClient the Cloud pane
+    // uses, prints a secret-free summary, and exits before any window opens.
+    // It is the GUI's own answer to "can Refresh from AWS succeed?", gathered
+    // without a human clicking.
+    static func runSelfCheckIfRequested() {
+        guard CommandLine.arguments.contains("--self-check-cloud") else { return }
+        let result = HelperCloudClient.status()
+        switch result {
+        case .success(let payload):
+            let summary = "gui-self-check ok=\(payload.ok) health=\(payload.health.rawValue) "
+                + "message=\(payload.message) intervals=\(payload.intervals.count)\n"
+            FileHandle.standardError.write(Data(summary.utf8))
+            for interval in payload.intervals {
+                let line = "gui-self-check interval \(interval.from)->\(interval.to) "
+                    + "\(interval.source)/\(interval.basis)\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            }
+            exit(payload.ok ? 0 : 3)
+        case .failure(let failure):
+            FileHandle.standardError.write(Data("gui-self-check failure=\(failure)\n".utf8))
+            exit(4)
+        }
+    }
+
     @StateObject private var state = AppState()
     @StateObject private var loginItem = LoginItemController()
+
+    init() {
+        Self.runSelfCheckIfRequested()
+    }
 
     var body: some Scene {
         WindowGroup("Vacation Rental Calendar") {

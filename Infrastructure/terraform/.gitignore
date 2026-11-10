@@ -1,0 +1,14 @@
+# Provider binaries and local state. State for this project lives in S3 (see
+# the commented backend block in versions.tf); nothing local is ever authoritative.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+crash.log
+# The preflight receipt pins a plan file's hash to a verdict. It carries no
+# secret, but it is local evidence about one machine's validation run and must
+# not travel with the repository -- a committed receipt would let an apply on
+# another machine think its plan was reviewed.
+*.tfplan.receipt

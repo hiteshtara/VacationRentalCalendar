@@ -57,9 +57,9 @@ struct FeedsView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 6) {
-                Image(systemName: state.signature.kind.survivesRebuild
+                Image(systemName: state.signature.kind.identityIsStable
                       ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(state.signature.kind.survivesRebuild ? .green : .orange)
+                    .foregroundStyle(state.signature.kind.identityIsStable ? .green : .orange)
                 Text(state.signature.explanation)
                     .font(.caption)
                     .fixedSize(horizontal: false, vertical: true)
@@ -299,6 +299,7 @@ struct SyncHistoryView: View {
         case .success: return "checkmark.circle.fill"
         case .failure: return "xmark.octagon.fill"
         case .skipped: return "minus.circle"
+        case .disconnected: return "link.badge.plus"
         }
     }
 
@@ -307,6 +308,7 @@ struct SyncHistoryView: View {
         case .success: return .green
         case .failure: return .red
         case .skipped: return .secondary
+        case .disconnected: return .orange
         }
     }
 }

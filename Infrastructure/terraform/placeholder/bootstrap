@@ -1,0 +1,6 @@
+#!/bin/sh
+# Placeholder only, so `terraform plan` can resolve a deployment package
+# before the Swift binaries are built. Scripts/build-lambda.sh replaces this
+# with a statically linked aarch64 Swift executable.
+echo '{"error":"placeholder bootstrap - no Swift binary deployed"}' >&2
+exit 1

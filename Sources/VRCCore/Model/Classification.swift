@@ -16,6 +16,12 @@ public enum BlockKind: String, Codable, CaseIterable, Sendable, Identifiable {
     /// Airbnb blocked the dates because of a host cancellation. NOT booked.
     /// Must never reach another platform.
     case cancellationBlock = "cancellation_block"
+    /// The platform will not take bookings for these dates — the end of the
+    /// booking window, a minimum-notice rule, or another restriction the
+    /// platform imposes. Not a hold the owner placed, and emphatically not
+    /// something to copy elsewhere: every platform has its own window, so
+    /// propagating one destroys sellable inventory on the others.
+    case platformRestriction = "platform_restriction"
     /// Unavailable, cause unknown. Treated as unsafe to share.
     case unknownUnavailable = "unknown_unavailable"
 
@@ -27,31 +33,82 @@ public enum BlockKind: String, Codable, CaseIterable, Sendable, Identifiable {
         case .ownerBlock: return "Owner block"
         case .maintenanceBlock: return "Maintenance block"
         case .cancellationBlock: return "Cancellation block"
+        case .platformRestriction: return "Booking window / platform restriction"
         case .unknownUnavailable: return "Unknown unavailable"
         }
     }
 
+    /// Shorter label for dense places like a calendar bar.
+    public var shortName: String {
+        switch self {
+        case .confirmedReservation: return "Reserved"
+        case .ownerBlock: return "Owner block"
+        case .maintenanceBlock: return "Maintenance"
+        case .cancellationBlock: return "Cancellation"
+        case .platformRestriction: return "Booking window"
+        case .unknownUnavailable: return "Unknown"
+        }
+    }
+
     /// Longer text shown next to the choice in the review queue.
-    public var guidance: String {
+    ///
+    /// Takes the platform so the wording is true of the event in front of the
+    /// owner: a cancellation penalty is an Airbnb mechanism, and describing a
+    /// Vrbo block that way would be simply wrong.
+    public func guidance(for platform: RentalPlatform? = nil) -> String {
+        let others = Self.otherPlatforms(excluding: platform)
         switch self {
         case .confirmedReservation:
-            return "A guest is actually staying. These dates will be blocked on your other platforms."
+            return "A guest is actually staying. These dates will be blocked on \(others)."
         case .ownerBlock:
-            return "You are holding these dates yourself. They will be blocked on other platforms once approved."
+            return "You are holding these dates yourself. They are blocked on \(others) once "
+                + "you approve it."
         case .maintenanceBlock:
-            return "The unit is unusable. These dates will be blocked on other platforms once approved."
+            return "The unit is unusable. These dates are blocked on \(others) once you "
+                + "approve it."
         case .cancellationBlock:
-            return "Airbnb took these dates away after a cancellation. They stay sellable on Vrbo and Booking.com and are never exported."
+            switch platform {
+            case .airbnb:
+                return "Airbnb took these dates back after a cancellation. They are not booked, "
+                    + "so they stay on sale on \(others) and are never exported."
+            case .some(let value):
+                return "\(value.displayName) made these dates unavailable following a "
+                    + "cancellation. They are not booked, so they stay on sale on \(others) and "
+                    + "are never exported."
+            case .none:
+                return "The platform took these dates back after a cancellation. They are not "
+                    + "booked, so they stay on sale elsewhere and are never exported."
+            }
+        case .platformRestriction:
+            let name = platform?.displayName ?? "The platform"
+            return "\(name) will not take bookings for these dates — usually the end of your "
+                + "booking window. Every platform sets its own window, so this is never copied "
+                + "to \(others)."
         case .unknownUnavailable:
             return "Cause unknown. Never exported until you decide what it is."
         }
     }
 
+    /// Backwards-compatible accessor for call sites with no platform to hand.
+    public var guidance: String { guidance(for: nil) }
+
+    public static func otherPlatforms(excluding platform: RentalPlatform?) -> String {
+        let names = [RentalPlatform.airbnb, .vrbo, .bookingCom]
+            .filter { $0 != platform }
+            .map(\.displayName)
+        guard names.count > 1 else { return names.first ?? "your other platforms" }
+        return names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
+    }
+
     /// Kinds that can, after human approval, legitimately block other platforms.
+    ///
+    /// A booking-window restriction is excluded deliberately: it describes a
+    /// limit of the platform that imposed it, not of the property, and copying
+    /// it elsewhere would take sellable nights off sale for no reason.
     public var describesGenuineUnavailability: Bool {
         switch self {
         case .confirmedReservation, .ownerBlock, .maintenanceBlock: return true
-        case .cancellationBlock, .unknownUnavailable: return false
+        case .cancellationBlock, .platformRestriction, .unknownUnavailable: return false
         }
     }
 }

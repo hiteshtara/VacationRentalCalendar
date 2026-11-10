@@ -3,21 +3,36 @@ import Foundation
 /// Reads and writes listings, routing the iCal URL through the credential store
 /// whenever the listing is marked as Keychain-backed.
 public struct ListingRepository: Sendable {
-    let database: Database
+    let database: DataStore
     let credentials: FeedCredentialStore
 
-    public init(database: Database, credentials: FeedCredentialStore) {
+    public init(database: DataStore, credentials: FeedCredentialStore) {
         self.database = database
         self.credentials = credentials
     }
 
     /// Deterministic, readable Keychain account name.
-    public static func credentialReference(platform: RentalPlatform, listingLabel: String) -> String {
+    /// The Keychain item name for a listing's feed URL.
+    ///
+    /// Scoped by `propertyID`, which the label alone cannot do. Two properties
+    /// whose listings are both simply called "Airbnb" previously produced
+    /// `airbnb-airbnb` for both, so one Keychain item backed two feeds and
+    /// revoking one would silently break the other — across properties. A
+    /// unique index on `credential_ref` now makes that collision impossible to
+    /// store even if this function were wrong again.
+    ///
+    /// Existing references are never recomputed: `persistURL` keeps whatever a
+    /// listing already has, so 39 G Street's three live credentials are
+    /// untouched by this change.
+    public static func credentialReference(
+        platform: RentalPlatform, listingLabel: String, propertyID: Int64
+    ) -> String {
         let slug = listingLabel
             .lowercased()
             .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return "\(platform.rawValue)-\(slug.isEmpty ? UUID().uuidString.lowercased() : slug)"
+        let name = slug.isEmpty ? UUID().uuidString.lowercased() : slug
+        return "\(platform.rawValue)-p\(propertyID)-\(name)"
     }
 
     /// Decodes a row **without** touching the credential store.
@@ -26,6 +41,17 @@ public struct ListingRepository: Sendable {
     /// Keychain call, and on an unsigned local build each of those can block on
     /// an authorisation prompt. URLs are therefore resolved lazily, only when an
     /// import or the settings screen actually needs one — see `resolveURL`.
+    /// Adds or advances a `-vN` suffix, so a replacement entry is obviously
+    /// related to the one it supersedes.
+    public static func nextReference(after reference: String) -> String {
+        guard let range = reference.range(of: #"-v(\d+)$"#, options: .regularExpression) else {
+            return reference + "-v2"
+        }
+        let digits = reference[range].dropFirst(2)
+        let next = (Int(digits) ?? 1) + 1
+        return String(reference[reference.startIndex..<range.lowerBound]) + "-v\(next)"
+    }
+
     private func decode(_ row: Row) -> PlatformListing {
         let storage = FeedURLStorage(rawValue: row.stringValue("url_storage")) ?? .database
         let reference = row.stringValue("credential_ref")
@@ -41,6 +67,11 @@ public struct ListingRepository: Sendable {
             autoRefreshEnabled: row.bool("auto_refresh_enabled", default: true),
             lastSyncAt: row.date("last_sync_at"),
             lastSyncSummary: row.stringValue("last_sync_summary"),
+            connectionState: FeedConnectionState(
+                rawValue: row.stringValue("connection_state")
+            ) ?? .unknown,
+            connectionChangedAt: row.date("connection_changed_at"),
+            connectionDetail: row.stringValue("connection_detail"),
             createdAt: row.dateValue("created_at"),
             updatedAt: row.dateValue("updated_at")
         )
@@ -48,15 +79,70 @@ public struct ListingRepository: Sendable {
 
     /// Splits a listing into the part that may be persisted and the part that
     /// must go to the credential store. Returns the value for `ical_url`.
-    private func persistURL(_ listing: PlatformListing) throws -> (column: String, reference: String) {
+    private func persistURL(
+        _ listing: PlatformListing, rehome: Bool = false
+    ) throws -> (column: String, reference: String) {
         switch listing.urlStorage {
         case .database:
             return (listing.icalURL, listing.credentialRef)
         case .keychain:
-            let reference = listing.credentialRef.isEmpty
-                ? Self.credentialReference(platform: listing.platform, listingLabel: listing.label)
+            // No URL, no reference. A reference with nothing behind it is
+            // indistinguishable from a broken credential: `doctor` reports it
+            // unreadable and the credential migration raises an authorization
+            // prompt that cannot possibly succeed. Three such placeholders
+            // buried a real failure on 2026-11-10.
+            //
+            // An existing reference is always kept, even with no URL, so a
+            // listing whose credential is temporarily unreadable does not
+            // quietly lose the pointer to it.
+            guard listing.hasURL || !listing.credentialRef.isEmpty else {
+                return ("", "")
+            }
+
+            var reference = listing.credentialRef.isEmpty
+                ? Self.credentialReference(
+                    platform: listing.platform, listingLabel: listing.label,
+                    propertyID: listing.propertyID)
                 : listing.credentialRef
+
             if listing.hasURL {
+                // If an item already sits at this reference, write to a fresh
+                // one instead of updating in place.
+                //
+                // Updating would preserve the existing access list, which is
+                // the one case where preserving the owner's grant is exactly
+                // wrong: a list naming an earlier build makes the item
+                // permanently unreadable. Note this uses `exists`, which reads
+                // attributes only — testing readability by actually reading
+                // would block, and an abandoned read holds the keychain for
+                // the rest of the process, breaking this very save.
+                //
+                // The old item is left untouched. Nothing is deleted and no
+                // credential is regenerated.
+                //
+                // Scoped to connections a new URL is meant to revive, so a
+                // working entry keeps its reference and the grant the owner
+                // gave it. Readability is never tested by reading.
+                //
+                // This is the same rule as the state reset below, and for the
+                // same reason. Keying it to `credentialUnreadable` alone meant
+                // a REVOKED feed wrote into its existing item and inherited an
+                // access list naming an older build — the write succeeded,
+                // because writing and reading are authorised separately, and
+                // the next import then failed as unreadable. The owner had to
+                // paste the same URL twice before it took.
+                //
+                // `rehome` forces the same thing regardless of state. Moving a
+                // credential to a NEW code object is the one case where
+                // preserving the existing access list is actively harmful: the
+                // list names binaries that no longer exist, so the save appears
+                // to work and the credential is unreadable from then on. That
+                // is exactly what happened on 2026-11-10, to both the app and
+                // its own bundled helper.
+                if rehome || listing.connectionState.isClearedByANewURL,
+                   credentials.exists(reference: reference) {
+                    reference = Self.nextReference(after: reference)
+                }
                 try credentials.save(url: listing.icalURL, reference: reference)
             }
             // Deliberately store nothing in the database column.
@@ -87,9 +173,20 @@ public struct ListingRepository: Sendable {
         return stored
     }
 
-    public func update(_ listing: PlatformListing) throws {
+    /// - Parameter rehomeCredential: write the URL to a FRESH Keychain
+    ///   reference even if this listing is healthy. Used after the app is
+    ///   rebuilt, when the existing item's access list names binaries that no
+    ///   longer exist. Never deletes the old entry.
+    public func update(_ listing: PlatformListing, rehomeCredential: Bool = false) throws {
         guard let id = listing.id else { return }
-        let (column, reference) = try persistURL(listing)
+        let (column, reference) = try persistURL(listing, rehome: rehomeCredential)
+        // A freshly entered URL supersedes whatever was wrong before.
+        if listing.hasURL, listing.connectionState.isClearedByANewURL {
+            try? setConnectionState(
+                listingID: id, to: .unknown,
+                detail: "A new URL was entered.", actor: "owner"
+            )
+        }
         try database.run("""
             UPDATE platform_listings
             SET property_id = ?, platform = ?, label = ?, ical_url = ?,
@@ -102,6 +199,61 @@ public struct ListingRepository: Sendable {
                 .text(reference), SQLValue(listing.autoRefreshEnabled),
                 SQLValue(Date()), .integer(id),
             ])
+    }
+
+    /// Moves a listing's connection state and records why, keeping the history
+    /// even when the connection itself is finished.
+    public func setConnectionState(
+        listingID: Int64,
+        to state: FeedConnectionState,
+        detail: String = "",
+        httpStatus: Int? = nil,
+        actor: String = "system",
+        at date: Date = Date()
+    ) throws {
+        let previous = try find(id: listingID)?.connectionState
+        guard previous != state || !detail.isEmpty else { return }
+
+        try database.run("""
+            UPDATE platform_listings
+            SET connection_state = ?, connection_changed_at = ?, connection_detail = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """, [
+                .text(state.rawValue), SQLValue(date), .text(detail),
+                SQLValue(date), .integer(listingID),
+            ])
+        try database.run("""
+            INSERT INTO listing_connection_events
+                (listing_id, at, from_state, to_state, actor, detail, http_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+            """, [
+                .integer(listingID), SQLValue(date), SQLValue(previous?.rawValue),
+                .text(state.rawValue), .text(actor), .text(detail), SQLValue(httpStatus),
+            ])
+    }
+
+    public func connectionHistory(listingID: Int64, limit: Int = 50) throws -> [ConnectionEvent] {
+        try database.query("""
+            SELECT * FROM listing_connection_events WHERE listing_id = ?
+            ORDER BY at DESC, id DESC LIMIT ?;
+            """, [.integer(listingID), .integer(Int64(limit))]).map { row in
+            ConnectionEvent(
+                id: row.int("id"),
+                listingID: row.int("listing_id") ?? 0,
+                at: row.dateValue("at"),
+                fromState: row.string("from_state").flatMap(FeedConnectionState.init(rawValue:)),
+                toState: FeedConnectionState(rawValue: row.stringValue("to_state")) ?? .unknown,
+                actor: row.stringValue("actor"),
+                detail: row.stringValue("detail"),
+                httpStatus: row.int("http_status").map(Int.init)
+            )
+        }
+    }
+
+    /// Listings a platform has disconnected, so the UI can ask for a new URL.
+    public func disconnected() throws -> [PlatformListing] {
+        try all().filter { $0.connectionState.isDisconnected }
     }
 
     public func recordSync(listingID: Int64, at date: Date, summary: String) throws {

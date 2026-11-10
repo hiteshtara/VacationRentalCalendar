@@ -99,11 +99,41 @@ public enum TestRegistry {
     public static var all: [TestCase] {
         MigrationTests.cases
             + ICalParsingTests.cases
+            + SemanticHashTests.cases
+            + SQLScannerTests.cases
+            + DataStoreTests.cases
+            + TransactionLifecycleTests.cases
+            + DataStoreParityTests.cases
+            + DestructiveIsolationTests.cases
+            + EmptyCalendarTests.cases
+            + CredentialReplacementTests.cases
+            + BulkCancellationTests.cases
+            + MultiPropertyTests.cases
+            + PortfolioTests.cases
+            + ConflictNoiseTests.cases
+            + CredentialRehomeTests.cases
+            + FeedEndpointTests.cases
+            + SigningTests.cases
+            + PostgresIntegrationTests.cases
+            + DecisionRouteTests.cases
+            + CloudSyncClientTests.cases
+            + CloudConnectionTests.cases
+            + CloudIntervalTests.cases
+            + CloudStatusPayloadTests.cases
+            + LambdaHandlerTests.cases
             + ClassifierTests.cases
             + ImportTests.cases
             + ConflictTests.cases
             + ExportTests.cases
             + PresentationTests.cases
+            + AvailabilityTests.cases
+            + FeedGenerationTests.cases
+            + PublicationSafetyTests.cases
+            + ClassificationSafeguardTests.cases
+            + ConnectionStateTests.cases
+            + ConflictCategoryTests.cases
+            + HostingTests.cases
+            + ArchitectureReviewTests.cases
             + SecurityTests.cases
             + RequiredScenarioTests.cases
     }

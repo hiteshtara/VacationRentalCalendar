@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(Security)
 import Security
+#endif
 
 /// A platform iCal export URL is a credential, not a setting.
 ///
@@ -36,9 +38,14 @@ public enum FeedCredentialError: Error, LocalizedError {
         case .notFound(let reference):
             return "No feed URL is stored under \"\(reference)\"."
         case .timedOut:
-            return "The Keychain did not answer in time. macOS is probably waiting for you to "
-                + "approve access — look for a \"Vacation Rental Calendar wants to use your "
-                + "confidential information\" prompt and choose Always Allow."
+            return "This feed URL cannot be read, and macOS will not offer to fix it.\n\n"
+                + "The Keychain item's access list names an older build of this app by its "
+                + "code hash. The app has since been signed with a certificate, so its hash "
+                + "changed and no longer matches. macOS does not prompt in this situation — it "
+                + "simply refuses — so there is no dialog to approve.\n\n"
+                + "Fix it by entering the URL again under Feeds. It is saved under a fresh "
+                + "Keychain entry owned by the current app, and the old entry is left untouched. "
+                + "Nothing is deleted and no credential is regenerated."
         }
     }
 }
@@ -61,6 +68,7 @@ public enum FeedCredentialError: Error, LocalizedError {
 ///    hash, which changes on every rebuild, so every rebuild asks again. Signed
 ///    with a real or self-signed certificate, the requirement is tied to the
 ///    certificate instead and survives rebuilds. See `Scripts/setup-signing.sh`.
+#if canImport(Security)
 public struct KeychainFeedCredentialStore: FeedCredentialStore {
     public let service: String
     /// Extra executables added to each new item's ACL, so one grant covers both
@@ -184,7 +192,15 @@ public struct CodeSignatureInfo: Sendable {
         case adHoc
         case certificate
 
-        public var survivesRebuild: Bool { self == .certificate }
+        /// Whether the code's *identity* is stable across rebuilds.
+        ///
+        /// NOT whether Keychain access survives one. It does not: items are
+        /// written with `SecTrustedApplicationCreateFromPath`, which pins the
+        /// binary's code hash at the moment of writing, so a rebuild loses
+        /// access even when the certificate and designated requirement are
+        /// byte-identical. Conflating the two caused a real outage — an app
+        /// update silently disconnected every platform feed.
+        public var identityIsStable: Bool { self == .certificate }
     }
 
     public var kind: Kind
@@ -243,6 +259,7 @@ public struct CodeSignatureInfo: Sendable {
         return CodeSignatureInfo(kind: .certificate, identifier: identifier, authority: authority)
     }
 }
+#endif // canImport(Security)
 
 // MARK: - In memory (tests)
 
@@ -340,5 +357,27 @@ private final class ResultBox<T>: @unchecked Sendable {
     var value: Result<T, Error>? {
         lock.lock(); defer { lock.unlock() }
         return stored
+    }
+}
+
+
+/// A credential store whose items EXIST but cannot be read.
+///
+/// Models the situation this project keeps hitting: a Keychain item whose
+/// access list names a build that no longer exists, so `exists` succeeds and
+/// the read fails. Test-only, and in VRCCore rather than the test target so
+/// the Linux build compiles it too.
+public final class UnreadableFeedCredentialStore: FeedCredentialStore, @unchecked Sendable {
+    private let present: Set<String>
+    public init(presentReferences: [String]) { self.present = Set(presentReferences) }
+
+    public var storageDescription: String { "unreadable (test only)" }
+    public func save(url: String, reference: String) throws {}
+    public func delete(reference: String) throws {}
+    public func exists(reference: String) -> Bool { present.contains(reference) }
+
+    public func url(reference: String) throws -> String? {
+        guard present.contains(reference) else { return nil }
+        throw FeedCredentialError.keychainFailure(-25293, "read")
     }
 }
