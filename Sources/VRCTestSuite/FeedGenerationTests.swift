@@ -319,5 +319,125 @@ public enum FeedGenerationTests {
                 expect.ok(!adapter.importInstructions.isEmpty)
             }
         },
+
+        // --- A simulated Booking.com subscriber ----------------------------
+        //
+        // Everything here is synthetic and in-memory. No live Booking.com
+        // decision is created: the owner's instruction is explicit that the
+        // generator must not be tested by approving real availability.
+
+        TestCase(group: "Feeds",
+                 name: "Booking.com receives ONLY what was approved for Booking.com") { expect in
+            let feed = CalendarFeedGenerator().generate(
+                destination: .bookingCom, propertyID: 1, propertyName: "39 G Street",
+                sourceEvents: [
+                    // Must never travel: an Airbnb cancellation penalty.
+                    source(key: "cancel", platform: .airbnb, kind: .cancellationBlock,
+                           from: (2028, 5, 1), to: (2028, 5, 8)),
+                    // Must never travel: an opaque, unclassified block.
+                    source(key: "unknown", platform: .airbnb, kind: .unknownUnavailable,
+                           needsReview: true, from: (2028, 6, 1), to: (2028, 6, 4)),
+                    // Must never travel back out: one of our own published blocks
+                    // returning through a platform's export.
+                    source(key: "ours", platform: .bookingCom, kind: .ownerBlock,
+                           uid: "vrc-deadbeef", from: (2028, 7, 1), to: (2028, 7, 5)),
+                ],
+                decisions: [
+                    // Approved for Booking.com — the only thing that may appear.
+                    decision(.bookingCom, .block, status: .approved,
+                             from: (2028, 9, 1), to: (2028, 9, 5), id: 1),
+                    // Approved, but for VRBO. A Vrbo approval is not a
+                    // Booking.com approval and must not leak across.
+                    decision(.vrbo, .block, status: .approved,
+                             from: (2028, 10, 1), to: (2028, 10, 5), id: 2),
+                    // Booking.com, but never approved.
+                    decision(.bookingCom, .block, status: .draft,
+                             from: (2028, 11, 1), to: (2028, 11, 5), id: 3),
+                ],
+                scope: .approvedManualBlocksOnly
+            )
+
+            expect.equal(feed.included.count, 1, "exactly one entry may be published")
+            expect.equal(feed.included.first?.decisionID, 1, "and it is the Booking.com approval")
+
+            let ics = CalendarFeedGenerator().makeICS(feed)
+            expect.equal(ics.components(separatedBy: "BEGIN:VEVENT").count - 1, 1,
+                         "one VEVENT in the served calendar")
+            // Checkout-exclusive: DTEND is the checkout day itself, so the last
+            // night sold is the 4th. Off by one here double-books or loses a night.
+            expect.contains(ics, "DTSTART;VALUE=DATE:20280901")
+            expect.contains(ics, "DTEND;VALUE=DATE:20280905")
+            for absent in ["20280501", "20280601", "20280701", "20281001", "20281101"] {
+                expect.notContains(ics, absent)
+            }
+            expect.notContains(ics, "Dana Pemberton")
+            expect.notContains(ics, "8891")
+            expect.notContains(ics, "ATTENDEE")
+
+            // The fixture the local HTTP subscriber test serves. Written from the
+            // generator itself so the consumer check exercises real output rather
+            // than a hand-written approximation.
+            let fixture = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("vrc-booking-fixture.ics")
+            try? ics.write(to: fixture, atomically: true, encoding: .utf8)
+        },
+
+        TestCase(group: "Feeds",
+                 name: "a Booking.com block keeps its UID across regeneration") { expect in
+            // Booking.com must see an update, not a delete plus a create. A
+            // changed UID is what makes it see the latter.
+            //
+            // Note where the guarantee actually comes from: `publicationUID`
+            // defaults to a NEWLY generated value for each AvailabilityDecision
+            // object, so stability is a property of the decision being STORED
+            // and re-read, not of the generator. Building a fresh decision each
+            // time would produce a new UID and the test would be asserting
+            // nothing — which is exactly what the first draft of it did. Hence
+            // one decision, reused. CLAUDE.md makes the same point from the
+            // other direction: publication UIDs are migrated verbatim, never
+            // regenerated.
+            let stored = decision(.bookingCom, .block, status: .approved,
+                                  from: (2028, 9, 1), to: (2028, 9, 5), id: 1)
+            func build() -> String {
+                CalendarFeedGenerator().makeICS(CalendarFeedGenerator().generate(
+                    destination: .bookingCom, propertyID: 1, propertyName: "39 G Street",
+                    sourceEvents: [], decisions: [stored],
+                    scope: .approvedManualBlocksOnly))
+            }
+            func uids(_ ics: String) -> [String] {
+                ics.split(separator: "\r\n").map(String.init).filter { $0.hasPrefix("UID:") }
+            }
+            let first = uids(build())
+            expect.equal(first.count, 1)
+            expect.equal(uids(build()), first,
+                         "the stored decision yields the same UID every time")
+            // And a DIFFERENT decision must not collide with it.
+            let other = decision(.bookingCom, .block, status: .approved,
+                                 from: (2028, 9, 1), to: (2028, 9, 5), id: 2)
+            expect.ok(other.publicationUID != stored.publicationUID,
+                      "two decisions never share a publication UID")
+        },
+
+        TestCase(group: "Feeds",
+                 name: "an empty Booking.com feed is still a valid calendar") { expect in
+            // The state this project will actually start in, and the one most
+            // likely to be mishandled: nothing approved yet.
+            let feed = CalendarFeedGenerator().generate(
+                destination: .bookingCom, propertyID: 1, propertyName: "39 G Street",
+                sourceEvents: [
+                    source(key: "cancel", platform: .airbnb, kind: .cancellationBlock,
+                           from: (2028, 5, 1), to: (2028, 5, 8)),
+                ],
+                decisions: [],
+                scope: .approvedManualBlocksOnly)
+            expect.equal(feed.included.count, 0)
+            let ics = CalendarFeedGenerator().makeICS(feed)
+            expect.contains(ics, "BEGIN:VCALENDAR")
+            expect.contains(ics, "END:VCALENDAR")
+            expect.notContains(ics, "BEGIN:VEVENT")
+            // An empty calendar is a statement that nothing is blocked — it is
+            // NOT a signal to reopen. That distinction lives in
+            // FeedPublicationSafety, which refuses an unexplained shrink.
+        },
     ] }
 }

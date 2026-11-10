@@ -1023,3 +1023,121 @@ Steps 1–2 need no infrastructure and can be done today. Nothing past step 2
 happens without explicit approval, and `OutboundSyncGate` stays `false`
 throughout — note that publishing a *file* and opening the *gate* are separate
 decisions.
+
+---
+
+## 16. Booking.com feed — hosting decision and local verification (2026-11-10)
+
+**Nothing is deployed. No bucket was made public, no endpoint created, the gate
+is still `false`.**
+
+### Recommendation: a Lambda Function URL in front of the PRIVATE feeds bucket
+
+This replaces the "small public bucket" suggested in §15. Having checked the
+options properly, a public bucket is the wrong trade.
+
+```
+publish Lambda  ──writes──▶  s3://vrc-staging-feeds-…/ical/<token>.ics   (PRIVATE)
+Booking.com  ──GET──▶  https://<id>.lambda-url.us-east-1.on.aws/ical/<token>.ics
+                        └─ feed Lambda: compares token, streams the object
+```
+
+| | Public S3 object | **Lambda Function URL** | API Gateway route |
+|---|---|---|---|
+| Booking.com fetches without IAM | yes | **yes** | yes |
+| Bucket stays fully private | **no** | **yes** | yes |
+| Touches the authenticated API | no | **no** | **yes** — adds an unauthenticated route to the API that today has exactly one, `ANY /{proxy+}` on `AWS_IAM` |
+| Wrong token | 403/404 from S3 | **404 from our code** | 404 |
+| Revocation | delete/rename object | **delete one row; instant** | delete route or row |
+| Who fetched it | S3 access logging is **off by default** | **CloudWatch, free** | CloudWatch |
+| Rate limiting | none | reserved concurrency | throttles |
+| Extra cost | $0.00014/mo | **≈$0.00** (360 invocations) | ≈$0.0004/mo |
+
+Lambda Function URLs are available in this account (the API answers
+`ResourceNotFoundException`, i.e. supported, none configured). S3 GET pricing
+read from the Pricing API: `$0.0000004` per request — 360/month is
+**$0.00014**. Either option is free in practice; the difference is entirely
+about blast radius.
+
+It also reuses what exists: `Scripts/build-lambda.sh` already builds and
+packages handlers, and the private `vrc-staging-feeds-f79de5f0` bucket is
+already created and empty. No DNS, no CloudFront, no NAT, no servers.
+
+**Naming precaution:** Booking.com's own guidance describes a valid calendar
+link as containing `/ical/` or ending `.ics`. Whether that is *enforced* or
+merely advisory is unverified, so the path is shaped `…/ical/<token>.ics` —
+free insurance against a validator rejecting the URL.
+
+### An obscure URL is NOT authentication
+
+Stated plainly because it is easy to pretend otherwise:
+
+1. **It is a bearer capability, not an identity check.** Anyone holding the URL
+   reads the feed, forever, until it is rotated. There is no "who".
+2. **URLs leak** — browser history, referrer headers, proxy logs, support
+   tickets, screenshots, and Booking.com's own internal storage.
+3. **The bucket name is guessable; only the key is secret.** 128 bits of
+   randomness is not brute-forceable, but the entire security rests on that key
+   staying secret.
+4. **`s3:ListBucket` must never be public.** If it were, the "secret" key would
+   be enumerable and the whole scheme collapses. Grant `s3:GetObject` only —
+   this is the single most important line in any policy. With the Function URL
+   design the question does not arise, because nothing is public.
+5. **A public bucket policy requires disabling `BlockPublicPolicy` and
+   `RestrictPublicBuckets`**, leaving a standing misconfiguration risk for
+   anything later written there. Avoided entirely here.
+6. **No audit by default.** S3 server access logging is off unless enabled and
+   paid for; a Function URL logs every request to CloudWatch for nothing.
+
+What limits the damage is the payload, not the URL: the feed carries approved
+blocked dates and nothing else — no names, prices, or contact details. Worst
+case on disclosure is that someone learns which nights are blocked.
+
+### Verified locally today, with synthetic data only
+
+Three new tests in the `Feeds` group, plus an HTTP subscriber check. **No live
+Booking.com decision was created or approved** — the owner's instruction was
+explicit, and the generator was exercised on in-memory fixtures instead.
+
+A simulated subscriber fetched the generator's real output over HTTP and got:
+
+```
+BEGIN:VEVENT
+UID:5c9a63a5…@vacationrentalcalendar.local
+DTSTART;VALUE=DATE:20280901
+DTEND;VALUE=DATE:20280905
+SUMMARY:Not available
+END:VEVENT
+```
+
+One event — the Booking.com approval — and **nothing else**: the Airbnb
+cancellation block, the unknown block, an event bearing our own `vrc-` marker,
+a **Vrbo-approved** block, and an unapproved Booking.com draft were all held
+back. `Content-Type: text/calendar`, CRLF endings, every line ≤ 75 octets, no
+`ATTENDEE`/`DESCRIPTION`/guest text. The empty-feed case is also a valid
+calendar with zero `VEVENT`s.
+
+**A test that was wrong first, and what it taught.** The UID-stability test
+initially failed, and the product was right: `publicationUID` defaults to a
+*newly generated* value per `AvailabilityDecision` object, so building a fresh
+decision for each generation produced a new UID. Stability is a property of the
+decision being **stored and re-read**, not of the generator — the same point
+CLAUDE.md makes from the other side ("migrated verbatim, never regenerated").
+The test now reuses one stored decision and additionally asserts that two
+different decisions never collide.
+
+### What was already covered, and needed no new tests
+
+`Publication safety` already holds 19 tests covering exactly requirement 2: an
+unexplained empty feed is refused, a failed import never shrinks a feed, a stale
+or never-imported calendar refuses any removal, a removal over a confirmed
+reservation is explained rather than hidden, a failed upload leaves the previous
+feed serving, and token rotation issues a new key with no key material reaching
+the database.
+
+### Rollback
+
+Nothing to roll back yet. Once deployed: delete the Function URL config (the
+feed stops resolving immediately), delete the `ical/` object, mark the
+`feed_tokens` row `retired_at`. The private bucket, the management API and the
+Mac application are untouched by all three.
