@@ -782,16 +782,48 @@ final class AppState: ObservableObject {
 
     func cancel(decisionID: Int64) {
         guard let store else { return }
-        try? store.availabilityManager.cancel(decisionID: decisionID)
+        do {
+            _ = try store.availabilityManager.cancel(decisionID: decisionID)
+            statusMessage = "Change cancelled."
+        } catch let error as AvailabilityError {
+            // An approved decision refuses a plain cancel. Say so rather than
+            // failing silently, which is how the old `try?` behaved.
+            statusMessage = error.errorDescription ?? "That change could not be cancelled."
+        } catch {
+            statusMessage = "That change could not be cancelled."
+        }
         reload()
-        statusMessage = "Change cancelled."
+    }
+
+    /// Deliberately withdrawing an approval. The view asks for confirmation
+    /// first; this is only reached after the owner says yes.
+    func withdrawApproved(decisionID: Int64) {
+        guard let store else { return }
+        do {
+            _ = try store.availabilityManager.withdrawApproved(
+                decisionID: decisionID, confirmation: .ownerConfirmedWithdrawal)
+            statusMessage = "Approval withdrawn. The nights go back on sale here."
+        } catch {
+            statusMessage = "That approval could not be withdrawn."
+        }
+        reload()
     }
 
     func cancelAllPending() {
         guard let store, let propertyID = selectedPropertyID else { return }
-        let count = (try? store.availabilityManager.cancelPending(propertyID: propertyID)) ?? 0
+        guard let result = try? store.availabilityManager.cancelPending(propertyID: propertyID)
+        else { return }
         reload()
-        statusMessage = "Cleared \(count) pending change\(count == 1 ? "" : "s")."
+        var message = "Cleared \(result.cancelled) pending change"
+            + (result.cancelled == 1 ? "." : "s.")
+        if result.keptApproved > 0 {
+            // Saying what was KEPT is the point. A sweep that quietly does
+            // less than the button implies is its own surprise.
+            message += " \(result.keptApproved) approved change"
+                + (result.keptApproved == 1 ? " was" : "s were")
+                + " kept — withdraw those individually if you meant to."
+        }
+        statusMessage = message
     }
 
     var decisionsForSelectedProperty: [AvailabilityDecision] {

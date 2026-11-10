@@ -167,6 +167,7 @@ struct AvailabilityEditorView: View {
 struct PendingDecisionsView: View {
     @EnvironmentObject var state: AppState
     @State private var expandedDecision: Int64?
+    @State private var withdrawalCandidate: Int64?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -176,6 +177,8 @@ struct PendingDecisionsView: View {
                 if !state.pendingDecisions.isEmpty {
                     Button("Cancel all") { state.cancelAllPending() }
                         .controlSize(.small)
+                        .help("Clears drafts and changes waiting for approval. "
+                            + "Anything you have already approved is kept.")
                 }
             }
             .padding(12)
@@ -197,6 +200,22 @@ struct PendingDecisionsView: View {
                     .padding(11)
                 }
             }
+        }
+        .confirmationDialog(
+            "Withdraw this approved change?",
+            isPresented: Binding(
+                get: { withdrawalCandidate != nil },
+                set: { if !$0 { withdrawalCandidate = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Withdraw approval", role: .destructive) {
+                if let id = withdrawalCandidate { state.withdrawApproved(decisionID: id) }
+                withdrawalCandidate = nil
+            }
+            Button("Keep it", role: .cancel) { withdrawalCandidate = nil }
+        } message: {
+            Text("You approved this change. Withdrawing it puts those nights back on sale "
+                + "here. The decision and its history are kept.")
         }
     }
 
@@ -244,8 +263,11 @@ struct PendingDecisionsView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
-                Button("Cancel") {
-                    if let id = decision.id { state.cancel(decisionID: id) }
+                // Withdrawing an approval is deliberate, so it asks. The
+                // plain cancel path refuses an approved decision outright —
+                // this is the only route, and it is one the owner has to mean.
+                Button("Withdraw approval…") {
+                    withdrawalCandidate = decision.id
                 }
                 .controlSize(.small)
             }

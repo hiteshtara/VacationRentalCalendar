@@ -286,50 +286,35 @@ public enum AvailabilityTests {
             let cleared = try setup.store.availabilityManager.cancelPending(
                 propertyID: setup.propertyID
             )
-            expect.equal(cleared, 2)
+            expect.equal(cleared.cancelled, 2)
+            expect.equal(cleared.keptApproved, 0)
             expect.equal(try setup.store.availability.pending().count, 0)
         },
 
-        // Characterisation, not aspiration: this records what "Cancel all"
-        // actually does today, because it surprised the owner once and cost
-        // two approved decisions.
-        //
-        // `cancelPending` cancels everything whose status `isPending`, and
-        // `isPending` includes `.approved`. That predicate was written for
-        // CONFLICT CHECKS — an approved-but-unpublished decision must still
-        // block an overlapping one — and `cancelPending` reuses it as a
-        // DELETION SCOPE. Those are different questions, so the editor's
-        // "Cancel all" button discards approved work along with drafts.
-        //
-        // The test above only ever submits drafts, so it never covered this.
-        // If this behaviour is ever changed deliberately, this test should
-        // fail and force the decision to be made on purpose.
+        // The behaviour this used to pin — "Cancel all" sweeping up approved
+        // decisions — was the bug, not the design. It is fixed, and the
+        // regression suite for it lives in `Bulk cancellation`. What remains
+        // here is the reason the two predicates must stay distinct.
         TestCase(group: "Availability",
-                 name: "cancel pending also discards APPROVED decisions, not just drafts") { expect in
+                 name: "an approved decision still counts as pending for conflict checks") { expect in
             let setup = try makeStore()
             let submitted = try setup.store.availabilityManager.submit(
                 plan(setup.propertyID, [.vrbo: .block])
             )
             let id = submitted[0].id!
             let approved = try setup.store.availabilityManager.approve(decisionID: id)
-            expect.equal(approved.status, .approved, "precondition: it really is approved")
+            expect.equal(approved.status, .approved)
             expect.ok(AvailabilityStatus.approved.isPending,
-                      "and `approved` counts as pending, which is the whole mechanism")
+                      "it still occupies those nights, so an overlap must be refused")
+            expect.ok(!AvailabilityStatus.approved.isDiscardableInBulk,
+                      "but a bulk sweep must not discard it")
 
             let cleared = try setup.store.availabilityManager.cancelPending(
                 propertyID: setup.propertyID
             )
-            expect.equal(cleared, 1, "the approved decision was swept up")
-            expect.equal(try setup.store.availability.find(id: id)?.status, .cancelled)
-
-            // The row and its audit trail survive — cancellation is not deletion,
-            // which is the one mercy here: the history explains what happened.
-            expect.ok(try setup.store.availability.find(id: id) != nil,
-                      "the decision row survives")
-            let history = try setup.store.auditLog.entries(forDecision: id)
-            expect.ok(history.contains { $0.toStatus == .cancelled
-                        && $0.detail == "Pending changes cleared." },
-                      "and the audit names the cause, so it is diagnosable afterwards")
+            expect.equal(cleared.cancelled, 0)
+            expect.equal(cleared.keptApproved, 1)
+            expect.equal(try setup.store.availability.find(id: id)?.status, .approved)
         },
 
         TestCase(group: "Availability", name: "every status transition is audited") { expect in

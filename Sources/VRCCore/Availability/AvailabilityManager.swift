@@ -1,11 +1,22 @@
 import Foundation
 
+/// Proof that withdrawing an approval was deliberate.
+///
+/// A single-case enum rather than a `Bool`, so `withdrawApproved(…, true)`
+/// cannot be written at a call site and read as something else.
+public enum WithdrawalConfirmation: Sendable, Equatable {
+    case ownerConfirmedWithdrawal
+}
+
 public enum AvailabilityError: Error, LocalizedError {
     case refused([RuleViolation])
     case illegalTransition(from: AvailabilityStatus, to: AvailabilityStatus)
     case notFound(Int64)
     case outboundDisabled
     case notApproved
+    /// A plain cancel was attempted on an approved decision. Withdrawing an
+    /// approval is a separate, deliberate act.
+    case approvedRequiresWithdrawal(Int64)
 
     public var errorDescription: String? {
         switch self {
@@ -18,6 +29,9 @@ public enum AvailabilityError: Error, LocalizedError {
             return "Decision \(id) no longer exists."
         case .outboundDisabled:
             return OutboundSyncGate.explanation
+        case .approvedRequiresWithdrawal(let id):
+            return "Decision \(id) has already been approved. Approved changes are not "
+                + "cancelled in passing — withdraw it explicitly if you have changed your mind."
         case .notApproved:
             return "That decision has not been approved, so it cannot be published."
         }
@@ -335,6 +349,12 @@ public final class AvailabilityManager: @unchecked Sendable {
         guard let decision = try decisions.find(id: decisionID) else {
             throw AvailabilityError.notFound(decisionID)
         }
+        // Closing the back door. Narrowing only the bulk sweep would leave
+        // every other caller able to discard an approval silently, and this is
+        // the method they all reach for.
+        guard decision.status != .approved else {
+            throw AvailabilityError.approvedRequiresWithdrawal(decisionID)
+        }
         var cancelled = try transition(
             decision, to: .cancelled, actor: actor, now: now,
             detail: reason.isEmpty ? "Cancelled before publication." : reason
@@ -344,18 +364,70 @@ public final class AvailabilityManager: @unchecked Sendable {
         return cancelled
     }
 
-    /// Cancels every still-pending decision for a property and range — the
-    /// "cancel pending changes" the editor offers.
+    /// What a bulk sweep did, and what it deliberately left alone.
+    ///
+    /// `keptApproved` exists so the editor can say so. A sweep that silently
+    /// does less than the button implies is its own kind of surprise.
+    public struct BulkCancellation: Sendable, Equatable {
+        public var cancelled: Int
+        public var keptApproved: Int
+        public init(cancelled: Int, keptApproved: Int) {
+            self.cancelled = cancelled
+            self.keptApproved = keptApproved
+        }
+    }
+
+    /// Cancels the open work for a property that the owner has not approved —
+    /// the "cancel pending changes" the editor offers.
+    ///
+    /// Scoped by `isDiscardableInBulk`, not `isPending`. See that property for
+    /// why the two are different questions; using the wrong one here cost two
+    /// approved Vrbo decisions.
     @discardableResult
     public func cancelPending(
         propertyID: Int64, actor: String = "owner", now: Date = Date()
-    ) throws -> Int {
-        let pending = try decisions.forProperty(propertyID).filter { $0.status.isPending }
-        for decision in pending {
+    ) throws -> BulkCancellation {
+        let all = try decisions.forProperty(propertyID)
+        let discardable = all.filter { $0.status.isDiscardableInBulk }
+        for decision in discardable {
             guard let id = decision.id else { continue }
             _ = try cancel(decisionID: id, actor: actor, reason: "Pending changes cleared.", now: now)
         }
-        return pending.count
+        return BulkCancellation(
+            cancelled: discardable.count,
+            keptApproved: all.filter { $0.status == .approved }.count)
+    }
+
+    /// Withdraws a decision the owner already approved.
+    ///
+    /// Separate from `cancel` on purpose, and the confirmation is a required
+    /// argument with no default so it cannot be supplied by accident: the
+    /// compiler, not a code review, is what stops an approval being discarded
+    /// in passing.
+    ///
+    /// The publication UID is carried through untouched. A changed UID makes a
+    /// platform see a delete plus a create instead of an update, so it is
+    /// migrated verbatim and never regenerated.
+    @discardableResult
+    public func withdrawApproved(
+        decisionID: Int64,
+        confirmation: WithdrawalConfirmation,
+        actor: String = "owner",
+        reason: String = "",
+        now: Date = Date()
+    ) throws -> AvailabilityDecision {
+        precondition(confirmation == .ownerConfirmedWithdrawal)
+        guard let decision = try decisions.find(id: decisionID) else {
+            throw AvailabilityError.notFound(decisionID)
+        }
+        guard decision.status == .approved else { throw AvailabilityError.notApproved }
+
+        var withdrawn = try transition(
+            decision, to: .cancelled, actor: actor, now: now,
+            detail: reason.isEmpty ? "Approval withdrawn by the owner." : reason)
+        withdrawn.cancelledAt = now
+        try decisions.update(withdrawn)
+        return withdrawn
     }
 
     // MARK: - Publication bookkeeping

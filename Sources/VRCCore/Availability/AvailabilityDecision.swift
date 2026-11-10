@@ -114,6 +114,28 @@ public enum AvailabilityStatus: String, CaseIterable, Codable, Sendable, Identif
         }
     }
 
+    /// Whether a bulk sweep may discard this without asking again.
+    ///
+    /// Deliberately NOT `isPending`. `isPending` answers "does this still
+    /// occupy these nights?", and an approved-but-unpublished decision does —
+    /// which is why conflict checks must keep counting it. That is a different
+    /// question from "is this safe to throw away in bulk?".
+    ///
+    /// Approval is the owner saying yes. A sweep that undoes it destroys
+    /// deliberate work, which is exactly what happened to two approved Vrbo
+    /// decisions when "Cancel all" reused `isPending` as a deletion scope.
+    ///
+    /// Listed exhaustively rather than with a `default`, so a status added
+    /// later has to be classified on purpose instead of defaulting to
+    /// discardable.
+    public var isDiscardableInBulk: Bool {
+        switch self {
+        case .draft, .validated, .awaitingApproval: return true
+        case .approved, .published, .awaitingPlatformRefresh, .verified,
+             .failed, .cancelled, .unknown: return false
+        }
+    }
+
     public var isTerminal: Bool {
         self == .cancelled || self == .verified || self == .failed
     }
