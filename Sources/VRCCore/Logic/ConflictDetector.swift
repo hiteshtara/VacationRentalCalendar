@@ -44,6 +44,28 @@ public struct ConflictDetector: Sendable {
                         continue
                     }
 
+                    // A conflict has to be actionable. If NEITHER side claims
+                    // the property is actually unavailable, there is nothing
+                    // colliding and nothing the owner can do.
+                    //
+                    // 39 G Street reported nine conflicts with nothing booked:
+                    // every observation was a cancellation block — nights
+                    // Airbnb closed after a host cancellation, which this app
+                    // deliberately keeps on sale — and they overlap each other
+                    // constantly. That marked the property "needs attention"
+                    // and would have buried a real double booking as the tenth
+                    // row in a list of nine false ones.
+                    //
+                    // Keyed to `describesGenuineUnavailability`, the allow-list
+                    // that already decides what may be exported, so a new
+                    // BlockKind is governed here too instead of being forgotten.
+                    // One side is enough: a confirmed reservation under dates
+                    // another platform cancelled is exactly worth a human look.
+                    guard a.classification.kind.describesGenuineUnavailability
+                        || b.classification.kind.describesGenuineUnavailability else {
+                        continue
+                    }
+
                     let conflict = ReservationConflict(
                         propertyID: propertyID,
                         propertyName: a.propertyName,

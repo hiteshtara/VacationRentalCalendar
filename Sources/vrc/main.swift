@@ -213,8 +213,12 @@ func runSetURL() async {
     }
     let previousRef = listing.credentialRef
 
+    // After a rebuild the existing entry's access list names binaries that no
+    // longer exist, so a re-home must create a new entry rather than update in
+    // place. The old entry is left untouched.
+    let rehome = flags.contains("--rehome")
     do {
-        try store.listings.update(updated)
+        try store.listings.update(updated, rehomeCredential: rehome)
         let saved = try store.listings.find(id: listingID)
         print("")
         print("  Stored in \(store.credentials.storageDescription).")
@@ -946,10 +950,10 @@ func runDoctor() {
         // Readability is a separate question from identity, and the only one
         // that matters operationally. `vrc doctor` previously reported the
         // presence of a Keychain REFERENCE as though it were access.
-        let unreadable = (try? store.listings.all())?.filter {
-            !$0.credentialRef.isEmpty
-                && (try? store.credentials.url(reference: $0.credentialRef)) == nil
-        }.count ?? 0
+        // Via the store, which flattens the double optional this used to get
+        // wrong: a reference pointing at nothing came back `.some(nil)` and
+        // was counted as readable.
+        let unreadable = ((try? store.unreadableCredentials()) ?? []).count
         check("this build can actually READ its stored credentials", unreadable == 0,
               unreadable == 0
                   ? "all readable"

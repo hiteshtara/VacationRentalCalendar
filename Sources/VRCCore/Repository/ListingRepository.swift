@@ -79,7 +79,9 @@ public struct ListingRepository: Sendable {
 
     /// Splits a listing into the part that may be persisted and the part that
     /// must go to the credential store. Returns the value for `ical_url`.
-    private func persistURL(_ listing: PlatformListing) throws -> (column: String, reference: String) {
+    private func persistURL(
+        _ listing: PlatformListing, rehome: Bool = false
+    ) throws -> (column: String, reference: String) {
         switch listing.urlStorage {
         case .database:
             return (listing.icalURL, listing.credentialRef)
@@ -116,7 +118,15 @@ public struct ListingRepository: Sendable {
                 // because writing and reading are authorised separately, and
                 // the next import then failed as unreadable. The owner had to
                 // paste the same URL twice before it took.
-                if listing.connectionState.isClearedByANewURL,
+                //
+                // `rehome` forces the same thing regardless of state. Moving a
+                // credential to a NEW code object is the one case where
+                // preserving the existing access list is actively harmful: the
+                // list names binaries that no longer exist, so the save appears
+                // to work and the credential is unreadable from then on. That
+                // is exactly what happened on 2026-11-10, to both the app and
+                // its own bundled helper.
+                if rehome || listing.connectionState.isClearedByANewURL,
                    credentials.exists(reference: reference) {
                     reference = Self.nextReference(after: reference)
                 }
@@ -150,9 +160,13 @@ public struct ListingRepository: Sendable {
         return stored
     }
 
-    public func update(_ listing: PlatformListing) throws {
+    /// - Parameter rehomeCredential: write the URL to a FRESH Keychain
+    ///   reference even if this listing is healthy. Used after the app is
+    ///   rebuilt, when the existing item's access list names binaries that no
+    ///   longer exist. Never deletes the old entry.
+    public func update(_ listing: PlatformListing, rehomeCredential: Bool = false) throws {
         guard let id = listing.id else { return }
-        let (column, reference) = try persistURL(listing)
+        let (column, reference) = try persistURL(listing, rehome: rehomeCredential)
         // A freshly entered URL supersedes whatever was wrong before.
         if listing.hasURL, listing.connectionState.isClearedByANewURL {
             try? setConnectionState(

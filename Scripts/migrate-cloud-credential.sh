@@ -135,7 +135,7 @@ while IFS='|' read -r listing_id platform ref label; do
 
     # Hand it over through a pipe. --stdin skips the interactive confirmation
     # but keeps every check: https only, fetched and parsed before saving.
-    if printf '%s\n' "${URL}" | "$HELPER" set-url --listing "${listing_id}" --stdin >/dev/null 2>&1; then
+    if printf '%s\n' "${URL}" | "$HELPER" set-url --listing "${listing_id}" --stdin --rehome >/dev/null 2>&1; then
         unset URL
         if "$HELPER" keychain 2>/dev/null | grep -F "${platform}" | grep -q "^  ok"; then
             say "    migrated and verified readable"

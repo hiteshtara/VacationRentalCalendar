@@ -196,6 +196,26 @@ public final class RentalStore: @unchecked Sendable {
         }
     }
 
+    /// Listings whose stored credential this build cannot actually read.
+    ///
+    /// "Cannot read" means the read threw — an access list that does not name
+    /// this binary — OR the reference points at nothing. `vrc doctor` asked
+    /// `(try? credentials.url(ref)) == nil`, which is a DOUBLE optional and so
+    /// is nil only in the first case: a dangling reference came back as
+    /// `.some(nil)` and was reported as readable.
+    ///
+    /// A listing with no reference at all is not a credential problem — its
+    /// URL lives in the database column — and is excluded.
+    public func unreadableCredentials() throws -> [PlatformListing] {
+        try listings.all().filter { listing in
+            guard !listing.credentialRef.isEmpty else { return false }
+            guard let value = try? credentials.url(reference: listing.credentialRef) else {
+                return true          // the read failed outright
+            }
+            return value == nil      // the reference points at nothing
+        }
+    }
+
     public func conflicts() throws -> [ReservationConflict] {
         detector.detect(
             in: try classifiedEvents(),
