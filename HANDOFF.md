@@ -23,7 +23,7 @@ cluster to validate B6 and emptied it, destroying the synthetic demo rows, 2
 synthetic approved decisions and the Airbnb `platform_listings` row.
 `Scripts/seed-staging-demo.sql` restores only the property, one reservation and
 one hold, so the rest was gone. No real data was lost — the 7 events, 7
-classifications and 2 approved Vrbo decisions live in local SQLite, were never a
+classifications and 2 Vrbo decisions live in local SQLite, were never a
 target, and are re-verified in §9.
 
 **What now prevents it.**
@@ -61,14 +61,16 @@ publication rehearsals against the local SQLite database.
 
 ## 0. One-line status
 
-The Mac app is installed and working, and it shows **live data from the deployed
-AWS staging backend**. Staging is up and validated through smoke tests **B5 and
-B6**. Scheduled imports and outbound publishing are **off**. No real feeds import
-yet.
+The Mac app is installed and working, it shows **live data from the deployed AWS
+staging backend**, and as of 2026-11-10 it holds **real imported observations**:
+**Airbnb 4 events and Vrbo 3 events**, fetched from the live feeds. Booking.com
+is the only feed still disconnected (§13). Staging validation is complete
+(A1–A5, B1–B9, Phase C). Scheduled imports and outbound publishing remain
+**off** at every layer.
 
-Both loose ends from the previous round are closed: the truncating setup is now
-**guarded in code** (above), and staging's leftover test litter has been
-**removed** after confirming each row individually (§4).
+Two things need the owner's attention, both in §13 and §14: Booking.com needs a
+fresh export URL, and the two December Vrbo decisions now read `cancelled`
+rather than approved.
 
 ---
 
@@ -78,8 +80,9 @@ Both loose ends from the previous round are closed: the truncating setup is now
 |---|---|
 | macOS app | built, signed, installed at `/Applications/VacationRentalCalendar.app` |
 | Cloud integration | **working** — the app reads live status/availability from AWS staging via the bundled `vrc` helper |
+| Real feeds | **Airbnb and Vrbo connected and importing** (4 and 3 events). Booking.com disconnected — needs a new export URL (§13) |
 | AWS staging | **deployed** in account …1110, us-east-1; cluster + 5 Lambdas + API Gateway + 3 buckets + 4 secrets |
-| Tests | **369 tests**, passing on **macOS and Linux** (1242 assertions with the PostgreSQL group live, 1223 without) |
+| Tests | **370 tests**, passing on macOS (1229 assertions; 1248 with the PostgreSQL group live). 369/369 verified on Linux at `02f6df6` — the one newer test is pure Swift with no platform surface |
 | Cross-platform parity | byte-identical digest `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` |
 | Staging smoke tests | **ALL COMPLETE: A1–A5, B1–B9, and Phase C C1–C5.** See §5 and §12 |
 | Outbound publishing | **off** — code gate, function env and database setting all verified `false` 2026-11-09; Terraform precondition not re-checked (§4) |
@@ -538,7 +541,7 @@ truncation described at the top of this file did not touch it. Re-read through
 |---|---|
 | Events | **7** |
 | Classifications | **7** |
-| Approved Vrbo decisions | **2** |
+| Vrbo decisions | **2 rows, both `cancelled` as of 2026-11-10** — see §14. Previously approved-and-unpublished |
 | — Decision 1 | Vrbo block **2026-12-10 → 2026-12-17**, UID `vrc-812d19781e654081a164c12d307b07b4` |
 | — Decision 2 | Vrbo block **2026-12-19 → 2026-12-20**, UID `vrc-a5a1dbf505da412e87a71d6a78481547` |
 | December 17–18 | **no Vrbo block decision** — those nights stay sellable (verified: 0 blocks cover them) |
@@ -708,21 +711,45 @@ Explorer lags about a day and had published nothing for the period.
 
 ---
 
-## 13. Real feed readiness — checked 2026-11-10. **All three feeds are blocked.**
+## 13. Real feeds — Airbnb and Vrbo are LIVE. Only Booking.com is outstanding.
+
+**Updated 2026-11-10 01:3x.** An earlier revision of this section said all three
+feeds were blocked. That is no longer true: the owner re-entered the Airbnb and
+Vrbo URLs through the app's Feeds pane, and both now import real observations.
+The Booking.com half of the section still stands.
 
 The real-import milestone cannot start until the owner acts. Nothing here is a
 code problem, and nothing is fixable from an automated session.
 
-### What each feed needs
+### Where each feed stands
 
-| Listing | State | What it needs |
+| Listing | State | Real observations |
 |---|---|---|
-| **Airbnb** — 39 G Street | `Needs the URL entered again` | the owner re-enters the URL |
-| **Vrbo** — 39 G Street (5550554) | `Needs the URL entered again` | the owner re-enters the URL |
-| **Booking.com** — Southie Beach House (17482435) | **`Disconnected by the platform`** | a **brand-new export URL generated on Booking.com** |
+| **Airbnb** — 39 G Street | ✅ `Connected` | **4 events, 4 in feed** |
+| **Vrbo** — 39 G Street (5550554) | ✅ `Connected` | **3 events, 3 in feed** |
+| **Booking.com** — Southie Beach House (17482435) | 🟥 `Disconnected by the platform` | 0 — needs a **brand-new export URL** |
 
-**Airbnb and Vrbo** are the documented cdhash trap. `vrc keychain` on the
-installed build (`217f668`) reports:
+So the 7 active local events **are real imported observations**, not fixtures:
+4 from Airbnb and 3 from Vrbo, with feed counts matching exactly.
+
+### The one thing to know about entering feed URLs
+
+**Enter them in the app, under Feeds — not through the `vrc` CLI.** After the
+re-entry, `vrc keychain` *still* reports all three feed items unreadable
+(`OSStatus -25293`), while Airbnb and Vrbo import perfectly. That is not a
+contradiction: the GUI created the new items, and the GUI is a **different code
+object** from the `vrc` helper, so each can only read what it created. The
+Keychain references bumped `airbnb-…-v3` → `-v4` and `vrbo-…-v3` → `-v4`, which
+is `set-url` writing a fresh entry and leaving the old one untouched, exactly as
+designed.
+
+This is the same split documented in [docs/KEYCHAIN.md](docs/KEYCHAIN.md) for
+the AWS credential, just in the other direction: there, the GUI had to delegate
+to `vrc`; here, `vrc` cannot see what the GUI owns.
+
+### The cdhash trap, for reference — this is what Airbnb and Vrbo were in
+
+`vrc keychain` on the installed build (`217f668`) reported:
 
 ```
 FAIL Airbnb — 39 G Street [airbnb-1759472334611502986-v3] — refused (OSStatus -25293)
@@ -759,14 +786,19 @@ explains why not and what to do.
 `ResourceNotFoundException` — the secret exists but holds no value. So AWS is not
 an alternative source, and a cloud-side import is blocked for the same reason.
 
-### How the owner unblocks it
+### How Airbnb and Vrbo were unblocked — and how Booking.com will be
 
-In a **real Terminal** (not an automated session), or in the app under **Feeds**:
+Through the app's **Feeds** pane (the route that worked). The CLI equivalent,
+for reference, must run in a **real Terminal** — `set-url` refuses to save when
+stdin is not a TTY, demands `https`/`webcal`, redacts the URL, and fetches and
+parses it before saving, leaving any existing entry untouched on failure
+(`--dry-run` verifies without saving):
 
 ```bash
-/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc set-url --listing 2   # Airbnb
-/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc set-url --listing 1   # Vrbo
+/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc set-url --listing 3   # Booking.com
 ```
+
+But prefer the Feeds pane, for the code-object reason above.
 
 `set-url` reads the URL from stdin with echo cleared, verifies it before saving,
 and never puts it in argv, shell history, `ps`, or a log. It writes a fresh
@@ -776,7 +808,7 @@ nothing is deleted and no credential is regenerated. Then
 
 **Never pass a feed URL as a command-line argument.** It is a bearer credential.
 
-### Local data, as it stands before any real import
+### Local data, as it stands with Airbnb and Vrbo imported
 
 | | |
 |---|---|
@@ -785,7 +817,7 @@ nothing is deleted and no credential is regenerated. Then
 | Confirmed reservations | **none** — worth knowing before reconciliation, since none of the 7 is a booking |
 | Needs review | 0 |
 | Double bookings | 0 · other overlaps 4 |
-| Approved Vrbo decisions | 2, both **approved and not published** (Dec 10–17 and Dec 19–20, 2026) |
+| Vrbo decisions | 2 rows, both now **`cancelled`**, never published — see §14 |
 | December 17–18 2026 | **free of any Vrbo block decision** |
 
 ### The Mac display is already built
@@ -801,3 +833,80 @@ already present, so no UI work is pending on this milestone:
 | Conflicts requiring review | `ConflictsView`, `ReviewView`, and a review queue in `vrc status` |
 | Last successful refresh | Cloud pane renders `status.lastSuccessfulImport` (currently `never`) |
 | Duplicate-free refresh | covered by `RequiredScenarioTests` — "re-importing a feed creates no duplicates" |
+
+---
+
+## 14. Why the two Vrbo decisions read `cancelled` — investigated 2026-11-10
+
+Both decisions were **approved and unpublished** for a day, then both became
+`cancelled` within the same second. Nothing was deleted: both rows survive, both
+publication UIDs are intact, and the full audit trail explains it.
+
+### When
+
+| Decision | Created (draft) | Approved | Cancelled |
+|---|---|---|---|
+| 1 — Vrbo block Dec 10→17 2026 (7 nights) | 2026-11-09 03:33:38 | 2026-11-09 03:37:09 | **2026-11-10 01:09:14** |
+| 2 — Vrbo block Dec 19→20 2026 (1 night) | 2026-11-09 03:33:38 | 2026-11-09 03:37:09 | **2026-11-10 01:09:14** |
+
+The two audit histories are **identical in shape and to the second** — created
+together, advanced `draft → validated → awaiting_approval → approved` together,
+cancelled together, both with the detail `Pending changes cleared.` and actor
+`owner`. That is one action affecting both, not two separate decisions.
+
+### How
+
+A single click on the button labelled **"Cancel all"**, in the availability
+editor's *"Waiting for you"* section
+([AvailabilityEditor.swift:177](Sources/VacationRentalCalendar/Availability/AvailabilityEditor.swift#L177)).
+It calls `AppState.cancelAllPending()` →
+`AvailabilityManager.cancelPending(propertyID:)`, which cancels **every** decision
+whose status `isPending`.
+
+### Why it swept up approved work
+
+`AvailabilityStatus.isPending` returns true for `.draft`, `.validated`,
+`.awaitingApproval` **and `.approved`**
+([AvailabilityDecision.swift:112](Sources/VRCCore/Availability/AvailabilityDecision.swift#L112)).
+Its own doc comment gives the intent: *"Still open, so it counts as a pending
+operation during **conflict checks**."*
+
+That predicate was written to answer **"must this block an overlapping
+decision?"** — and an approved-but-unpublished decision certainly must.
+`cancelPending` reuses it to answer a different question: **"may this be thrown
+away?"** Those are not the same question, and conflating them means a button
+called "Cancel all", sitting under a heading that reads "Waiting for you",
+silently discards approved work. An approved decision is arguably no longer
+*waiting for you* at all — it is waiting for publication.
+
+**This is a design observation, not a fault anyone introduced carelessly, and it
+has not been changed.** Altering the semantics of an availability control is a
+reviewed decision, not a cleanup, and the owner has asked not to reactivate or
+publish these decisions without approval.
+
+What *was* added is a characterisation test,
+`"cancel pending also discards APPROVED decisions, not just drafts"`, which pins
+the current behaviour so it cannot stay invisible. The pre-existing test
+`"cancel pending clears everything open"` only ever submitted drafts, so it never
+covered this path. The new test was verified to be sensitive: excluding
+`.approved` from `cancelPending`'s filter makes it fail on exactly the two
+assertions that matter, and the source was reverted afterwards.
+
+### What survived, and what the owner still has to decide
+
+Nothing was lost but the approval itself:
+
+- both decision rows exist, with `publication_uid` `vrc-812d1978…` and
+  `vrc-a5a1dbf5…` **verbatim** — which matters, because a changed UID would make
+  a platform see a delete plus a create instead of an update;
+- `feed_publications` is **0** — neither was ever published anywhere;
+- the audit trail is complete at 10 entries and names the cause;
+- December 17–18 2026 remain free of any Vrbo block decision.
+
+**Open question for the owner:** whether that "Cancel all" click was deliberate.
+If the two December blocks are still wanted, they must be re-approved
+deliberately — the statuses are terminal (`cancelled` is in `isTerminal`), so
+this means new decisions or an explicit reinstatement, and **neither has been
+done**. CLAUDE.md lists these two under "Data that must survive"; the rows and
+UIDs survive, their *approved* status does not, and that note should be reworded
+once the owner says which state is intended.
