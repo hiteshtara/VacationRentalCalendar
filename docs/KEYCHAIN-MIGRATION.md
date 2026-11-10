@@ -284,3 +284,156 @@ Steps 4 onward need separate approval.
 | Outbound feed token forgotten | Named explicitly above; Booking.com already subscribes to it, and re-minting would break that connection |
 | Access group mismatch between signature and code | A test already asserts `AppleTeam.identifier` and `KeychainPolicy.groupSuffix` match `Scripts/apple-config.sh` and both entitlements files |
 | Certificate expires | Developer ID certificates last five years; items are scoped to the **team**, not the certificate, so renewal does not orphan them |
+
+
+---
+
+# Verified against Apple's documentation — 2026-11-10
+
+Checked because the empirical SIGKILL needed confirming against the rules
+rather than inferred from one machine's behaviour. Sources at the end.
+
+## 1. Is `keychain-access-groups` restricted?
+
+**Yes.** On macOS an app may claim many entitlements without authorisation —
+App Sandbox and Hardened Runtime configuration, `application-groups`,
+`get-task-allow` — but `keychain-access-groups` is **restricted** and must be
+allowlisted by a provisioning profile. Apple's stated reason is to stop one
+developer impersonating another's app to steal its keychain items.
+
+This applies to **Developer ID** signing, not only the App Store. Developer ID
+is distribution-signed code, and distribution-signed code claiming a
+restricted entitlement needs a distribution profile.
+
+That matches what this machine did: unsigned runs, signed-without-entitlements
+runs, signed-with-the-entitlement is SIGKILLed with no error and no log.
+
+## 2. Is a Developer ID provisioning profile supported here?
+
+**Yes.** The portal offers a **Developer ID** profile type for macOS, distinct
+from Mac App Store. Choose the one matching the distribution channel.
+
+## 3. The exact access group
+
+A group is `<prefix>.<identifier>`, where the prefix is the team identifier.
+In an entitlements file `$(AppIdentifierPrefix)` expands to `<TeamID>.`.
+
+For this product:
+
+| | |
+|---|---|
+| Entitlements file | `$(AppIdentifierPrefix)com.vacationrentalcalendar.shared` |
+| Fully qualified at runtime | `26JLFSV9YS.com.vacationrentalcalendar.shared` |
+| `kSecAttrAccessGroup` value | `26JLFSV9YS.com.vacationrentalcalendar.shared` |
+
+Both spellings are already in the repository and agree: the entitlements files
+use the variable, `KeychainPolicy` composes the fully qualified form, and a
+test asserts they match `Scripts/apple-config.sh`.
+
+## 4. How the profile applies to the GUI and the nested `vrc` helper
+
+**It does not cover both.** Apple is explicit: where a product contains
+multiple executables that need a profile, the process is repeated **for each
+one**, with its own profile at its own `Contents/embedded.provisionprofile`,
+embedded **before** that item is signed, signing inside-out.
+
+And a profile can only live in a bundle. For a **non-bundled executable** that
+needs a restricted entitlement, Apple's documented technique is to package it
+in an **app-like structure**.
+
+`Contents/MacOS/vrc` is a bare executable. As it stands it **cannot** carry
+the entitlement, and it does not inherit the app's.
+
+## 5. Can the standalone helper architecture be supported?
+
+Three honest options.
+
+**(a) Wrap the helper.** `Contents/Helpers/vrc.app/` with its own profile,
+signed before the outer app. Supported and documented. Cost: a second App ID
+and profile, a more complex build, and a nested executable that App Review
+will ask about later.
+
+**(b) Move credential access in-process — recommended.** The GUI calls
+`VRCCore` directly instead of spawning `vrc`. Only one executable then needs
+the entitlement, one profile, no wrapper. It also deletes the class of bug
+that has cost the most time on this project: the app and its own helper
+disagreeing about whether a credential is readable, which happened at 18:22
+on 2026-11-10. `HelperCloudClient` is the only thing standing in the way, and
+the logic it shells out for is already a library.
+
+**(c) Leave the CLI on the legacy file keychain.** Tempting and wrong: two
+stores means two answers to "is this credential readable", which is precisely
+the confusion being removed.
+
+**Recommendation: (b).** Treat `vrc` as a development tool that keeps working
+against the legacy store, and give the entitlement to the app alone. If a
+supported standalone CLI is wanted later, (a) remains available.
+
+## 6. Test harness
+
+Reworked to build real `.app` bundles with the profile at
+`Contents/embedded.provisionprofile` before signing, rather than bare
+executables. It now skips with a precise reason until a profile exists.
+
+---
+
+# Developer portal — exact steps
+
+Nothing below has been done. All of it is yours; none of it can be automated
+from here.
+
+### Step 1 — Register the App ID
+
+1. <https://developer.apple.com/account> → **Certificates, Identifiers &
+   Profiles** → **Identifiers** → **+**
+2. Select **App IDs** → **Continue** → type **App** → **Continue**
+3. **Description:** `Vacation Rental Calendar`
+4. **Bundle ID:** select **Explicit** and enter exactly
+   `com.vacationrentalcalendar.app`
+   *(Explicit, not wildcard — Keychain Sharing needs an explicit App ID.)*
+5. Under **Capabilities**, tick **Keychain Sharing**, then its **Edit**/
+   **Configure** button and add the group:
+   `com.vacationrentalcalendar.shared`
+   *(Without the `26JLFSV9YS.` prefix — the portal adds it.)*
+6. **Continue** → **Register**
+
+### Step 2 — Create the Developer ID provisioning profile
+
+1. **Profiles** → **+**
+2. Under **Distribution**, choose **Developer ID** → **Continue**
+3. **App ID:** `com.vacationrentalcalendar.app` → **Continue**
+4. **Certificate:** the Developer ID Application certificate for
+   `hitesh tara (26JLFSV9YS)` → **Continue**
+5. **Name:** `VRC Developer ID` → **Generate**
+6. **Download**
+
+### Step 3 — Put it where the scripts look
+
+```
+cp ~/Downloads/VRC_Developer_ID.provisionprofile \
+   Resources/Profiles/vrc-developer-id.provisionprofile
+```
+
+It is gitignored — a profile is team-specific and has no business in a public
+repository.
+
+### Step 4 — Tell me, and I will run tests A–F
+
+No live credential is involved: the probes use a service name that exists
+nowhere else in the product and delete what they write.
+
+### Not needed
+
+* No Mac App Store profile — that is a later, separate path.
+* No second App ID, **unless** you choose option (a) above and wrap the helper.
+* No notarization for the tests. It is needed before distributing, not before
+  testing the Keychain.
+
+---
+
+## Sources
+
+* [Signing a Mac Product For Distribution](https://developer.apple.com/forums/thread/128166) — restricted entitlements, profile placement, per-executable profiles, sign inside-out
+* [Creating Distribution-Signed Code for Mac](https://developer.apple.com/forums/thread/701514) — which entitlements are unrestricted, profile sealed by the signature, non-bundled executables need an app-like structure
+* [Signing a Daemon with a Restricted Entitlement](https://developer.apple.com/documentation/xcode/signing-a-daemon-with-a-restricted-entitlement) — the app-like structure technique
+* [Technical Note TN2415: Entitlements Troubleshooting](https://developer.apple.com/library/archive/technotes/tn2415/_index.html) — access group format `<prefix>.<identifier>`
