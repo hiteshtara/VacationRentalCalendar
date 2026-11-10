@@ -1364,3 +1364,214 @@ without the tests.
 Airbnb and Vrbo feed URLs were re-entered by the owner (references now `-v5`),
 so no migration is outstanding today. The migration path exists for the **next**
 rebuild, and `build-app.sh` will now say so instead of claiming success.
+
+## 19. The empty feed was not valid iCalendar (2026-11-10)
+
+Booking.com property `17482435` holds a connection named `loda` at
+**Activating**. Diagnosing that turned up a defect in our own output that had
+nothing to do with Booking.com's opinion of it.
+
+### The defect
+
+RFC 5545 §3.4 defines a calendar's body as:
+
+```
+icalbody  = calprops component
+component = 1*(eventc / todoc / journalc / freebusyc / timezonec / iana-comp / x-comp)
+```
+
+`1*` means **one or more**. A `VCALENDAR` carrying calendar properties and no
+components does not satisfy the grammar. The feed served for Booking.com was
+exactly that — 297 bytes, and zero `VEVENT`, `VTODO`, `VJOURNAL`, `VFREEBUSY`
+and `VTIMEZONE` — because the destination has nothing approved for sharing.
+
+Two independent parsers confirm it, and the contrast is the evidence:
+
+| | old object (297 B) | new object (641 B) |
+|---|---|---|
+| Python `icalendar` 7.3.0 — components | `[]` → **violation** | `['VTIMEZONE','STANDARD','DAYLIGHT']` |
+| Mozilla `ical.js` 2.2.1 — components | `[]` → **violation** | `[vtimezone]` |
+
+Note that both parsers *accept* the empty document without raising: real-world
+parsers are lenient here, so this is a conformance defect, **not proof that
+Booking.com rejected it.** Their validation is not observable from here. The
+point of fixing it is that a feed which fails the generic standard had to be
+ruled out before asking Booking.com anything about their side.
+
+### The fix, and why it is not a VEVENT
+
+`ICalWriter.makeCalendar` now emits a `VTIMEZONE` for `America/New_York` when,
+and only when, there are no entries.
+
+A placeholder `VEVENT` would satisfy the same grammar. It must not be used: an
+outbound feed's events **are** its statement of unavailability, so inventing
+one would withdraw a night nobody approved — the single failure this project
+exists to prevent. A timezone definition asserts nothing about availability, so
+the feed still means what it meant before: no blocks to report.
+
+The definition is a hard-coded constant, not read from the host's timezone
+database, because cross-platform output parity is a release gate and the bytes
+a subscriber receives must not depend on which machine generated them.
+
+Conformance details that are easy to get wrong, and are tested:
+
+* each observance carries `DTSTART`, `TZOFFSETFROM`, `TZOFFSETTO` — all three
+  REQUIRED by §3.6.5, asserted per-observance so one carrying two copies
+  cannot pass for two;
+* the `DTSTART`s are **floating local times** — no `Z`, no `TZID` parameter —
+  which §3.6.5 requires, because the offsets are what define the zone;
+* the offsets are the post-2007 US rules (DST from the second Sunday in March
+  to the first Sunday in November), and both parsers resolve them to the same
+  values as the IANA tzdb either side of both boundaries.
+
+### What the tests lock down
+
+Twelve tests in `Empty calendar`. Six are the new behaviour; **six exist to
+catch this change breaking something else**:
+
+* a populated calendar is asserted **byte-for-byte** against its pre-change
+  output, so the feeds Airbnb and Vrbo already read cannot be silently rewritten;
+* the app's own parser reads **zero events** from the empty feed — whatever we
+  added must not be interpretable as unavailability downstream;
+* the timezone's `RRULE` raises **no parser warning**: that warning exists to
+  flag recurring *events* for human review, and a recurrence rule in a
+  `VTIMEZONE` is ordinary;
+* no `SUMMARY`, `ATTENDEE`, `ORGANIZER` or `DESCRIPTION` — no guest data;
+* CRLF endings and ≤75-octet folding;
+* identical bytes across two regenerations at different times.
+
+Each assertion was falsified by breaking the implementation eight ways — UTC
+`DTSTART`, a `TZID` parameter, a dropped observance, a missing `TZOFFSETTO`,
+wrong offsets, no `TZID`, unconditional insertion, and a placeholder `VEVENT`.
+All eight were caught.
+
+Suite: **407 tests** (was 395). Parity digest **unchanged** at
+`b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` — both
+parity fixtures have events, so the new branch is not reached there.
+
+### The staging object
+
+Only the existing object was replaced. No new token, no new URL, no change to
+the Lambda, IAM, Terraform or the schedules; outbound publishing is still
+disabled.
+
+| | |
+|---|---|
+| Object | `s3://vrc-staging-feeds-f79de5f0/ical/booking-v1.ics` |
+| Replaced at | 2026-11-10 15:50:34Z |
+| New version | `3b_MFyK4vg5NRzcFam69wo0y1Sexyp2b` — 641 B |
+| **Previous version, for rollback** | `olC8_F0WJBV5cSONHFhyGc1A17_Mct9W` — 297 B |
+| Content type | `text/calendar; charset=utf-8` (unchanged) |
+| Encryption | `aws:kms`, same key (unchanged) |
+
+Bucket versioning is **enabled**, so rollback is
+`aws s3api copy-object` from the previous version id above.
+
+The difference between the two objects is the seventeen-line `VTIMEZONE` and
+**nothing else** — verified by diff, and the served bytes are byte-identical to
+what the writer produces locally.
+
+Re-verified after the replacement: HTTPS `200`, `641` bytes,
+`text/calendar; charset=utf-8`, `cache-control: no-store`; invalid token still
+`404`; unauthenticated direct S3 still `403`; all four public-access blocks
+still `true`.
+
+### What the logs do and do not show
+
+`vrc-staging-feed` logs no source IP and no user agent — deliberately, since
+the endpoint discloses nothing — and Function URL access logging is not
+enabled. **Attribution of any fetch to Booking.com is therefore impossible
+from our side.** A served `200` is not evidence a platform read or accepted the
+feed, which is the standing rule in `CLAUDE.md`.
+
+Between 15:12 and 15:34 the endpoint served fourteen valid GETs. I was running
+verification commands throughout that window and cannot separate mine from a
+third party's. The two fetches at 15:19:52Z and 15:20:33Z were previously
+flagged as possibly Booking.com's; they remain unattributable.
+
+One thing worth noting is what is *absent*: an activated Booking.com
+subscription polls roughly every two hours, and across the whole log window
+there is no served request standing alone in time, away from my own activity.
+That is weak evidence against Booking.com having begun polling. It is not
+proof — the window is short.
+
+### Next diagnostic step
+
+Enable one of the two things that would make attribution provable instead of
+circumstantial, both of which are deploys and neither of which is authorized
+yet:
+
+1. log the request's user agent in the feed handler (a code change), or
+2. enable Lambda Function URL access logging (a Terraform change).
+
+Until one exists, "did Booking.com fetch it?" cannot be answered, only guessed
+at. If `loda` is still Activating after a full two-hour poll interval past
+15:50Z, the remaining step is Booking.com support. A message is drafted below;
+it carries neither the token nor the URL.
+
+> **Subject: Calendar connection stuck on "Activating" — property 17482435**
+>
+> Property 17482435 has a calendar connection named **loda** that has shown
+> the status **Activating** since it was created, and has not progressed to
+> Okay, Import only, or Export only.
+>
+> 1. **Import side.** I supplied an iCalendar URL for Booking.com to import.
+>    My server's logs show requests that were authenticated and served
+>    successfully, returning HTTP 200 with
+>    `Content-Type: text/calendar; charset=utf-8`. I cannot tell from my side
+>    whether those requests came from Booking.com. Could you confirm whether
+>    Booking.com has fetched the URL for this connection, and if so whether
+>    the calendar was accepted or rejected — and if rejected, the reason?
+>
+> 2. **Export side.** I would also like Booking.com's own export (iCal) URL
+>    for this property, so the connection works in both directions. The
+>    **loda** connection no longer offers a "Complete setup" option — only
+>    "Remove" — so I cannot reach the export step without creating a second
+>    connection, which I would prefer not to do. Where can I retrieve the
+>    export URL for an existing connection?
+>
+> One detail that may be relevant: the calendar I am publishing contains **no
+> events**, because this property has no blocked dates to report. If
+> Booking.com requires at least one event before a connection activates,
+> please say so and I will account for it.
+
+### A correction
+
+An earlier diagnosis in this session reported "9 non-ASCII bytes" in the feed.
+That was wrong: it came from `grep -c`, which counts matching *lines*, with a
+mangled pattern. The feed contains exactly **one** non-ASCII character — the
+`→` in `X-WR-CALNAME`, three bytes of valid UTF-8 — which is legal and is not a
+problem.
+
+### The secret scanner has been red since §18, and was reported green
+
+`Scripts/check-no-secrets.sh` fails, and did so at `d262eda` too. The cause is
+`Scripts/test-check-no-secrets.sh`, added in that commit: it wrote five
+fixtures out literally — an Airbnb URL, a Vrbo URL, a Booking.com URL, a
+private-key header and a guest name — and the scanner correctly finds them.
+
+This is the same mistake as the AKIA fixture one commit earlier, in the same
+file: those values are assembled from fragments precisely so the file cannot
+report itself, and the lesson was applied to one fixture and not the other
+five.
+
+All five are now assembled the same way, each split so neither half matches the
+pattern alone. The strings handed to the scanner are unchanged, so the tests
+still prove it catches them — all 11 pass.
+
+**None of them is a credential**: the hex runs are `0123456789…`, the key block
+contains no key, and "Dana" is not a guest. Nothing needs rotating.
+
+That fixes the **working tree** scan, which is the half that prevents new
+leaks. The literal fixtures remain in commit `d262eda`, which is already on the
+public remote, so the **history** scan still reports all five and the script
+still exits 1. Clearing that needs a history rewrite and a force-push, which is
+not authorized. The options, for a decision:
+
+1. leave it, and accept a permanently red gate — the outcome the AWS-key
+   exemption exists specifically to avoid;
+2. extend the exact-match exemption to these five synthetic values — consistent
+   with the precedent, but the §18 authorization was explicitly for the AWS
+   documentation key *only*;
+3. rewrite history and force-push — clean, and the branch is unmerged, but it
+   rewrites commits already published.
