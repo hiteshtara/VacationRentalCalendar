@@ -39,6 +39,17 @@ public enum FeedRefreshEligibility: Sendable, Equatable {
         }
     }
 
+    /// Whether a listing's property permits importing at all.
+    ///
+    /// Split out so `ImportService` and this type cannot drift: the import
+    /// path needs exactly this question and nothing else, and asking it
+    /// through here means there is one definition of "out of service" rather
+    /// than two that have to be kept in step by hand.
+    public static func propertyStatus(_ property: Property?) -> FeedRefreshEligibility {
+        guard let property, !property.isArchived else { return .propertyArchived }
+        return .runnable
+    }
+
     /// The order of these checks decides only which reason is reported; the
     /// answer is no in every case. Archived comes first because it is the
     /// thing the owner changed most recently.
@@ -47,7 +58,7 @@ public enum FeedRefreshEligibility: Sendable, Equatable {
         property: Property?,
         hasStoredCredential: Bool
     ) -> FeedRefreshEligibility {
-        guard let property, !property.isArchived else { return .propertyArchived }
+        guard propertyStatus(property).canRun else { return .propertyArchived }
         guard listing.connectionState.shouldAttemptImport else {
             return .notConnected(listing.connectionState)
         }

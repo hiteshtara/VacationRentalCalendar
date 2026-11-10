@@ -2375,3 +2375,95 @@ can go stale while waiting.
 * The two publication UIDs live on `availability_decisions.publication_uid`,
   not in `feed_publications`, which is empty. An earlier count of "0 UIDs" was
   a query against the wrong table.
+
+## 28. Imports now refuse what is out of service (2026-11-10)
+
+### The gap §27 left open
+
+`FeedRefreshQueue` re-checked a **queued** feed when its turn came, but that
+only protected requests travelling through the queue. A "Refresh all" pass
+walked the listing list it had captured when the pass began and handed every
+one of those listings to `importFeed`, so a property archived during the pass
+still had its calendars fetched. The per-feed path had the same hole from the
+other direction: the queue carries a `PlatformListing` **value**, captured when
+the owner clicked, so a request made before archiving could be honoured after
+it.
+
+### Where the check went, and why there
+
+Into `ImportService.importFeed`, as the first thing it does — before the
+connection-state check, before the credential is resolved, before anything is
+fetched.
+
+That is the single door every import in the system goes through: the app's
+per-feed refresh, the queue drain, the bulk pass, and the `vrc` CLI all end up
+here. `ImportService` is constructed in exactly one place
+(`RentalStore.makeImportService`), so adding `PropertyRepository` to it reaches
+every caller at once and leaves no path that can forget to ask. Putting the
+rule in the callers instead would have meant the same decision written three
+times, with the bulk pass and the queue drain free to drift apart.
+
+It also closes the race that a caller cannot. The property is read from the
+database **at the moment of the import**, not at the moment of the request, so
+a stale listing value cannot get an archived property imported.
+
+The rule itself is `FeedRefreshEligibility.propertyStatus`, shared with the
+queue's own check, so there is one definition of "out of service" rather than
+two kept in step by hand.
+
+### The audit trail, and the thing that must never happen
+
+A refusal writes an explicit `.skipped` run with a plain reason — "The property
+is archived." — plus a `recordSync` summary, so the history shows the refusal
+rather than an unexplained gap. That is the lesson of §27: a silent gap is what
+made the dead Refresh button so hard to find.
+
+**A refusal withdraws nothing.** The check returns before any reconciliation,
+so `eventsTombstoned` is 0, `eventsSeen` is 0, no observation is tombstoned and
+no classification is touched. Four tests assert this directly, including the
+worst case — archiving *every* property in the portfolio, which must not read
+as "every feed is now empty". This is the same failure mode as the
+unconditional `tombstoneMissing` of §23, and it is the one that costs real
+money: a night left on sale by mistake is recoverable, a night silently
+withdrawn is lost revenue nobody notices.
+
+Unarchiving restores importing with nothing to re-enter: the refusal reflects
+current state and is not a latch.
+
+### What the queue now defers
+
+`takeNextQueuedListing` refuses only a listing that **no longer exists** — a
+property delete cascades to its listings, so a queued id can outlive its row,
+and there is nothing left to import or even to record a run against. Everything
+else goes to `ImportService`, archived and disconnected feeds included, so that
+every refusal reaches the history through one path. Refusing them in the queue
+as well would be the same decision taken twice in two places, with only one of
+them leaving a trace.
+
+The bulk pass likewise still offers every listing and now reports "N skipped"
+in its summary line.
+
+### Verified
+
+* **557 tests**, 1824 assertions. Ten new in `Archived import`: a recorded skip
+  for an archived property; nothing withdrawn; unarchiving restores importing;
+  a property archived *after* the listing value was captured still refused;
+  disconnected and unconfigured feeds refused, recorded, withdrawing nothing;
+  Refresh all across two properties importing one and skipping the other; and
+  archiving the whole portfolio withdrawing nothing at all.
+* **Parity identical on both platforms**, `b3398471…c604f5`, unchanged — the
+  cloud handlers do not use `ImportService`, so no business-rule output moved.
+* **Secret scanner clean**, with its five baselined historical findings.
+
+One test was corrected rather than kept: the "orphaned listing" case asserted a
+state the schema makes impossible. `platform_listings.property_id` is
+`REFERENCES properties(id) ON DELETE CASCADE`, so the insert is refused and a
+delete takes the listings with it. The test now asserts that guarantee, and
+says why the defensive `property == nil` branch still exists.
+
+### Not done
+
+No rebuild, no reinstall — the running application is still `f74bbb7`, with
+neither §27's queue nor this check. No credential read or migrated, no Keychain
+change, no availability change, no AWS deployment; outbound publishing and both
+schedules remain disabled.

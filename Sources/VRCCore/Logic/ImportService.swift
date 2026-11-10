@@ -35,6 +35,7 @@ public struct ImportService: Sendable {
     let events: EventRepository
     let classifications: ClassificationRepository
     let listings: ListingRepository
+    let properties: PropertyRepository
     let syncRuns: SyncRunRepository
     let fetcher: FeedFetching
     let classifier: BlockClassifier
@@ -43,6 +44,7 @@ public struct ImportService: Sendable {
         events: EventRepository,
         classifications: ClassificationRepository,
         listings: ListingRepository,
+        properties: PropertyRepository,
         syncRuns: SyncRunRepository,
         fetcher: FeedFetching,
         classifier: BlockClassifier = BlockClassifier()
@@ -50,6 +52,7 @@ public struct ImportService: Sendable {
         self.events = events
         self.classifications = classifications
         self.listings = listings
+        self.properties = properties
         self.syncRuns = syncRuns
         self.fetcher = fetcher
         self.classifier = classifier
@@ -65,6 +68,44 @@ public struct ImportService: Sendable {
         }
 
         var run = SyncRun(listingID: listingID, startedAt: now)
+
+        // A property the owner has archived is out of service: its calendars
+        // are not fetched, and nothing already observed for them is withdrawn.
+        //
+        // Checked HERE rather than in the caller, deliberately. Every import in
+        // the system comes through this function — the per-feed refresh, the
+        // queue drain, the "Refresh all" pass and the `vrc` CLI — so this is
+        // the only place the rule cannot be bypassed or forgotten. It also
+        // closes a race the caller cannot: a bulk pass walks the listing list
+        // it captured when the pass began, and a queued request carries a
+        // listing value captured when it was clicked, so both can arrive after
+        // the property was archived. The database is consulted at the moment of
+        // the import, not at the moment of the request.
+        //
+        // Read with an explicit do/catch rather than `try?`: this returns an
+        // optional, and `try?` would wrap it in a second one, which is exactly
+        // how the doctor once reported dangling references as readable.
+        let property: Property?
+        do {
+            property = try properties.find(id: listing.propertyID)
+        } catch {
+            // Could not establish what this listing belongs to. Refusing is the
+            // safe direction — an import that cannot be justified must not
+            // withdraw anything.
+            property = nil
+        }
+        if !FeedRefreshEligibility.propertyStatus(property).canRun {
+            run.outcome = .skipped
+            run.finishedAt = Date()
+            run.errorMessage = property == nil
+                ? "The property for this listing could not be found."
+                : "The property is archived."
+            try? syncRuns.record(run)
+            try? listings.recordSync(
+                listingID: listingID, at: now, summary: run.summaryLine
+            )
+            return ImportReport(run: run)
+        }
 
         // A revoked credential is never retried. The platform has already
         // given its answer, and repeating the request only fills the history

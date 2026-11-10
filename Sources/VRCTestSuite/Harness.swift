@@ -119,6 +119,7 @@ public enum TestRegistry {
             + FeedEndpointTests.cases
             + SigningTests.cases
             + RefreshQueueTests.cases
+            + ArchivedPropertyImportTests.cases
             + PostgresIntegrationTests.cases
             + DecisionRouteTests.cases
             + CloudSyncClientTests.cases

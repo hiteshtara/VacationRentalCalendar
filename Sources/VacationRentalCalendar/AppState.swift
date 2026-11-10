@@ -524,17 +524,28 @@ final class AppState: ObservableObject {
             ? listings.filter(\.autoRefreshEnabled)
             : listings
 
-        var seen = 0, created = 0, changed = 0, review = 0
+        var seen = 0, created = 0, changed = 0, review = 0, skipped = 0
         var failures: [String] = []
 
         for listing in targets {
+            // Every listing is offered, including ones belonging to an archived
+            // property or with no URL. `importFeed` re-reads the property and
+            // refuses them itself, writing an explicit skipped run — so the
+            // pass cannot import something out of service, and the history
+            // shows the refusal rather than a silent gap. Filtering them out
+            // here instead would import nothing and record nothing.
             let report = await service.importFeed(for: listing)
             seen += report.run.eventsSeen
             created += report.run.eventsInserted
             changed += report.run.eventsUpdated
             review += report.run.eventsNeedingReview
-            if report.run.outcome == .failure {
+            switch report.run.outcome {
+            case .failure:
                 failures.append("\(listing.label): \(report.run.errorMessage ?? "failed")")
+            case .skipped, .disconnected:
+                skipped += 1
+            case .success:
+                break
             }
         }
 
@@ -545,6 +556,7 @@ final class AppState: ObservableObject {
         if created > 0 { parts.append("\(created) new") }
         if changed > 0 { parts.append("\(changed) changed") }
         if review > 0 { parts.append("\(review) need review") }
+        if skipped > 0 { parts.append("\(skipped) skipped") }
         statusMessage = parts.joined(separator: " · ")
         lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
@@ -581,44 +593,35 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Promotes the next queued feed that is still worth importing.
+    /// Promotes the next queued feed.
     ///
-    /// A feed can wait here for as long as the imports ahead of it take, and
-    /// the owner can archive a property or disconnect a feed in that time. Its
-    /// eligibility is therefore re-checked at the moment its turn comes rather
-    /// than when it was clicked, and a refusal is reported instead of being
-    /// run anyway or dropped in silence.
+    /// The only thing refused here is a listing that no longer exists — a
+    /// property delete cascades to its listings, so a queued id can outlive
+    /// its row, and there is nothing to import or even to record a run
+    /// against. Everything else is handed to `ImportService`, including a feed
+    /// whose property was archived or whose connection was dropped while it
+    /// waited. That is deliberate: the import path refuses those itself and
+    /// writes an explicit skipped run, so the refusal reaches the history
+    /// instead of disappearing inside the queue. Refusing them here as well
+    /// would be the same decision taken twice, in two places, with only one of
+    /// them leaving a trace.
     private func takeNextQueuedListing() -> PlatformListing? {
-        var refusals: [String] = []
+        var vanished: [Int64] = []
         let nextID = refreshQueue.nextRunnable(
-            isRunnable: { [weak self] id in
-                guard let self else { return false }
-                return self.eligibility(ofListingID: id).canRun
-            },
-            onSkip: { [weak self] id in
-                guard let self, let listing = self.listing(id: id) else { return }
-                refusals.append(
-                    "\(listing.label): \(self.eligibility(ofListingID: id).explanation)")
-            }
+            isRunnable: { [weak self] id in self?.listing(id: id) != nil },
+            onSkip: { id in vanished.append(id) }
         )
-        if !refusals.isEmpty { statusMessage = refusals.joined(separator: " · ") }
+        if !vanished.isEmpty {
+            statusMessage = vanished.count == 1
+                ? "A queued calendar was removed before its turn."
+                : "\(vanished.count) queued calendars were removed before their turn."
+        }
         guard let nextID else { return nil }
         return listing(id: nextID)
     }
 
     private func listing(id: Int64) -> PlatformListing? {
         listings.first { $0.id == id }
-    }
-
-    /// Whether a queued feed is still worth importing. A listing that has gone
-    /// away entirely is refused, so a stale id cannot wedge the queue.
-    private func eligibility(ofListingID id: Int64) -> FeedRefreshEligibility {
-        guard let listing = listing(id: id) else { return .propertyArchived }
-        return FeedRefreshEligibility.of(
-            listing: listing,
-            property: properties.first { $0.id == listing.propertyID },
-            hasStoredCredential: hasStoredCredential(for: listing)
-        )
     }
 
     private func drainRefreshQueue() async {

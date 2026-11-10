@@ -371,10 +371,16 @@ public enum RefreshQueueTests {
         // MARK: - Requirement 8: stale work is not run
 
         TestCase(group: "RefreshQueue",
-                 name: "a feed archived while it waited is skipped, and the next one runs") { expect in
+                 name: "a feed removed while it waited is skipped, and the next one runs") { expect in
+            // What the app refuses at this level is a listing that no longer
+            // exists: a property delete cascades to its listings, so a queued
+            // id can outlive its row and there is nothing left to import or to
+            // record a run against. A feed whose property was merely ARCHIVED
+            // still goes to `ImportService`, which refuses it and writes an
+            // explicit skipped run — see the Archived import group.
             var queue = FeedRefreshQueue()
             _ = queue.request(listingID: 1)
-            _ = queue.request(listingID: 2)   // archived while waiting
+            _ = queue.request(listingID: 2)   // its listing goes away while waiting
             _ = queue.request(listingID: 3)
             let result = drain(&queue, startingWith: 1, runnable: { $0 != 2 })
             expect.equal(result.ran, [1, 3], "2 was not imported")
@@ -586,9 +592,10 @@ public enum RefreshQueueTests {
 
         TestCase(group: "RefreshQueue multi-property",
                  name: "a mixed property imports its configured feeds and skips the rest") { expect in
-            // Requirement 7's point: Test Cottage has no URLs at all, and
-            // 39 G Street has three. A queue holding both must import three
-            // and skip three, not stall on the first unconfigured one.
+            // Test Cottage has no URLs at all, and 39 G Street has three.
+            // This exercises the shared rule directly; in the running app the
+            // same verdict is reached inside `ImportService`, which also
+            // writes the skipped run that keeps the refusal in the history.
             let properties: [Int64: Property] = [1: property(1), 2: property(2)]
             let listings: [Int64: PlatformListing] = [
                 1: listing(1, property: 1, platform: .vrbo, state: .connected),
@@ -619,7 +626,9 @@ public enum RefreshQueueTests {
 
         TestCase(group: "RefreshQueue multi-property",
                  name: "archiving a property mid-queue skips only its feeds") { expect in
-            // The owner archives Test Cottage while all six are queued.
+            // The owner archives Test Cottage while all six are queued. The
+            // rule is asserted here; the recorded skip it produces in the app
+            // is asserted in the Archived import group.
             let properties: [Int64: Property] = [
                 1: property(1), 2: property(2, archived: true),
             ]

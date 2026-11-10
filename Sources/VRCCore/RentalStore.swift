@@ -170,6 +170,7 @@ public final class RentalStore: @unchecked Sendable {
             events: events,
             classifications: classifications,
             listings: listings,
+            properties: properties,
             syncRuns: syncRuns,
             fetcher: fetcher,
             classifier: classifier
