@@ -18,6 +18,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 SCANNER="$(pwd)/Scripts/check-no-secrets.sh"
+DIGEST() { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}'; }
 
 pass=0; fail=0
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$*"; pass=$((pass+1)); }
@@ -71,6 +72,45 @@ verdict() {
     rm -rf "${tmp}"
 }
 
+# Builds a repo where `content` exists ONLY in history: committed, then
+# deleted and committed again. That is the shape the real baseline addresses —
+# a value that reached a public commit and is no longer in the tree.
+# `baselined` is the EXACT MATCHED SUBSTRING to accept, not the whole line:
+# the scanner hashes what the pattern matched, so `vrbo.com/icalendar/<id>`
+# rather than the full URL including its scheme. Getting that wrong is how
+# these tests first failed, and it is worth knowing because the same mistake
+# would silently produce a baseline entry that never matches anything.
+verdict_history_only() {
+    local content="$1" baselined="${2:-}" tmp hash
+    tmp="$(mktemp -d)"
+    mkdir -p "${tmp}/Scripts"
+    cp "${SCANNER}" "${tmp}/Scripts/check-no-secrets.sh"
+    if [ -n "${baselined}" ]; then
+        hash="$(printf '%s' "${baselined}" | DIGEST)"
+        printf '# test baseline\n%s  # under test\n' "${hash}" \
+            > "${tmp}/Scripts/secret-history-baseline.txt"
+    fi
+    (
+        cd "${tmp}" || exit 99
+        git init -q . 2>/dev/null
+        git config user.email t@t; git config user.name t
+        printf '%s\n' "${content}" > sample.txt
+        git add -A 2>/dev/null; git commit -qm "fixture" 2>/dev/null
+        rm -f sample.txt
+        git add -A 2>/dev/null; git commit -qm "removed" 2>/dev/null
+        ./Scripts/check-no-secrets.sh >/dev/null 2>&1
+        echo $?
+    )
+    rm -rf "${tmp}"
+}
+
+expect_history() {
+    local label="$1" content="$2" baselined="$3" want="$4"
+    local got; got="$(verdict_history_only "${content}" "${baselined}" | tail -1)"
+    if [ "${got}" = "${want}" ]; then ok "${label}"
+    else bad "${label} — scanner exited ${got}, expected ${want}"; fi
+}
+
 expect() {
     local label="$1" content="$2" want="$3"
     local got; got="$(verdict "${content}" | tail -1)"
@@ -118,6 +158,27 @@ expect "guest data is still rejected" \
 
 # 7. And a file with nothing sensitive is clean, so the suite can fail.
 expect "ordinary content is clean" "let greeting = \"hello\"" 0
+
+# 8. The historical baseline. It accepts known values BY EXACT VALUE and must
+#    not become a blanket amnesty for the shape, the file, or the pattern.
+printf '\n\033[1m==> Historical baseline\033[0m\n'
+
+expect_history "an un-baselined historical finding still fails" \
+       "${FAKE_VRBO_URL}" "" 1
+VRBO_MATCH="$(printf '%s%s' 'vrbo.com/icalendar/' '0123456789abcdef01234567')"
+expect_history "a baselined historical finding is accepted" \
+       "${FAKE_VRBO_URL}" "${VRBO_MATCH}" 0
+
+# The whole point: a baseline for one value must not excuse another of the
+# same shape. If this ever passes, the baseline has become a pattern hole.
+VRBO_OTHER="$(printf '%s%s' 'https://www.vrbo.com/icalendar/' 'fedcba9876543210fedcba98')"
+expect_history "a DIFFERENT value of a baselined shape still fails" \
+       "${VRBO_OTHER}" "${VRBO_MATCH}" 1
+
+# And the baseline is history-only. A value that is still in the working tree
+# is a live leak, not a historical one, however well known it is.
+expect "a baselined value sitting in the working tree is still rejected" \
+       "${FAKE_VRBO_URL}" 1
 
 printf '\n  === %s passed, %s failed ===\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]
