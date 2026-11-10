@@ -2467,3 +2467,129 @@ No rebuild, no reinstall — the running application is still `f74bbb7`, with
 neither §27's queue nor this check. No credential read or migrated, no Keychain
 change, no availability change, no AWS deployment; outbound publishing and both
 schedules remain disabled.
+
+## 29. A backup disconnected two calendars (2026-11-10)
+
+### What happened
+
+23:02:51 — `Scripts/backup-before-install.sh` ran, ahead of an approved
+installation. Its step 3 asked whether six credentials were readable, and the
+shared helper answered that question the "supported" way: by launching
+`/Applications/VacationRentalCalendar.app/Contents/MacOS/VacationRentalCalendar
+--credential-health`, which reads every credential **value** in process.
+Reading a value requires Keychain authorization.
+
+23:05:17 — the running app's hourly auto-refresh fired, mid-backup. Two code
+objects now wanted authorization for the same items in the same second:
+
+| run | listing | outcome | detail |
+|---|---|---|---|
+| 291 | 2 airbnb | disconnected | Keychain read failed (OSStatus **−128**) |
+| 292 | 3 booking_com | **success, HTTP 200, 2 events** | — |
+| 293 | 1 vrbo | disconnected | Keychain read failed (OSStatus **−128**) |
+
+`ImportService` filed −128 under "this credential cannot be read" and latched
+`credentialUnreadable`, which `shouldAttemptImport` refuses. **Airbnb and Vrbo
+stopped importing permanently because of a condition that lasted one second.**
+Booking.com, read at the same instant, returned HTTP 200 — which is the proof
+that nothing was wrong with the Keychain or with any credential.
+
+A backup — an operation whose whole purpose is to be safe to run — broke two
+live calendars.
+
+### Two defects, and the same old shape
+
+**−128 was treated as a verdict.** `errSecUserCanceled` is returned both when
+a person dismisses the dialog and when macOS cannot present one, and the
+Security framework offers nothing to tell those apart. It is a statement about
+the moment, not about the stored value. The import path asked only "was it a
+timeout?", so every other transient failure fell through to "dead credential".
+That is the four-second deadline of §23 one layer over: **a transient condition
+recorded as a settled fact.**
+
+**A health check read secrets.** The helper's own header claimed "Nothing here
+reads a secret value", and that was false whenever the app was installed.
+
+### The fixes
+
+[`KeychainFailure`](Sources/VRCCore/Platform/KeychainFailure.swift) classifies
+every status code in one place:
+
+| code | classification | retryable |
+|---|---|---|
+| −128 `errSecUserCanceled` | `authorizationCancelled` | **yes** |
+| −25308 / −25315 interaction unavailable | `interactionUnavailable` | **yes** |
+| −25293 `errSecAuthFailed` | `accessDenied` | no — re-enter the URL |
+| −25300 not found | `itemNotFound` | no |
+| anything else | `other` | no, conservatively |
+
+An unrecognised code stays non-retryable on purpose: it might be one where the
+read blocks, and a blocked read poisons every later Keychain call in the
+process. Only the cases argued for are relaxed. The codes are spelled
+numerically rather than via `errSec*` so the type compiles on Linux and the
+parity build sees the same rules.
+
+`ImportService` now asks `FeedCredentialError.isRetryableCredentialFailure`
+instead of "was it a timeout?", so a retryable failure leaves the feed
+`failing` — which is still fetched — and only a settled refusal becomes
+`credentialUnreadable`.
+
+On the distinction the brief asked for: where the platform is ambiguous this
+code says so rather than guessing. `isSettledRefusal` is deliberately **not**
+the inverse of `isRetryable`; −128 is neither retried-as-fine nor presented to
+the owner as a verdict.
+
+[`AuthorizationCooloffFeedCredentialStore`](Sources/VRCCore/Platform/AuthorizationCooloffFeedCredentialStore.swift)
+answers the obvious follow-on risk: retryable must not mean "ask again
+immediately", or one dismissed dialog becomes a dialog per feed per pass, every
+hour. After an authorization-related failure it holds off on that one reference
+for ten minutes — a fixed window, not a growing backoff, whose only job is to
+collapse a burst into one. It is outermost in the store chain so a suppressed
+read returns without even entering the deadline machinery. Presence checks are
+never held off, because they read attributes and cannot prompt. A settled
+refusal is passed straight through, since delaying it only postpones the
+message the owner needs. An explicit refresh clears it — a prompt is tolerable
+when the owner just asked for one and is not tolerable on a timer.
+
+`Scripts/credential-health.sh` was rewritten to four absolute rules: never
+execute the app or the helper, never pass `-w` to `security`, only ever ask
+whether an item exists, and never substitute a weaker check silently. Its
+vocabulary changed from `readable` to **`present`** accordingly — presence is
+all attributes can prove. Where the installed build would use the data
+protection Keychain, which no command-line tool can inspect, it reports
+**`unverified`** and says so in the manifest. An unverifiable answer beats a
+confident wrong one: reporting six live credentials as absent looks like data
+loss, and reporting them readable by reading them is the bug itself.
+
+`Scripts/build-app.sh` now refuses its post-install readability probe while the
+app is running, for the same reason.
+
+### The test that would have caught it
+
+[`Scripts/test-credential-health.sh`](Scripts/test-credential-health.sh) is not
+a grep. It points the scripts at a **decoy** bundle whose executable records
+that it ran, takes a real backup against a throwaway copy of the database, and
+asserts the decoy was never executed, that no connection state changed, that
+every reference was still recorded, and that no feed URL reached the backup.
+Verified to fail against the old helper: asked for one credential's status, the
+old code executed `--credential-health`; the new code executes nothing.
+
+### Verified
+
+* **574 Swift tests**, 1869 assertions (17 new in `Keychain cancellation`).
+* Shell suites: credential-health 13/13, backup-restore 10/10, scanner 15/15,
+  migrate-credentials 14/14, profile-inspector 7/7.
+* Parity `b3398471…c604f5`, identical on macOS and Linux, unchanged.
+* Secret scanner clean, five baselined historical findings.
+
+### Still broken, and deliberately not touched
+
+**Listings 1 (vrbo) and 2 (airbnb) remain `credential_unreadable` in the live
+database.** The code fix prevents the latch forming again; it does not undo one
+already written. Recovery is proposed in the report and awaits separate
+approval. The database was not restored and no connection history was
+overwritten — the verified 23:02:51 backup, taken before the damage, is kept
+as it is.
+
+Nothing was installed. The running application is still `f74bbb7`, which
+contains neither this fix nor §27's queue nor §28's out-of-service check.

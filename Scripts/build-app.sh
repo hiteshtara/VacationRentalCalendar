@@ -207,6 +207,20 @@ if [ "${INSTALL}" = true ]; then
     # status is not evidence: it reflects the last fetch, which may predate
     # this install. Only an actual read proves anything.
     step "Verifying credential readability (not stored status)"
+    # This probe READS credential values, which requests Keychain
+    # authorization. Doing that beside a running copy of the app is what broke
+    # two live calendars on 2026-11-10: both processes asked for authorization
+    # on the same items, the running app's read was cancelled (-128), and its
+    # import latched credentialUnreadable. So refuse to probe while the app is
+    # running rather than racing it.
+    if pgrep -f "/Applications/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
+        echo "  SKIPPED: ${APP_NAME} is running."
+        echo "  Reading credentials beside a running copy makes both ask for"
+        echo "  Keychain authorization at once, and a cancelled prompt is what"
+        echo "  disconnected two calendars on 2026-11-10. Quit the app and"
+        echo "  re-run if you need this check."
+        KEYCHAIN_NEEDS_MIGRATION=0
+    else
     # `vrc doctor`, not `vrc keychain` — there has never been a `keychain`
     # subcommand. The old call failed silently, grep counted zero, and this
     # reported "all stored credentials are readable" after every install,
@@ -227,6 +241,7 @@ if [ "${INSTALL}" = true ]; then
     else
         echo "  all stored credentials are readable by this build"
         KEYCHAIN_NEEDS_MIGRATION=0
+    fi
     fi
 
     # A rebuilt helper has a new code hash, so it can no longer read the AWS

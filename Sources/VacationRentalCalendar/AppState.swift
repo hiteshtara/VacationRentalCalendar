@@ -563,6 +563,12 @@ final class AppState: ObservableObject {
 
     func refresh(listing: PlatformListing) async {
         guard let store, let listingID = listing.id else { return }
+        // An explicit click is the one moment a Keychain dialog is reasonable,
+        // so clear any hold-off left by an automatic refresh that had its
+        // authorization cancelled. Touches no credential value or reference.
+        if !listing.credentialRef.isEmpty {
+            store.allowCredentialRetry(reference: listing.credentialRef)
+        }
         let outcome = refreshQueue.request(listingID: listingID)
         // Every outcome is reported, including the two that start nothing. A
         // click that produces no visible answer is indistinguishable from the

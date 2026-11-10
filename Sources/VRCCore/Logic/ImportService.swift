@@ -127,17 +127,24 @@ public struct ImportService: Sendable {
         // for a refresh; it is not tolerable while drawing a calendar.
         var feedURL = ""
         var resolveError: String?
-        // A TIMEOUT is not a broken credential. It says the Keychain was slow
-        // at this moment and nothing at all about the stored value, so it must
-        // stay retryable. Treating the two alike meant any busy machine could
-        // permanently disconnect every calendar: on 2026-11-10 it silenced
-        // three working feeds for an hour and a real Airbnb reservation went
-        // unimported, while `vrc doctor` read all three credentials fine.
-        var resolveTimedOut = false
+        // A TRANSIENT Keychain failure is not a broken credential, and the
+        // difference decides whether this feed is ever read again:
+        // `credentialUnreadable` is never retried.
+        //
+        // This was asked inline as "was it a timeout?", which silently filed
+        // every OTHER transient failure as a dead credential. On 2026-11-10 a
+        // cancelled authorization — OSStatus -128, lasting one second, while a
+        // third feed read fine in the same instant — permanently disconnected
+        // Airbnb and Vrbo. The question is now answered in one place, by
+        // `FeedCredentialError.isRetryableCredentialFailure`, over a
+        // classification of the actual status code.
+        var resolveIsRetryable = false
+        var resolveSummary: String?
         do {
             feedURL = try listings.resolveURL(for: listing)
         } catch let error as FeedCredentialError {
-            if case .timedOut = error { resolveTimedOut = true }
+            resolveIsRetryable = error.isRetryableCredentialFailure
+            resolveSummary = error.shortSummary
             resolveError = error.errorDescription ?? "\(error)"
         } catch {
             resolveError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -146,22 +153,23 @@ public struct ImportService: Sendable {
         guard !feedURL.isEmpty else {
             run.finishedAt = Date()
             if let resolveError {
-                // The read did not merely fail, it blocked — which means the
-                // item's access list names an earlier build. Recorded so no
-                // further attempt is made, because each one holds the keychain
-                // for the rest of the process.
-                run.outcome = resolveTimedOut ? .failure : .disconnected
+                // Retryable failures are recorded as a failure and left
+                // `failing`, which `shouldAttemptImport` still allows. Only a
+                // settled refusal — an access list naming another build —
+                // becomes `credentialUnreadable`, which is never retried,
+                // because there each attempt holds the Keychain for the rest
+                // of the process and cannot succeed anyway.
+                run.outcome = resolveIsRetryable ? .failure : .disconnected
                 run.errorMessage = resolveError
                 try? listings.setConnectionState(
                     listingID: listingID,
-                    to: resolveTimedOut ? .failing : .credentialUnreadable,
+                    to: resolveIsRetryable ? .failing : .credentialUnreadable,
                     detail: resolveError, actor: "import", at: now
                 )
                 try? listings.recordSync(
                     listingID: listingID, at: now,
-                    summary: resolveTimedOut
-                        ? "The Keychain did not answer in time — will try again"
-                        : "Enter this listing's URL again — the saved one cannot be read"
+                    summary: resolveSummary
+                        ?? "Enter this listing's URL again — the saved one cannot be read"
                 )
             } else {
                 run.outcome = .skipped

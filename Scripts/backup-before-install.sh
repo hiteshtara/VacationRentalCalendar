@@ -95,16 +95,20 @@ take_backup() {
     sqlite3 "${DB}" "SELECT platform||'  '||credential_ref FROM platform_listings
                      WHERE credential_ref <> '' ORDER BY platform;" 2>/dev/null \
         >> "${dir}/credential-references.txt"
+    # Presence only, from item ATTRIBUTES. Nothing here executes the app and
+    # nothing reads a value: reading a value requires Keychain authorization,
+    # and on 2026-11-10 a backup that did exactly that — by launching the app
+    # beside a running copy — latched two live calendars into
+    # credentialUnreadable. A backup must be safe to run at any moment.
+    printf '# %s\n' "$(credential_health_caveat)" > "${dir}/keychain-presence.txt"
     while read -r ref; do
         [ -z "${ref}" ] && continue
-        # Asked through the signed app where one is installed, because
-        # /usr/bin/security cannot see data protection Keychain items at all.
-        # No secret is read either way.
         printf '%-15s %s\n' "$(credential_status "${ref}")" "${ref}" \
             >> "${dir}/keychain-presence.txt"
     done < <(sqlite3 "${DB}" "SELECT credential_ref FROM platform_listings WHERE credential_ref <> '';" 2>/dev/null)
     ok "$(wc -l < "${dir}/credential-references.txt" | tr -d ' ') reference(s) recorded, no values"
-    say "  health source: $(credential_health_source)"
+    say "  presence source: $(credential_health_source)"
+    say "  $(credential_health_caveat)"
 
     step "4. Manifest"
     {
@@ -112,6 +116,8 @@ take_backup() {
         printf 'git_commit=%s\n' "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
         printf 'git_branch=%s\n' "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
         printf 'source_db=%s\n' "${DB}"
+        printf 'credential_presence_source=%s\n' "$(credential_health_source)"
+        printf 'credential_presence_caveat=%s\n' "$(credential_health_caveat)"
         counts_of "${dir}/VacationRentalCalendar.sqlite"
     } > "${dir}/MANIFEST.txt"
     ok "manifest written"

@@ -137,16 +137,22 @@ public final class RentalStore: @unchecked Sendable {
     /// Both paths keep the deadline wrapper. The data protection Keychain does
     /// not prompt, so it should rarely fire, but an unbounded system call is
     /// not something to introduce on the assumption it is now unnecessary.
+    /// The hold-off wrapper is outermost so a suppressed read returns at once,
+    /// without even entering the deadline machinery. Making a cancelled
+    /// authorization retryable without it would turn one dismissed dialog into
+    /// a dialog per feed per refresh pass.
     public static func makeCredentialStore() -> FeedCredentialStore {
         let legacy = KeychainFeedCredentialStore(
             additionalTrustedPaths: AppPaths.siblingExecutablePaths()
         )
         guard CredentialStoreSelection.shouldUseDataProtection else {
-            return DeadlineFeedCredentialStore(wrapping: legacy)
+            return AuthorizationCooloffFeedCredentialStore(
+                wrapping: DeadlineFeedCredentialStore(wrapping: legacy))
         }
         let modern = DataProtectionFeedCredentialStore(policy: AppleTeam.keychainPolicy)
-        return DeadlineFeedCredentialStore(
-            wrapping: LayeredFeedCredentialStore(primary: modern, fallback: legacy))
+        return AuthorizationCooloffFeedCredentialStore(
+            wrapping: DeadlineFeedCredentialStore(
+                wrapping: LayeredFeedCredentialStore(primary: modern, fallback: legacy)))
     }
     #endif
 
@@ -248,6 +254,17 @@ public final class RentalStore: @unchecked Sendable {
     /// This distinction is not pedantry: reporting three never-configured
     /// listings as unreadable made `vrc doctor` permanently red, which is
     /// exactly how a genuinely unreadable credential stops being noticed.
+    /// Lets the next read of one credential ask for authorization again.
+    ///
+    /// For an explicit refresh by the owner. A dialog is tolerable when they
+    /// just asked for one; the hold-off exists to stop automatic refreshes
+    /// raising a series of them. Does nothing when no hold-off is in place,
+    /// and never touches a credential's value or its reference.
+    public func allowCredentialRetry(reference: String) {
+        (credentials as? AuthorizationCooloffFeedCredentialStore)?
+            .allowRetry(reference: reference)
+    }
+
     public func credentialHealth() throws -> [CredentialReport] {
         try listings.all().map { listing in
             guard !listing.credentialRef.isEmpty,

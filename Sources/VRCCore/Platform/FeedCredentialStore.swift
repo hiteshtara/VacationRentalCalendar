@@ -30,11 +30,57 @@ public enum FeedCredentialError: Error, LocalizedError {
     case keychainFailure(OSStatus, String)
     case timedOut
     case notFound(reference: String)
+    /// We declined to attempt the read, because a recent attempt had its
+    /// authorization cancelled and asking again would only produce another
+    /// dialog. Our own decision, not the platform's answer — so it is always
+    /// retryable and must never be read as evidence about the credential.
+    case authorizationSuppressed(retryAt: Date)
+
+    /// How this failure should be recorded: something a later refresh could
+    /// get past, or a settled fact about the credential.
+    ///
+    /// The single place that question is answered. It used to be asked inline
+    /// in `ImportService` as "was it a timeout?", which meant every other
+    /// transient failure — a cancelled authorization above all — was filed as
+    /// a dead credential and never retried.
+    public var isRetryableCredentialFailure: Bool {
+        switch self {
+        case .timedOut, .authorizationSuppressed: return true
+        case .keychainFailure(let status, _): return KeychainFailure.of(status).isRetryable
+        case .notFound: return false
+        }
+    }
+
+    /// The classification, where there is a status code to classify.
+    public var keychainFailure: KeychainFailure? {
+        if case .keychainFailure(let status, _) = self { return KeychainFailure.of(status) }
+        return nil
+    }
+
+    /// One line for the feed row.
+    public var shortSummary: String {
+        switch self {
+        case .timedOut:
+            return "The Keychain did not answer in time — will try again"
+        case .authorizationSuppressed:
+            return "Not asking for Keychain permission again yet — will try again"
+        case .keychainFailure(let status, _):
+            return KeychainFailure.of(status).shortSummary
+        case .notFound:
+            return "No calendar URL configured."
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
         case .keychainFailure(let status, let operation):
-            return "Keychain \(operation) failed (OSStatus \(status))."
+            let failure = KeychainFailure.of(status)
+            return "Keychain \(operation) failed (OSStatus \(status)). \(failure.explanation)"
+        case .authorizationSuppressed(let retryAt):
+            return "The Keychain authorization was cancelled a moment ago, so this read "
+                + "was not attempted again — repeating it would only raise another "
+                + "dialog. It will be tried again after "
+                + "\(retryAt.formatted(date: .omitted, time: .shortened))."
         case .notFound(let reference):
             return "No feed URL is stored under \"\(reference)\"."
         case .timedOut:
