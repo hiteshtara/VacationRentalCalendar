@@ -57,7 +57,13 @@ public struct S3ObjectStore: ObjectStore {
         if let sessionToken {
             request.setValue(sessionToken, forHTTPHeaderField: "X-Amz-Security-Token")
         }
-        try signer.sign(&request, payload: Data())
+        // S3 rejects a request that carries an x-amz-* header it was not asked
+        // to sign: the signature is computed over SignedHeaders, and an
+        // unsigned X-Amz-Security-Token yields a flat 403. Secrets Manager
+        // tolerates the same omission, which is why this went unnoticed —
+        // nothing else reads or writes S3 at runtime yet.
+        try signer.sign(&request, payload: Data(),
+                        alsoSign: sessionToken == nil ? [] : ["X-Amz-Security-Token"])
         let (data, status) = try perform(request)
         guard status == 200 else {
             throw LambdaRuntime.HandlerError(
@@ -78,7 +84,8 @@ public struct S3ObjectStore: ObjectStore {
             request.setValue(sessionToken, forHTTPHeaderField: "X-Amz-Security-Token")
         }
         request.httpBody = body
-        try signer.sign(&request, payload: body)
+        try signer.sign(&request, payload: body,
+                        alsoSign: sessionToken == nil ? [] : ["X-Amz-Security-Token"])
         let (_, status) = try perform(request)
         guard (200...299).contains(status) else {
             throw LambdaRuntime.HandlerError(
@@ -97,7 +104,8 @@ public struct S3ObjectStore: ObjectStore {
             request.setValue(sessionToken, forHTTPHeaderField: "X-Amz-Security-Token")
         }
         request.httpBody = body
-        try signer.sign(&request, payload: body)
+        try signer.sign(&request, payload: body,
+                        alsoSign: sessionToken == nil ? [] : ["X-Amz-Security-Token"])
         let (_, status) = try perform(request)
         if status == 412 { return false }
         guard (200...299).contains(status) else {
@@ -204,7 +212,8 @@ public struct CloudFrontInvalidator: CacheInvalidator {
             request.setValue(sessionToken, forHTTPHeaderField: "X-Amz-Security-Token")
         }
         request.httpBody = body
-        try signer.sign(&request, payload: body)
+        try signer.sign(&request, payload: body,
+                        alsoSign: sessionToken == nil ? [] : ["X-Amz-Security-Token"])
 
         let semaphore = DispatchSemaphore(value: 0)
         var status = 0

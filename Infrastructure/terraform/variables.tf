@@ -135,3 +135,9 @@ variable "outbound_enabled" {
   type        = bool
   default     = false
 }
+
+variable "create_feed_endpoint" {
+  description = "Create the public read-only iCalendar endpoint (Lambda Function URL). Setting this false and applying removes it entirely, which is the rollback."
+  type        = bool
+  default     = false
+}

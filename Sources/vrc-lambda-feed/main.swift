@@ -20,6 +20,14 @@ import VRCLambda
 
 let environment = ProcessInfo.processInfo.environment
 
+/// Server-side only. CloudWatch is private and this never reaches the caller,
+/// who sees nothing but a status code. Tokens and secret values are never
+/// passed here — only the category of failure, which is what diagnosing a
+/// silent 404 actually requires.
+func note(_ message: String) {
+    FileHandle.standardError.write(Data(("vrc-feed: " + message + "\n").utf8))
+}
+
 func response(_ status: Int, body: String = "", headers: [String: String] = [:]) -> Data {
     LambdaJSON.data([
         "statusCode": status,
@@ -60,8 +68,10 @@ LambdaRuntime.run { invocation in
         // Could not establish what is authorised, so authorise nothing. A 404
         // rather than a 503: an outsider learns nothing about our internals,
         // and a subscriber retries on its own schedule regardless.
+        note("grant table unreadable: \(error)")
         return response(404, body: "Not found")
     }
+    note("routing \(method) with \(grants.count) grant(s) loaded")
 
     switch FeedEndpoint.route(method: method, path: path, grants: grants) {
     case .methodNotAllowed:
@@ -71,6 +81,7 @@ LambdaRuntime.run { invocation in
         ])
 
     case .notFound:
+        note("no grant matched this request")
         return response(404, body: "Not found")
 
     case .serve(let objectKey):
@@ -85,6 +96,7 @@ LambdaRuntime.run { invocation in
             let isHead = method.uppercased() == "HEAD"
             return response(200, body: isHead ? "" : body, headers: FeedEndpoint.servedHeaders)
         } catch {
+            note("object read failed: \(error)")
             // The token was valid but the object is missing or unreadable.
             // Still a 404: the subscriber cannot act on the difference, and the
             // difference is exactly what we do not want to disclose.

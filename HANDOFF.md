@@ -1141,3 +1141,145 @@ Nothing to roll back yet. Once deployed: delete the Function URL config (the
 feed stops resolving immediately), delete the `ical/` object, mark the
 `feed_tokens` row `retired_at`. The private bucket, the management API and the
 Mac application are untouched by all three.
+
+---
+
+## 17. The read-only calendar endpoint — DEPLOYED to staging (2026-11-10)
+
+**Approved and applied.** Not connected to Booking.com; that needs separate
+approval. Outbound publishing and both schedules remain off throughout.
+
+### What exists now
+
+| Resource | Identifier |
+|---|---|
+| Lambda | `vrc-staging-feed` — arm64, 256 MB, 10s timeout |
+| Function URL | `https://om62jzjcqr6viusnmg7fgthvda0yaqra.lambda-url.us-east-1.on.aws/` |
+| IAM role | `vrc-staging-lambda-feed` |
+| Log group | `/aws/lambda/vrc-staging-feed`, 14-day retention |
+| Object served | `s3://vrc-staging-feeds-f79de5f0/ical/booking-v1.ics` — **private** |
+| Grant table | `vrc-staging/outbound/feed-tokens` — `sha256(token) → object key` |
+
+The token itself is **not** in Git, Terraform state, the database, or any log.
+Only its SHA-256 digest is stored, and the digest cannot be replayed as a URL.
+
+### Why a separate Lambda
+
+`PublishHandler` can write to S3 and invalidate a CloudFront distribution. This
+endpoint is the only thing in the stack reachable without AWS credentials, so it
+gets its own handler with the smallest possible job and a role that can do
+nothing else:
+
+```
+s3:GetObject              on vrc-staging-feeds-f79de5f0/ical/*   ← NOT ListBucket
+secretsmanager:GetSecret  on vrc-staging/outbound/feed-tokens
+logs:CreateLogStream/Put  on its own log group
+```
+
+`ListBucket` is deliberately absent: if an outsider could list the bucket the
+object keys would be enumerable, and the design rests on them staying unknown.
+The function's environment carries **no** `VRC_CLUSTER_ARN`,
+`VRC_DB_SECRET_ARN` or `VRC_DB_NAME` — it has no business knowing the database
+exists, and its role could not reach it if it did.
+
+### The two independent secrets
+
+The **token** in the URL and the **S3 object key** are unrelated. Listing the
+bucket would not yield usable URLs; a leaked URL would not reveal where the
+object lives. Only the digest is stored at runtime, so compromising the grant
+table yields nothing replayable.
+
+### Behaviour, all unit-tested in `Feed endpoint` (12 tests)
+
+- `GET` and `HEAD` only; every writing method is `405`.
+- Wrong token, revoked token and malformed path are **all a plain `404`** —
+  distinguishing them makes the endpoint an oracle, and a `410` would confirm a
+  token had once been real.
+- Revocation is the grant disappearing from the secret. There is no "retired"
+  flag anyone can forget to check.
+- `Cache-Control: no-store`, so revocation bites immediately. A cacheable
+  response would let an intermediary keep serving a withdrawn calendar, which is
+  the one failure this endpoint must not have.
+- Errors never surface: a missing object, an unreadable secret and absent
+  credentials all return the same `404`.
+
+### Plan review, before applying
+
+Account `589744711110`, region `us-east-1`. The plan was **5 creates and 61
+no-ops** — nothing existing changed — and `terraform show -json` confirmed no S3
+public-access or bucket-policy change anywhere. The bucket's four public-access
+blocks are still `true` and it still has no policy.
+
+### Live verification — all ten checks pass (2026-11-10)
+
+| # | Test | Result |
+|---|---|---|
+| 1 | Valid token | **200**, `Content-Type: text/calendar; charset=utf-8` |
+| 2 | Empty calendar | **0 `VEVENT`s**, well-formed `VCALENDAR` |
+| 3 | `HEAD` | **200**, headers only, **0 bytes** of body |
+| 4 | Invalid / malformed paths (`/`, `/ical/`, no extension, `.txt`, short token) | **404** every time |
+| 5 | Revoked token | **404**; restored → **200**, no caching in between |
+| 6 | `POST` / `PUT` / `PATCH` / `DELETE` | **405** |
+| 7 | Direct unauthenticated S3 GET of the object | **403** |
+| 8 | Management API, unsigned `GET /status` | **403** — IAM still enforced |
+| 9 | Publication / decisions in staging | `publications=0 published_entries=0 decisions=0` |
+| 10 | Token, credentials or calendar body in CloudWatch | **0 occurrences** |
+
+`Cache-Control: no-store, max-age=0` confirmed on the wire, which is what makes
+check 5 immediate.
+
+### Two faults found by deploying, not by reading
+
+**1. The bucket is SSE-KMS.** `s3:GetObject` alone is not enough; S3 must also
+decrypt on the role's behalf. Added `kms:Decrypt` on the one key the bucket
+uses, conditioned `kms:ViaService = s3.us-east-1.amazonaws.com` so the role can
+decrypt **only through S3** and cannot use the key for anything else.
+
+**2. `S3ObjectStore` never signed `X-Amz-Security-Token` — a real product bug.**
+The signer covers `host`, `x-amz-content-sha256` and `x-amz-date` unless extra
+headers are named. S3 rejects any `x-amz-*` header it receives that the
+signature does not cover, and answers a flat `403` with nothing useful. Secrets
+Manager tolerates the same omission, which is exactly why it survived: **nothing
+else in this project reads or writes S3 at runtime**, so the feed endpoint's
+first real S3 call was also the first opportunity to fail. In Lambda the
+credentials are always temporary, so the fault was unconditional there —
+`PublishHandler`'s writes would have failed the same way the moment publication
+was wired.
+
+Fixed at all four call sites (`get`, `put`, `putIfAbsent`, and CloudFront
+invalidation, which has the same requirement), guarded as
+`sessionToken == nil ? [] : [...]` so long-term credentials sign exactly what
+they signed before. Six regression tests in the `Signing` group cover it,
+including a characterisation of the unsigned-token trap and a check that two
+different session tokens never share a signature.
+
+Diagnosis took three attempts. The first two were guesses; the third added
+server-side `stderr` notes — CloudWatch only, never the response, never the
+token — which named the failure immediately:
+`object read failed: GET ical/booking-v1.ics returned 403`. Those notes are
+kept, because a silently-404ing endpoint is otherwise undiagnosable.
+
+### One thing the repository does not record
+
+`staging.tfvars` is gitignored (`*.tfvars`), so **`create_feed_endpoint = true`
+exists only on this machine**. The variable defaults to `false` in the tracked
+`variables.tf`, which is the safe default — but anyone reproducing this
+environment must set it explicitly, and a `terraform apply` from a fresh clone
+would otherwise plan to destroy the endpoint.
+
+### Rollback
+
+`create_feed_endpoint = false` in `staging.tfvars`, then apply. The URL stops
+resolving and the five resources go; nothing else is touched. To revoke without
+removing infrastructure, delete the entry from the grant secret — effective on
+the next request, because nothing is cached. Both were exercised: revocation was
+tested live and restored.
+
+### Cost
+
+Unmeasurable in practice. Booking.com would poll every ~2 hours — about 360
+invocations a month at 256 MB and well under a second each, which is inside the
+Lambda free tier; S3 GETs are `$0.0000004` each (**$0.00014/month**); the object
+is 297 bytes. The only standing cost is the CloudWatch log group, capped at
+14-day retention. Call it **well under $0.01/month**, against the staging
+environment's existing ~$2.
