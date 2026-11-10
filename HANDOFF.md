@@ -81,12 +81,23 @@ Both loose ends from the previous round are closed: the truncating setup is now
 | AWS staging | **deployed** in account …1110, us-east-1; cluster + 5 Lambdas + API Gateway + 3 buckets + 4 secrets |
 | Tests | **369 tests**, passing on **macOS and Linux** (1242 assertions with the PostgreSQL group live, 1223 without) |
 | Cross-platform parity | byte-identical digest `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` |
-| Staging smoke tests | **A1–A5, B1–B6, B9 done.** B7, B8 and Phase C C2/C3 are **unrun, not blocked** — one `aws rds enable-http-endpoint` call unblocks all three (§12) |
+| Staging smoke tests | **ALL COMPLETE: A1–A5, B1–B9, and Phase C C1–C5.** See §5 and §12 |
 | Outbound publishing | **off** — code gate, function env and database setting all verified `false` 2026-11-09; Terraform precondition not re-checked (§4) |
 | Scheduled imports | **disabled** (both EventBridge schedules DISABLED) |
 
 Completed milestones, newest first:
-1. **Linux verification, and three faults it exposed in `build-lambda.sh`**
+1. **Phase C complete, and B7/B8 complete — the staging validation programme is
+   finished.** Phase C re-run against a second temporary cluster
+   (`vrc-staging-pitr2`) with the corrected `aws rds enable-http-endpoint` call:
+   **27 checks, 0 failures**, covering recovery consistency against the source,
+   migrations 10/11, the generated columns, triggers, both exclusion
+   constraints, the allow-list function on all six `BlockKind`s, a guard that
+   actually refuses, and the source cluster untouched. B7 and B8 then ran
+   against that disposable cluster through the deployed artifact under the
+   Lambda Runtime Interface Emulator: **14 checks, 0 failures**. Temporary
+   resources deleted and cleanup verified by inventory. §12 has the detail,
+   including a credential asymmetry worth following up.
+2. **Linux verification, and three faults it exposed in `build-lambda.sh`**
    (commit `02f6df6`). All **369 tests now pass on Linux**, parity digest
    identical to macOS. Getting there required fixing the script: it never
    copied `Migrations/` into the container, so a test that reads those files
@@ -97,11 +108,11 @@ Completed milestones, newest first:
    would have printed a failure and shipped anyway** — contradicting CLAUDE.md's
    claim that this script refuses to deploy on divergence. All three fixed; the
    shell semantics were reproduced directly rather than assumed.
-2. **B9 complete — outbound publication is off at all four layers, each
+3. **B9 complete — outbound publication is off at all four layers, each
    verified.** Layer 3, the Terraform `precondition`, was the one still
    outstanding; all six unsafe configurations are now shown to be rejected
    plan-only with a non-zero exit (§5).
-3. **Destructive-test isolation, enforced in code** (commit `096d0ba`). The fix
+4. **Destructive-test isolation, enforced in code** (commit `096d0ba`). The fix
    for the 2026-11-09 truncation: `DestructiveTestIsolation` refuses any target
    that does not prove itself disposable, on four independent grounds, failing
    closed on each. It lives inside the only function that deletes rows, so there
@@ -109,11 +120,11 @@ Completed milestones, newest first:
    the one that matters — pointed at the real `vrc-staging-main` with full
    consent, the suite refuses and staging's row counts do not move. Full detail
    at the top of this file.
-4. **Staging test litter removed** (no commit — a database operation). The two
+5. **Staging test litter removed** (no commit — a database operation). The two
    leftover `channel='race'` holds and their property were deleted by explicit
    primary key after confirming every dependent row count was zero. Staging now
    reports exactly the two documented demo intervals. See §4.
-5. **Smoke test B6 — concurrency over the Data API** (commit `7e9a99a`). Two
+6. **Smoke test B6 — concurrency over the Data API** (commit `7e9a99a`). Two
    `RentalStore`s on independent transports race to claim the same nights on one
    property; the `no_overlapping_live_holds` exclusion constraint is the only
    arbiter. Exactly one is accepted, the loser's refusal must name that
@@ -124,18 +135,18 @@ Completed milestones, newest first:
    all four assertions, including `expected 1, got 2` live holds — a real double
    booking. Passed against local PostgreSQL 17.10 **and** live Aurora over the
    RDS Data API (10/10, 29 assertions in the group). Parity digest unchanged.
-6. **Daterange Data API fix** (found by B5 against real Aurora) — `SELECT *` on
+7. **Daterange Data API fix** (found by B5 against real Aurora) — `SELECT *` on
    tables with generated `daterange` columns 400s over the RDS Data API;
    replaced with explicit column lists. Lambdas redeployed.
-7. **GUI keychain fix via helper delegation** — the SwiftUI app could not read
+8. **GUI keychain fix via helper delegation** — the SwiftUI app could not read
    the AWS credential (macOS pins each keychain item to the creating binary's
    code hash; the GUI and `vrc` are different code objects). The GUI now calls
    the bundled `vrc cloud check --json` helper, which returns only sanitized
    JSON. See [docs/KEYCHAIN.md](docs/KEYCHAIN.md).
-8. **Cloud integration in the Mac app** — Cloud pane, AWS status-bar indicator,
+9. **Cloud integration in the Mac app** — Cloud pane, AWS status-bar indicator,
    Refresh from AWS, build-provenance tab.
-9. **Staging deployed and validated** (A1–A5, B1–B5).
-10. **Minimal AWS backend** — DataStore over the RDS Data API, 5 Lambda handlers,
+10. **Staging deployed and validated** (A1–A5, B1–B5).
+11. **Minimal AWS backend** — DataStore over the RDS Data API, 5 Lambda handlers,
    restricted DB role, Postgres schema generated from the SQLite migrator.
 
 ---
@@ -304,8 +315,8 @@ swift run vrc-parity --digest           # b3398471…c604f5
 | B4 sweeper by hand → holdsReleased:0, no reservation touched | ✅ (prior run) |
 | **B5 Data API transactions: Swift suite vs cluster** | ✅ **8/8 against live Aurora** |
 | **B6 concurrency: overlapping holds, one winner** | ✅ **passed on local PostgreSQL 17.10 and live Aurora** (group now 10/10, 29 assertions) |
-| B7 `POST /decisions` twice, one idempotency key | 🟥 **blocked** — see below |
-| B8 kill mid-write → client reports UNKNOWN | 🟥 **blocked** — see below |
+| **B7 `POST /decisions` twice, one idempotency key** | ✅ **passed** against the deployed artifact on a disposable cluster |
+| **B8 kill mid-write → client reports UNKNOWN** | ✅ **passed**, including reconciliation without duplication |
 | **B9 publication still impossible** | ✅ **all four layers verified** — see the §4 table |
 | Phase C PITR into a temporary cluster, then delete | 🟨 **C1 and C4 pass, C2/C3 blocked, C5 done** — see §12 |
 
@@ -329,36 +340,37 @@ A plan file **is** written on the error path, which looks alarming and is not:
 on it, versus `errored: false, complete: true` for the control. Terraform writes
 an errored plan for inspection and `apply` refuses it.
 
-### Why B7 and B8 are blocked, precisely
+### How B7 and B8 were finally run
 
-Both need to exercise the **deployed API** against a **disposable** database.
-Three routes exist and all three are closed:
+Both needed the **deployed API** against a **disposable** database. Three routes
+existed; two are permanently closed and the third is what was used.
 
 1. **Point the existing staging API at the disposable cluster** — forbidden, and
    it would not work anyway: `vrc-staging-lambda-api`'s policy scopes
-   `rds-data:*` to `vrc-staging-main` alone. So does every other `vrc-*` role.
-   Widening one means editing shared staging configuration.
-2. **Deploy a temporary API Lambda of its own** — a Lambda needs an execution
-   role, and creating an IAM role was refused by the session's permission
-   policy. Nothing was created.
-3. **Run the deployed artifact locally against the disposable cluster** — a
-   harness for exactly this is written and ready (the arm64 `bootstrap` from
-   `api.zip` under the official `provided:al2023` Runtime Interface Emulator,
-   which the image ships at `/usr/local/bin/aws-lambda-rie`), using the
-   operator's own credentials so no new IAM role is needed. **This route is
-   open.** It was blocked only because the disposable cluster had no working
-   Data API, and that turned out to be the wrong-API mistake corrected in §12 —
-   one `aws rds enable-http-endpoint` call fixes it. B7/B8 need a disposable
-   cluster with the Data API enabled, and nothing else.
+   `rds-data:*` to `vrc-staging-main` alone, as does every other `vrc-*` role.
+2. **Deploy a temporary API Lambda** — a Lambda needs an execution role, and
+   creating an IAM role was refused by the session's permission policy.
+3. **Run the deployed artifact locally** ✅ — the arm64 `bootstrap` from
+   `.build/lambda/api.zip`, the same package built and parity-checked this
+   round, under the AWS Lambda Runtime Interface Emulator that the official
+   `provided:al2023` image ships at `/usr/local/bin/aws-lambda-rie`. Same
+   binary, same `ApiHandler`, same `DecisionRoutes`, same idempotency
+   transaction, same Data API transport — hosted locally instead of in AWS.
 
-Much of what B7/B8 assert is already covered at unit level against fakes — see
-`DecisionRouteTests` ("the same key twice records one decision", "a reused
-publication UID with a NEW key is still not duplicated") and
-`CloudSyncClientTests` ("a dropped connection on a write is uncertain", "an
-uncertain write that DID apply is reconciled, not repeated"). What is missing is
-the same properties against the deployed service, and that is what stays
-unproven. Note for whoever unblocks it: `idempotency_keys` cannot be deleted by
-the runtime role, so each run needs a fresh `publicationUID`.
+**What route 3 does not cover, stated plainly:** API Gateway's `AWS_IAM`
+authorization layer (B2 and B3 cover that against the real gateway) and AWS's
+own Lambda hosting. The IAM principal is supplied in the synthetic event, as the
+gateway would supply it. So B7/B8 prove the handler's behaviour, not the
+gateway's.
+
+Two practical notes for re-running:
+- `idempotency_keys` cannot be deleted by the runtime role, so each run needs a
+  fresh `publicationUID` **and fresh nights**. `DecisionRoutes` correctly refuses
+  a block overlapping an existing approved decision for the same destination, so
+  reusing fixed dates makes the second run `409` against its own predecessor —
+  that is the route working, not failing. The harness derives its night windows
+  from the clock for this reason.
+- A successful first submission answers **201 Created**, not 200.
 
 **B7 and B8 were not begun.** Both need writes to the deployed staging API —
 B7 posts a decision twice, B8 interrupts a real write mid-flight — and the
@@ -571,29 +583,19 @@ Teardown (reversible, staging only): `./Scripts/staging-teardown.sh --destroy`.
 
 ## 11. Remaining work before production readiness
 
-Ordered. **Each of these is a new task; the project is paused here.**
+Ordered. **Each of these is a new task.** Staging validation is complete; the
+next milestone is real read-only Airbnb and Vrbo imports (item 2).
 
 1. **Finish staging validation.** Done: ~~B6~~, ~~isolation guard~~, ~~staging
    litter~~, ~~B9 (all four layers)~~, ~~Linux suite~~, ~~Phase C C1/C4/C5~~.
 
-   **What is left, and it is now one short sequence rather than three
-   decisions.** The earlier claim that this needed a redesign was based on a
-   wrong root cause, corrected in §12.
+   **Nothing is left. A1–A5, B1–B9 and Phase C C1–C5 all pass** (§5, §12). The
+   validation programme that this project has been working through since the
+   backend was built is finished.
 
-   1. Restore `vrc-staging-main` to a `pitr`-named cluster (C1 — already proven
-      to work), add its writer instance, then **`aws rds enable-http-endpoint
-      --resource-arn <cluster ARN>`** — the step that was missing.
-   2. Run **C2** (`vrc-migrate --status` → `10, 11`) and **C3** (the safety
-      assertions) against it. A ready-made script for both, plus the recovery
-      consistency and isolation checks, is in this session's scratchpad notes;
-      it was written but never got to run.
-   3. Mark that cluster disposable (`app_settings.disposable_database='true'`)
-      and run **B7/B8** against it through the RIE harness (§5), plus the
-      truncating integration suite, which the isolation guard will now permit.
-   4. Delete the cluster and its instance.
-
-   Budget roughly $0.10–$0.30 of Aurora time for the whole sequence, and expect
-   the restore plus writer to take about 10 minutes before any test can run.
+   The only follow-up it produced is a question rather than a task: the
+   Linux + static-credentials asymmetry in §12, which has a workaround, does not
+   affect production, and has no explanation yet.
 2. **Prepare real imports (read-only):** confirm the Airbnb/Vrbo feed URLs read
    from the Keychain via the `vrc` helper; run the live feed-diff to measure the
    change-detection hit rate (decides the ~$5.76 vs ~$19.95/mo import cadence);
@@ -615,91 +617,86 @@ owner approval.
 
 ---
 
-## 12. Phase C — what the PITR drill actually proved, and where it stops
+## 12. Phase C and B7/B8 — complete, 2026-11-10
 
-Run 2026-11-09 under explicit owner authorization for a temporary, isolated
-recovery cluster. **The temporary resources were deleted afterwards; nothing
-from this drill remains.**
+Run under explicit owner authorization for a temporary, isolated recovery
+cluster. **All temporary resources were deleted and the cleanup verified by
+inventory; nothing from the drill remains.**
 
-### Result: C1 and C4 pass. C2 and C3 were not run. C5 done.
+### Phase C: 27 checks, 0 failures
 
 | # | Test | Result |
 |---|---|---|
-| C1 | restore → a second, independent cluster appears | ✅ `vrc-staging-pitr` created from PITR of `vrc-staging-main`, restored to `2026-11-09T23:50:03Z`, 1 GB, own endpoint, own writer instance |
-| C2 | `vrc-migrate --status` against the restored cluster reports `10, 11` | ⬜ **not run** — the Data API was never successfully enabled, for the reason corrected below |
-| C3 | safety assertions against the restored cluster | ⬜ **not run**, same reason |
-| C4 | the restore is isolated; `vrc-staging-main` untouched | ✅ different endpoint, no shared instance, and staging still reads `properties=1 reservations=1 holds=1 availability_audit=41` with its own settings unchanged |
-| C5 | delete the temporary cluster | ✅ instance and cluster both deleted |
+| C1 | restore → a second, independent cluster | ✅ `vrc-staging-pitr2`, own endpoint, own writer, no shared instance |
+| C2 | migrations `10, 11` on the restored cluster | ✅ `schema_migrations` reports both |
+| C3 | the safety machinery present **and refusing** | ✅ 19 base tables, 6 generated columns, 2 triggers, `no_double_booking` + `no_overlapping_live_holds`, the allow-list function correct on all six `BlockKind`s, and an overlapping hold genuinely refused leaving no row behind |
+| C4 | the source cluster untouched | ✅ identical counts and settings before and after |
+| C5 | delete the temporary cluster | ✅ writer and cluster both deleted, verified by inventory |
 
-### Why C2/C3 failed, and the one-line fix — CORRECTED 2026-11-10
+**Recovery consistency** was checked table by table against the live source —
+`properties`, `reservations`, `holds`, `availability_audit`, `events`,
+`classifications`, `availability_decisions` all matched — and both synthetic
+intervals survived byte-for-byte: `demo-res-1` confirmed `[2027-07-01,2027-07-08)`
+and `demo-hold-1` `[2027-09-01,2027-09-04)`.
 
-**I used the wrong API.** The first write-up of this (commit `cabe65f`) claimed
-"the RDS Data API cannot be enabled on a PITR-restored cluster." **That was
-wrong**, and anyone acting on it would redesign a procedure that does not need
-redesigning.
+**The fix that made C2/C3 possible** was the one-line correction from the
+previous round: `aws rds enable-http-endpoint --resource-arn <cluster ARN>`,
+which returned `HttpEndpointEnabled: true` immediately and made the restored
+cluster queryable. `modify-db-cluster --enable-http-endpoint` is Serverless **v1**
+only and silently does nothing on a v2 or provisioned cluster. Confirmed in
+practice this round, not just from documentation.
 
-`modify-db-cluster --enable-http-endpoint` **applies only to Aurora Serverless
-v1.** On a Serverless v2 or provisioned cluster it is accepted, reports success,
-records no pending modification, and changes nothing — exactly the silent no-op
-observed. For v2 and provisioned clusters there is a **separate operation**:
+### B7 and B8: 14 checks, 0 failures
 
-```bash
-aws rds enable-http-endpoint  --resource-arn <cluster ARN>   # and
-aws rds disable-http-endpoint --resource-arn <cluster ARN>
-```
+Against the disposable cluster, through the deployed artifact under the Runtime
+Interface Emulator (see §5 for what that does and does not cover).
 
-The CLI's own help for `enable-http-endpoint` says so outright: *"This operation
-applies only to Aurora Serverless v2 and provisioned DB clusters. To enable the
-HTTP endpoint for Aurora Serverless v1 DB clusters, use modify-db-cluster."*
-That is also why neither restore operation has an `EnableHttpEndpoint` field —
-the field belongs to the v1 path, and the v2 path is a separate call made after
-the cluster exists. Terraform's `enable_http_endpoint` had the same bug for
-provisioned/v2 clusters until provider v5.64.0.
+**B7 — the same decision twice under one idempotency key.** First submission
+`201 Created`, echoing the submitted `publicationUID`, with `published=false`.
+Second submission `alreadyApplied=true` with the same UID. The database holds
+**exactly one** decision and **exactly one** idempotency key.
 
-**So Phase C's C2/C3 are not blocked.** The procedure in
-docs/STAGING-DEPLOYMENT.md §6 needs one extra step after C1, not a redesign:
+**B8 — an interrupted write.** The function was killed 0.4s into the write; the
+caller got no answer at all (`curl rc=52`, empty body) — a genuinely uncertain
+outcome, which is the state that must never become a duplicate. No decision
+existed at that moment. Reconciliation then retried under the same key the way
+`CloudSyncClient` does, and this is the part worth reading: it received `503`
+four times — the service correctly reporting *uncertain* rather than claiming
+"not applied", which would have invited a resubmit — and then `201`. The final
+state is **exactly one** decision, with nothing else covering those nights, and
+`GET /decisions/{uid}` answers `200` with an explicit `found=true`.
 
-```bash
-aws rds enable-http-endpoint --resource-arn \
-  arn:aws:rds:us-east-1:589744711110:cluster:<the restored cluster>
-```
+### An asymmetry worth following up
 
-This has **not yet been executed against a restored cluster** — the drill's
-cluster was already being deleted when the correct operation was identified. So
-C2/C3 remain *unrun*, not *impossible*. Re-running Phase C with that one added
-step is the next step, and it needs a fresh restore.
+The deployed artifact **could not authenticate to the Data API from inside the
+Linux container using static long-term credentials.** Every call returned
+HTTP 403, *"The security token included in the request is invalid"* — AWS saying
+it does not recognise the access key. The same keys work from macOS through the
+same `URLSessionDataAPITransport` (that is how B5/B6 ran), and the values were
+confirmed to arrive in the container intact (`AKIA…`, 20 and 40 characters,
+correct region and ARNs), with no clock skew and no injected `AWS_SESSION_TOKEN`.
+Supplying **temporary credentials with a session token** — `aws sts
+get-session-token` — made it work immediately.
 
-What does remain true from the first write-up: there is no network path to these
-clusters as an alternative to the Data API — not publicly accessible, no
-internet-gateway route on the subnets, and **no security-group ingress at all**,
-by design, since the architecture uses the Data API so the Lambdas need no VPC.
-So the Data API is the only route in, which is why getting this call right
-matters.
+So the untested combination was **Linux + static keys + no session token**.
+Deployed Lambda always has a session token, so production is unaffected and
+nothing here is evidence of a production fault. But this is a symptom with a
+workaround, **not a diagnosis**: the mechanism is unexplained, and the signer's
+behaviour when `sessionToken` is nil on corelibs deserves a look. It is the same
+class of macOS/Linux divergence CLAUDE.md already records twice.
 
-### Resources created, and the cost
+### Resources created, cost, and cleanup
 
 | Resource | Identifier | State |
 |---|---|---|
-| Cluster | `vrc-staging-pitr` (`arn:aws:rds:us-east-1:589744711110:cluster:vrc-staging-pitr`) | **deleted** |
-| Instance | `vrc-staging-pitr-writer`, `db.serverless` | **deleted** |
-| IAM role | `vrc-pitr-lambda-api` | **never created** — refused by the session's permission policy |
+| Cluster | `vrc-staging-pitr2` | **deleted** |
+| Instance | `vrc-staging-pitr2-writer`, `db.serverless` | **deleted** |
+| IAM / networking / DNS | none created — the existing `vrc-staging-db` subnet group and `sg-060063071c2073cdd` were reused | n/a |
+| Local Docker containers | `vrc-pitr-api-local`, `probe-api` | removed |
 
-Teardown re-verified 2026-11-10T00:05Z, after deletion completed: RDS holds
-only `vrc-staging-main` and `vrc-staging-main-writer`; **zero** cluster
-snapshots (the delete used `--skip-final-snapshot`); the only retained
-automated backup is `vrc-staging-main`'s own; no `pitr`-named resource anywhere
-in RDS; no new secret, Lambda, IAM role, log group or subnet group. The drill
-reused the pre-existing `vrc-staging-db` subnet group and security group rather
-than creating any, so there is nothing of its own left to clean up.
-
-Lifetime: cluster `23:37:33Z` → `~23:55Z` (~18 min); writer `~23:41Z` → `23:52Z`
-(~11 min, of which ~5 available).
-
-Cost, at rates read from the **AWS Pricing API** rather than quoted from memory:
-Aurora Serverless v2 **$0.12 per ACU-hour**, storage **$0.10 per GB-month**, I/O
-**$0.20 per million requests**. With one writer at low ACU for roughly a fifth of
-an hour and 1 GB for under 20 minutes, the incremental charge is **under $0.10,
-most likely $0.02–$0.05**. Cost Explorer had not yet published same-day figures
-(it lags about a day), so this is computed from verified rates and measured
-lifetimes, not observed billing. Confirm against Cost Explorer tomorrow if the
-exact number matters.
+Cost at rates read from the **AWS Pricing API**: Serverless v2 **$0.12 per
+ACU-hour**, storage **$0.10 per GB-month**, I/O **$0.20 per million**. The
+cluster lived roughly 35 minutes with one low-ACU writer and 1 GB of storage, so
+the incremental charge is **well under the $0.50 budget — on the order of
+$0.05–$0.15**. Computed from verified rates and measured lifetimes; Cost
+Explorer lags about a day and had published nothing for the period.
