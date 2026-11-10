@@ -15,10 +15,16 @@ import VRCCore
 /// present and the fault was unconditional there.
 public enum SigningTests {
 
-    /// Fixed inputs so a signature is reproducible. Not real credentials.
+    /// Fixed inputs so a signature is reproducible.
+    ///
+    /// Deliberately NOT AWS's documentation example key. That value is public
+    /// and harmless, but it matches `check-no-secrets.sh`'s
+    /// `(AKIA|ASIA)[0-9A-Z]{16}` pattern, so committing it breaks the gate for
+    /// everyone afterwards — and a scanner people learn to ignore is worse than
+    /// no scanner. Short, obviously-fake values match the convention already
+    /// used in CloudSyncClientTests.
     static let signer = SigV4Signer(
-        accessKeyID: "AKIAIOSFODNN7EXAMPLE",
-        secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        accessKeyID: "AKIATEST", secretAccessKey: "not-a-real-secret",
         region: "us-east-1", service: "s3")
     static let fixedDate = Date(timeIntervalSince1970: 1_800_000_000)
 
