@@ -359,3 +359,25 @@ private final class ResultBox<T>: @unchecked Sendable {
         return stored
     }
 }
+
+
+/// A credential store whose items EXIST but cannot be read.
+///
+/// Models the situation this project keeps hitting: a Keychain item whose
+/// access list names a build that no longer exists, so `exists` succeeds and
+/// the read fails. Test-only, and in VRCCore rather than the test target so
+/// the Linux build compiles it too.
+public final class UnreadableFeedCredentialStore: FeedCredentialStore, @unchecked Sendable {
+    private let present: Set<String>
+    public init(presentReferences: [String]) { self.present = Set(presentReferences) }
+
+    public var storageDescription: String { "unreadable (test only)" }
+    public func save(url: String, reference: String) throws {}
+    public func delete(reference: String) throws {}
+    public func exists(reference: String) -> Bool { present.contains(reference) }
+
+    public func url(reference: String) throws -> String? {
+        guard present.contains(reference) else { return nil }
+        throw FeedCredentialError.keychainFailure(-25293, "read")
+    }
+}

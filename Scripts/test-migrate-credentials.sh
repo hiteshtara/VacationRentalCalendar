@@ -143,5 +143,52 @@ got="$(prompts)"
 [ "${got}" = "0" ] && ok "nothing stored anywhere means no prompts at all" \
     || bad "expected 0 prompts, got ${got}"
 
+printf '\n\033[1m==> Verification message reflects reality\033[0m\n'
+
+# The stub helper reports success and the reference exists afterwards, so the
+# script must say it migrated — it used to report every success as a failure,
+# because it grepped the output of `vrc keychain`, a command that does not
+# exist.
+: > "${CALLS}"
+make_db "${ROOT}/db.sqlite"
+OUT="$(PATH="${ROOT}/bin:${PATH}" PRESENT_REFS="booking-17482435-v2" \
+    VRC_DB_OVERRIDE="${ROOT}/db.sqlite" VRC_HELPER_OVERRIDE="${ROOT}/bin/vrc" \
+    "${SCRIPT_UNDER_TEST}" --feeds-only --platform booking_com 2>&1)"
+
+printf '%s' "${OUT}" | grep -q "migrated — stored under" \
+    && ok "a successful migration is reported as success" \
+    || bad "a successful migration was not reported as success"
+printf '%s' "${OUT}" | grep -qi "still cannot read it" \
+    && bad "the discredited failure message is still being printed" \
+    || ok "the false failure message is gone"
+printf '%s' "${OUT}" | grep -qi "already readable" \
+    && bad "the unreachable 'already readable' branch is still present" \
+    || ok "the unreachable branch is gone"
+
+# And when the entry genuinely does not land, it must say so.
+cat > "${ROOT}/bin/vrc" <<'STUB'
+#!/bin/bash
+case "${1:-}" in
+    keychain) exit 0 ;;
+    cloud)    exit 1 ;;
+    set-url)  cat >/dev/null; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "${ROOT}/bin/vrc"
+make_db "${ROOT}/db.sqlite"
+sqlite3 "${ROOT}/db.sqlite" "UPDATE platform_listings SET credential_ref='vanished' WHERE id=3;"
+OUT="$(PATH="${ROOT}/bin:${PATH}" PRESENT_REFS="vanished" \
+    VRC_DB_OVERRIDE="${ROOT}/db.sqlite" VRC_HELPER_OVERRIDE="${ROOT}/bin/vrc" \
+    "${SCRIPT_UNDER_TEST}" --feeds-only --platform booking_com 2>&1)"
+# After set-url the reference is still 'vanished' and PRESENT_REFS has it, so
+# this should report success; flip presence away to prove the failure path.
+OUT2="$(PATH="${ROOT}/bin:${PATH}" PRESENT_REFS="" \
+    VRC_DB_OVERRIDE="${ROOT}/db.sqlite" VRC_HELPER_OVERRIDE="${ROOT}/bin/vrc" \
+    "${SCRIPT_UNDER_TEST}" --feeds-only --platform booking_com 2>&1)"
+printf '%s' "${OUT2}" | grep -q "no credential stored; skipped" \
+    && ok "an absent credential is still skipped rather than mis-reported" \
+    || bad "absent credential handling regressed"
+
 printf '\n  === %s passed, %s failed ===\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]

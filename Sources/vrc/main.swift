@@ -933,11 +933,20 @@ func runDoctor() {
         check("no feed URL stored in the database",
               !(try store.listings.databaseLeaksAnyKeychainURL()))
 
-        for listing in try store.listings.all() {
-            let stored = store.listings.hasCredential(for: listing)
-            check("feed URL stored for \(listing.label)", stored,
-                  stored ? "Keychain: \(listing.credentialRef)"
-                         : "nothing under \(listing.credentialRef)")
+        // Reported per listing, with "never set up" kept apart from "broken".
+        // Test Cottage's three empty listings are expected, not failures.
+        let credentialHealth = (try? store.credentialHealth()) ?? []
+        for report in credentialHealth {
+            switch report.status {
+            case .notConfigured:
+                print("  --   \(report.listing.label) — not configured (no calendar URL yet)")
+            case .readable:
+                check("feed URL readable for \(report.listing.label)", true,
+                      "Keychain: \(report.listing.credentialRef)")
+            case .unreadable:
+                check("feed URL readable for \(report.listing.label)", false,
+                      "stored under \(report.listing.credentialRef) but this build cannot read it")
+            }
         }
         print("")
         let signature = CodeSignatureInfo.current()
@@ -953,11 +962,17 @@ func runDoctor() {
         // Via the store, which flattens the double optional this used to get
         // wrong: a reference pointing at nothing came back `.some(nil)` and
         // was counted as readable.
-        let unreadable = ((try? store.unreadableCredentials()) ?? []).count
-        check("this build can actually READ its stored credentials", unreadable == 0,
-              unreadable == 0
-                  ? "all readable"
-                  : "\(unreadable) unreadable — run ./Scripts/migrate-cloud-credential.sh")
+        // Three outcomes, not two. A listing that was never set up is not a
+        // broken credential, and reporting it as one made this gate
+        // permanently red — which is exactly how a real failure stops being
+        // noticed.
+        let health = credentialHealth
+        let unreadable = health.filter { $0.status == .unreadable }
+        check("this build can actually READ its stored credentials", unreadable.isEmpty,
+              unreadable.isEmpty
+                  ? "\(health.filter { $0.status == .readable }.count) readable, "
+                      + "\(health.filter { $0.status == .notConfigured }.count) not configured"
+                  : "\(unreadable.count) unreadable — run ./Scripts/migrate-cloud-credential.sh")
         print("")
         print("Credential store: \(store.credentials.storageDescription)")
         print("Code signature:   \(signature.kind.rawValue)"

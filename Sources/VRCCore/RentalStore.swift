@@ -196,24 +196,50 @@ public final class RentalStore: @unchecked Sendable {
         }
     }
 
-    /// Listings whose stored credential this build cannot actually read.
+    /// What a listing's stored credential is actually doing.
+    public enum CredentialStatus: String, Sendable, Equatable {
+        /// No Keychain item exists. The listing has never been set up — which
+        /// is not a fault, and must not be reported as one.
+        case notConfigured
+        /// An item exists and this build can read it.
+        case readable
+        /// An item exists and this build CANNOT read it. The real problem: an
+        /// access list naming a build that no longer exists.
+        case unreadable
+    }
+
+    public struct CredentialReport: Sendable {
+        public let listing: PlatformListing
+        public let status: CredentialStatus
+    }
+
+    /// Per-listing credential state.
     ///
-    /// "Cannot read" means the read threw — an access list that does not name
-    /// this binary — OR the reference points at nothing. `vrc doctor` asked
-    /// `(try? credentials.url(ref)) == nil`, which is a DOUBLE optional and so
-    /// is nil only in the first case: a dangling reference came back as
-    /// `.some(nil)` and was reported as readable.
+    /// The discriminator between "not set up" and "broken" is whether an ITEM
+    /// exists. `exists` reads attributes only, never prompts and never blocks,
+    /// so asking costs nothing.
     ///
-    /// A listing with no reference at all is not a credential problem — its
-    /// URL lives in the database column — and is excluded.
-    public func unreadableCredentials() throws -> [PlatformListing] {
-        try listings.all().filter { listing in
-            guard !listing.credentialRef.isEmpty else { return false }
-            guard let value = try? credentials.url(reference: listing.credentialRef) else {
-                return true          // the read failed outright
+    /// This distinction is not pedantry: reporting three never-configured
+    /// listings as unreadable made `vrc doctor` permanently red, which is
+    /// exactly how a genuinely unreadable credential stops being noticed.
+    public func credentialHealth() throws -> [CredentialReport] {
+        try listings.all().map { listing in
+            guard !listing.credentialRef.isEmpty,
+                  credentials.exists(reference: listing.credentialRef) else {
+                return CredentialReport(listing: listing, status: .notConfigured)
             }
-            return value == nil      // the reference points at nothing
+            guard let value = try? credentials.url(reference: listing.credentialRef),
+                  value != nil else {
+                return CredentialReport(listing: listing, status: .unreadable)
+            }
+            return CredentialReport(listing: listing, status: .readable)
         }
+    }
+
+    /// Listings whose credential exists but cannot be read. A listing that was
+    /// never configured is NOT included — see `credentialHealth`.
+    public func unreadableCredentials() throws -> [PlatformListing] {
+        try credentialHealth().filter { $0.status == .unreadable }.map(\.listing)
     }
 
     public func conflicts() throws -> [ReservationConflict] {

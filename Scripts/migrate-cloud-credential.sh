@@ -129,7 +129,7 @@ if [ ! -f "$DB" ]; then
     exit 0
 fi
 
-migrated=0; already=0; needs_entry=0
+migrated=0; needs_entry=0
 
 # `.backup` rather than reading the live file: a plain read misses the WAL.
 TMPDB="$(mktemp -t vrcmig).sqlite"
@@ -163,12 +163,13 @@ while IFS='|' read -r listing_id platform ref label; do
     say ""
     say "  ${platform} (listing ${listing_id}) — reference ${ref}"
 
-    # Does the new helper already read it? Then leave it completely alone.
-    if "$HELPER" keychain 2>/dev/null | grep -F "[${ref}]" | grep -q "^  ok"; then
-        say "    already readable by this build — nothing to do"
-        already=$((already + 1))
-        continue
-    fi
+    # There is deliberately no "is it already readable?" shortcut here. The
+    # previous one piped `"$HELPER" keychain` — a command that does not exist —
+    # into grep, so it never matched and "already readable" was always zero.
+    # Testing readability properly means attempting a read, which is the very
+    # prompt this is trying to avoid raising unnecessarily. Re-homing a
+    # credential that was already fine is harmless: it writes a new entry and
+    # leaves the old one alone.
 
     # Read the old item. macOS prompts; choose "Always Allow". The value is
     # captured into a shell variable and never echoed.
@@ -185,10 +186,27 @@ while IFS='|' read -r listing_id platform ref label; do
     # but keeps every check: https only, fetched and parsed before saving.
     if printf '%s\n' "${URL}" | "$HELPER" set-url --listing "${listing_id}" --stdin --rehome >/dev/null 2>&1; then
         unset URL
-        if "$HELPER" keychain 2>/dev/null | grep -F "${platform}" | grep -q "^  ok"; then
-            say "    migrated and verified readable"
+        # Verify against what actually happened, not against a command that
+        # does not exist. `set-url` fetches and parses the feed before storing
+        # it, so its exit status already proves the URL was read and worked;
+        # what remains is confirming a NEW entry landed, which the database
+        # names and `security` can confirm WITHOUT -w — attributes only, no
+        # prompt.
+        #
+        # The old check reported every successful migration as a failure. It
+        # had already cried wolf in the other direction the same day, and a
+        # verification nobody can trust is worse than none.
+        new_ref="$(sqlite3 "$DB" "SELECT credential_ref FROM platform_listings WHERE id = ${listing_id};" 2>/dev/null)"
+        if [ -n "${new_ref}" ] \
+           && security find-generic-password -s "$SERVICE" -a "${new_ref}" >/dev/null 2>&1; then
+            if [ "${new_ref}" = "${ref}" ]; then
+                say "    migrated — stored under ${new_ref}"
+            else
+                say "    migrated — stored under ${new_ref} (was ${ref}, which is left in place)"
+            fi
         else
-            say "    migrated; the helper still cannot read it — re-entry may be required"
+            say "    the helper reported success but no entry was found afterwards."
+            say "    ACTION REQUIRED: check this listing under Feeds in the app."
         fi
         migrated=$((migrated + 1))
     else
@@ -206,7 +224,6 @@ rm -f "$TMPDB"
 step "Feed URL summary"
 say "  migrated:                ${migrated}"
 say "  skipped (no credential): ${skipped}"
-say "  already readable:        ${already}"
 say "  need manual re-entry:    ${needs_entry}"
 if [ "${needs_entry}" -gt 0 ]; then
     say ""

@@ -86,21 +86,99 @@ public enum CredentialRehomeTests {
 
         // --- Knowing what cannot be read -------------------------------------
 
-        TestCase(group: "Credential re-home",
-                 name: "a reference with nothing behind it counts as unreadable") { expect in
-            // `vrc doctor` asked `(try? store.credentials.url(ref)) == nil`,
-            // which is a DOUBLE optional: it is nil only when the read THREW.
-            // A reference pointing at an item that is simply not there came
-            // back as `.some(nil)` — and was reported as readable.
+        // --- Telling "not set up" apart from "broken" ------------------------
+        //
+        // `vrc doctor` reported Test Cottage's three empty listings as
+        // CREDENTIAL UNREADABLE, which reads as three broken credentials on a
+        // property that has simply never been configured. It also made the gate
+        // permanently red, so a genuinely unreadable credential would not have
+        // stood out.
+        //
+        // The discriminator is whether a Keychain ITEM exists. `exists` reads
+        // attributes only and never prompts, so this costs nothing and cannot
+        // block. If there is no item there is no credential, and "unreadable"
+        // is the wrong word for it.
+
+        TestCase(group: "Credential health",
+                 name: "a reference with nothing behind it is not configured, not broken") { expect in
             let store = try RentalStore.makeInMemory()
+            let property = try store.properties.insert(Property(name: "Test Cottage"))
+            let listing = try store.listings.insert(PlatformListing(
+                propertyID: property.id!, platform: .airbnb, label: "Airbnb — Test Cottage",
+                urlStorage: .keychain, credentialRef: "airbnb-p2-test-cottage"))
+
+            let health = try store.credentialHealth()
+            expect.equal(health.first { $0.listing.id == listing.id }?.status, .notConfigured)
+            expect.equal(try store.unreadableCredentials().count, 0,
+                         "an empty listing is not a failure")
+        },
+
+        TestCase(group: "Credential health",
+                 name: "a listing with no reference at all is not configured") { expect in
+            let store = try RentalStore.makeInMemory()
+            let property = try store.properties.insert(Property(name: "Test Cottage"))
+            let listing = try store.listings.insert(PlatformListing(
+                propertyID: property.id!, platform: .vrbo, label: "Vrbo — Test Cottage",
+                urlStorage: .keychain))
+            let health = try store.credentialHealth()
+            expect.equal(health.first { $0.listing.id == listing.id }?.status, .notConfigured)
+        },
+
+        TestCase(group: "Credential health",
+                 name: "a stored credential that reads is reported readable") { expect in
+            let store = try RentalStore.makeInMemory()
+            let live = try listing(store, state: .connected,
+                                   ref: "airbnb-123-v6", url: "https://a.test/f.ics")
+            let health = try store.credentialHealth()
+            expect.equal(health.first { $0.listing.id == live.id }?.status, .readable)
+            expect.equal(try store.unreadableCredentials().count, 0)
+        },
+
+        TestCase(group: "Credential health",
+                 name: "an item that exists but cannot be read IS a failure") { expect in
+            // The case that must keep working. A credential whose access list
+            // names a build that no longer exists is a real problem and has to
+            // stay visible — that is the whole point of the check.
+            let store = try RentalStore(
+                database: Database.inMemory(),
+                credentials: UnreadableFeedCredentialStore(presentReferences: ["airbnb-123-v6"]))
             let property = try store.properties.insert(Property(name: "39 G Street"))
             _ = try store.listings.insert(PlatformListing(
-                propertyID: property.id!, platform: .vrbo, label: "Vrbo",
-                urlStorage: .keychain, credentialRef: "vrbo-missing-v1"))
+                propertyID: property.id!, platform: .airbnb, label: "Airbnb",
+                urlStorage: .keychain, credentialRef: "airbnb-123-v6"))
 
-            let unreadable = try store.unreadableCredentials()
-            expect.equal(unreadable.count, 1, "a dangling reference is not readable")
-            expect.equal(unreadable.first?.credentialRef, "vrbo-missing-v1")
+            let health = try store.credentialHealth()
+            expect.equal(health.first?.status, .unreadable)
+            expect.equal(try store.unreadableCredentials().count, 1)
+        },
+
+        TestCase(group: "Credential health",
+                 name: "a mixed portfolio reports each listing on its own terms") { expect in
+            // Three configured and readable, three never set up — exactly 39 G
+            // Street and Test Cottage as they stand.
+            let store = try RentalStore.makeInMemory()
+            let real = try store.properties.insert(Property(name: "39 G Street"))
+            for (platform, ref) in [(RentalPlatform.airbnb, "airbnb-p1-v6"),
+                                    (.vrbo, "vrbo-p1-v6"), (.bookingCom, "booking-p1-v3")] {
+                _ = try store.listings.insert(PlatformListing(
+                    propertyID: real.id!, platform: platform, label: platform.displayName,
+                    icalURL: "https://a.test/\(ref).ics", urlStorage: .keychain,
+                    credentialRef: ref))
+            }
+            let synthetic = try store.properties.insert(Property(name: "Test Cottage"))
+            for platform in [RentalPlatform.airbnb, .vrbo, .bookingCom] {
+                _ = try store.listings.insert(PlatformListing(
+                    propertyID: synthetic.id!, platform: platform,
+                    label: platform.displayName, urlStorage: .keychain,
+                    credentialRef: "\(platform.rawValue)-p2-test-cottage"))
+            }
+
+            let health = try store.credentialHealth()
+            expect.equal(health.filter { $0.status == .readable }.count, 3)
+            expect.equal(health.filter { $0.status == .notConfigured }.count, 3)
+            expect.equal(health.filter { $0.status == .unreadable }.count, 0)
+            expect.equal(try store.unreadableCredentials().count, 0,
+                         "an unconfigured property must not make the gate red")
         },
 
         TestCase(group: "Credential re-home",
