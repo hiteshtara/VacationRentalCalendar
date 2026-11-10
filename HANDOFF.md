@@ -1781,3 +1781,78 @@ working-tree scan clean, history scan still red per §19.
 `vrc-staging-import` and `vrc-staging-hold-sweeper` both remain `DISABLED`.
 The Mac app has **not** been rebuilt, so both fixes reach it at the next build;
 today's recovery came from the database and from re-entering the URL.
+
+## 21. Multi-property Phase 1, and App Store readiness (2026-11-10)
+
+Branch `feature/multi-property`, commit `63e7d86` onward. PR #10 stays open.
+
+### What the inspection found
+
+The schema was **already mostly multi-property**: `platform_listings` carries
+`property_id`, events hang off a listing, classifications key off
+`event_key` (which includes the listing id), and `ConflictDetector` groups by
+property before comparing anything — so two properties blocked over identical
+dates were never mistaken for a double booking. That is now pinned by tests
+instead of being a happy accident.
+
+Three things were genuinely missing, and one of them was a latent data-safety
+bug.
+
+1. **`properties.time_zone` was a dead column.** Added in migration 10, never
+   present in the `Property` model or repository, so the thing it exists for —
+   counting a property's nights in its own zone — was not possible.
+2. **No way to retire a property** without deleting it and its history.
+3. **Credential references collided across properties.** They were derived
+   from the platform and the listing LABEL alone, so two properties whose
+   listings were both called "Airbnb" produced `airbnb-airbnb` for both: one
+   Keychain item backing two feeds, where revoking one would silently break
+   the other. References are now scoped by property id, and a partial unique
+   index on `credential_ref` makes the collision unstorable.
+
+Existing references are never recomputed, so 39 G Street's three live
+credentials are untouched.
+
+### Migration 13
+
+* `properties.archived_at` — archiving is never deletion. `active()` hides it;
+  `all()`, its observations, decisions and audit rows stay put. Reversible.
+* A partial unique index on `platform_listings(credential_ref)`, excluding the
+  empty string so database-stored URLs are unaffected.
+
+Postgres schema regenerated per the house rule; the diff is one column. **The
+unique index is not in the generated Postgres schema** — the generator emits
+tables only — which is acceptable while credentials live in Secrets Manager
+rather than the cloud database, but it is a known asymmetry.
+
+### Tests
+
+Ten, across three synthetic properties each with two listings blocked over the
+same dates — the arrangement that exposes cross-property bleeding if it
+exists. No event leakage, no cross-property conflicts, no decision reaching
+another property's feed, a revoked feed isolated to its property, review-queue
+filtering, credential uniqueness, archive round trips, and a repeatable
+migration.
+
+Suite at 437. Parity digest unchanged and identical on macOS and Linux.
+
+### Still to do in Phase 1
+
+Property management UI (create, edit, archive), the portfolio dashboard, and
+the read-only portfolio calendar. The data model and migration underneath them
+are done and tested.
+
+### App Store readiness
+
+Full audit in [docs/APP-STORE-READINESS.md](docs/APP-STORE-READINESS.md). The
+short version: ten blockers, of which four are one piece of work — App Sandbox
+has never been enabled, and enabling it breaks the legacy Keychain ACL scheme,
+relocates the database into a container, and puts the nested `vrc` CLI in
+App Review's path.
+
+That work is worth doing **whether or not the App Store ever happens**: the
+data protection keychain removes the code-hash pinning that is the single
+largest source of day-to-day breakage in this project.
+
+Recommended sequence is direct distribution first (Developer ID + notarization,
+no sandbox), then the sandbox/Keychain rewrite, then the store. Multi-tenant
+AWS is last and should not start before there are paying customers.
