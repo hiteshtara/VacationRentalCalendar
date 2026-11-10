@@ -123,11 +123,45 @@ How, without Xcode:
   using an app-specific password from appleid.apple.com. Stored by macOS; this
   repository never sees it.
 
+### ALSO REQUIRED — corrected 2026-11-10, this document had it wrong
+
+An earlier version of this section said no App ID or provisioning profile was
+needed for the Developer ID path, and that `keychain-access-groups` is
+honoured from the signature alone. **That is false**, and the machine proved
+it within minutes of the certificate arriving:
+
+| Binary | Result |
+|---|---|
+| unsigned | runs |
+| signed with Developer ID, **no entitlements** | runs |
+| signed with Developer ID **+ `keychain-access-groups`** | **killed, SIGKILL** |
+
+The entitlement embeds correctly — `codesign -d --entitlements -` shows it —
+and AMFI terminates the process anyway. `keychain-access-groups` is a
+**restricted entitlement** on macOS: it must be authorised by a provisioning
+profile, not merely requested in the signature.
+
+So two more prerequisites, both on developer.apple.com:
+
+5. **An App ID** for `com.vacationrentalcalendar.app`, with the **Keychain
+   Sharing** capability enabled and the group
+   `com.vacationrentalcalendar.shared` listed.
+6. **A Developer ID provisioning profile** for that App ID, downloaded and
+   embedded in the bundle as `Contents/embedded.provisionprofile`.
+
+This has a consequence for testing. A profile can only be embedded in a
+**bundle**, so the isolated probes cannot be bare executables — they must be
+`.app` bundles carrying the profile. `Scripts/test-keychain-integration.sh`
+builds bare binaries and therefore cannot pass until it is reworked, which is
+cheap but is not nothing.
+
+It also means the nested `vrc` helper inherits this: it is covered by the
+app's profile only while it lives inside the signed bundle. That strengthens
+the standing recommendation in DISTRIBUTION.md to drop the helper and call
+`VRCCore` in process.
+
 ### Not required
 
-* **No App ID or provisioning profile** for the Developer ID path on macOS —
-  `keychain-access-groups` is honoured from the signature alone. A profile
-  *is* required later for the App Store path.
 * **No paid team membership beyond the one already active.**
 
 ---
