@@ -2117,3 +2117,70 @@ They are the three **Test Cottage** placeholders — references created before
 the fix, with nothing behind them. The three real credentials all report `ok`.
 Clearing those three references would silence it, but they are synthetic
 records and were left alone deliberately.
+
+## 25. Making the credential diagnostics honest (2026-11-10)
+
+Commit `c9750c4`. Two messages that misled, in opposite directions, on the
+same day.
+
+### `vrc keychain` does not exist
+
+The migration script verified its own work with:
+
+```bash
+"$HELPER" keychain 2>/dev/null | grep -F "${platform}" | grep -q "^  ok"
+```
+
+There is no `keychain` subcommand. The command failed, the grep never matched,
+and **every successful migration was reported as a failure**. The same dead
+call sat behind the "already readable by this build" shortcut, which is why
+that count was always zero and every credential was re-homed whether it needed
+it or not.
+
+That message was right this morning and disbelieved; wrong this evening about
+a migration that worked. A verification nobody can trust is worse than none.
+
+It now checks what happened: `set-url` fetches and parses the feed before
+storing it, so its exit status already proves the URL works. What remained was
+confirming a new entry landed — the database names the reference and
+`security` confirms it **without** `-w`, attributes only, no prompt. When the
+reference changes the message says so, and says the old entry is kept.
+
+The "already readable" shortcut was removed rather than repaired: testing
+readability means attempting a read, which is the very prompt the script
+exists to avoid raising unnecessarily.
+
+### Three outcomes, not two
+
+Test Cottage has three listings and no calendar URLs. `vrc doctor` reported
+all three as credentials it could not read — three apparent failures on a
+property that was never set up, and a permanently red gate. That is precisely
+how a genuinely unreadable credential stops being noticed.
+
+`RentalStore.credentialHealth()` now returns `notConfigured`, `readable` or
+`unreadable`, keyed on whether a Keychain **item** exists. `exists` reads
+attributes only, never prompts, never blocks.
+
+This **reverses a behaviour added earlier the same day**: a dangling reference
+was counted as unreadable. There is no credential there to be unreadable, and
+saying otherwise hid the real ones.
+
+### Tests
+
+Nine for credential health, including a mixed portfolio of three readable and
+three unconfigured — 39 G Street and Test Cottage as they actually stand — and
+`UnreadableFeedCredentialStore`, whose items exist but refuse to be read, so
+the case that matters keeps failing loudly. Four for the script's messages,
+asserting both that success is reported as success and that the discredited
+text is gone.
+
+**468 tests.** Parity identical on macOS and Linux. Scanner clean. Script
+suites: migration 14/14, scanner 15/15, backup 10/10.
+
+### Not done, deliberately
+
+No rebuild, no reinstall, and **no live Keychain credential was read** — the
+fixes are verified by unit tests rather than by prompting again. The installed
+build therefore still prints the old messages until it is next rebuilt; the
+three live references, nine observations, ten classifications, two decisions,
+two publication UIDs and ten audit rows are untouched.
