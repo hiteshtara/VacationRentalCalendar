@@ -23,6 +23,13 @@ export VRC_APP_BINARY="/nonexistent/VacationRentalCalendar"
 
 ROOT="$(mktemp -d)"
 trap 'rm -rf "${ROOT}"' EXIT
+# Rehearsal mode. Not decoration: it makes a FORGOTTEN redirection a refusal
+# instead of a write to the live database. On 2026-11-10 a rehearsal relied on
+# an environment variable to isolate itself, the variable did not do what was
+# assumed, and two live feeds were changed. Scripts sourced from here resolve
+# the path they are about to touch and refuse if it is the real one.
+export VRC_REHEARSAL="disposable-database-only"
+
 export VRC_SUPPORT_DIR="${ROOT}/support"
 mkdir -p "${VRC_SUPPORT_DIR}"
 DB="${VRC_SUPPORT_DIR}/VacationRentalCalendar.sqlite"

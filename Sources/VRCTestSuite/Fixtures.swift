@@ -235,10 +235,33 @@ public enum Fixtures {
         return (store, ids, StubFeedFetcher(texts: texts))
     }
 
-    public static func temporaryDatabasePath() -> String {
+    /// A scratch database path, VERIFIED not to be the live one before it is
+    /// handed out.
+    ///
+    /// The assertion is not ceremony. On 2026-11-10 a rehearsal believed it had
+    /// redirected the database by setting `HOME`; macOS resolves the
+    /// application support directory without consulting `HOME`, so the real
+    /// database was opened and two live feeds were changed. Every test path
+    /// therefore proves itself here, at the one place they all come from, by
+    /// resolving the path rather than trusting how it was produced.
+    public static func temporaryDatabasePath(
+        file: StaticString = #filePath, line: UInt = #line
+    ) -> String {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("vrc-tests-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory.appendingPathComponent("test.sqlite").path
+        let path = directory.appendingPathComponent("test.sqlite").path
+        do {
+            try RehearsalIsolation.assertIsolated(databasePath: path)
+        } catch {
+            // Refuse BEFORE the caller can open it. A test that cannot prove
+            // its own isolation must not run at all.
+            fatalError("""
+                refusing to hand out a test database path that is not provably \
+                disposable: \(path) — \((error as? LocalizedError)?.errorDescription ?? "\(error)") \
+                [\(file):\(line)]
+                """)
+        }
+        return path
     }
 }

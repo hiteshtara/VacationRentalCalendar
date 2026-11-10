@@ -2593,3 +2593,102 @@ as it is.
 
 Nothing was installed. The running application is still `f74bbb7`, which
 contains neither this fix nor §27's queue nor §28's out-of-service check.
+
+## 30. Rehearsal isolation, enforced rather than assumed (2026-11-10)
+
+### The mistake this closes
+
+Rehearsing the connection-state recovery of §29, I "isolated" it by pointing
+`HOME` at a temporary directory and copying the database there. On macOS
+`FileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)` does
+**not** consult `HOME`, so `vrc` opened the real database and performed the
+change on production. Two live feeds moved from `credentialUnreadable` to
+`failing` without approval.
+
+The rehearsal's own before/after comparison showed nothing, because it was
+reading the copy — the wrong file. That is the part worth dwelling on: the
+check that was supposed to catch this was looking somewhere the write never
+went.
+
+**An environment variable is not isolation.** Isolation is only established by
+resolving the path that will actually be opened and proving it is not the live
+one.
+
+### The guard
+
+`RehearsalIsolation` already existed, for publication rehearsals, and was close
+— but it compared `standardizedFileURL` paths as strings. Three ways to name
+the live database got past that, each now closed:
+
+1. **Symlinks** are resolved. `/tmp` is a symlink to `/private/tmp`, so a
+   scratch file has two spellings — and far worse, a link inside a temporary
+   directory can point straight at production.
+2. **`.` and `..`** are collapsed, so traversal cannot walk back into the
+   support directory from somewhere that looked safe.
+3. **Case is folded for comparison.** APFS is case-insensitive by default, so
+   two spellings differing only in case are one file. Case is *not* folded in
+   the message, because a refusal must quote the path the caller actually gave.
+
+Also refused: the support directory itself, anything inside it (the WAL and
+shared-memory files hold recent writes; the backups live there too), and the
+directory beside an injected production path. `:memory:` is the one
+unconditionally safe answer. The stance is `DestructiveTestIsolation`'s: **fail
+closed** — the question is "has this proved itself disposable?", never "is
+there a reason to worry?".
+
+`RehearsalMode` is separate and answers a different question: not "is this path
+safe?" but "may I fall back to the default path at all?" In a rehearsal the
+answer is no, because the default path *is* production. So forgetting to pass
+a database is a refusal instead of a write to the real one.
+
+### Where it is enforced
+
+* **`vrc`** gains `--database <path>`, verified before the file is opened, and
+  honours `VRC_REHEARSAL`. Every invocation now prints the resolved database
+  path on stderr — the single line that would have made this mistake obvious
+  in a glance rather than after the write.
+* **`Fixtures.temporaryDatabasePath()`** verifies the path it is about to hand
+  out and `fatalError`s rather than return one that is not isolated. Every
+  file-backed Swift test comes through there, so that is the chokepoint.
+* **`backup-before-install.sh`** resolves its support directory with `pwd -P`
+  and refuses in rehearsal mode if it is the live one. `VRC_SUPPORT_DIR` being
+  set is not proof of anything — it can be set to the live directory.
+* **The shell suites** — backup/restore, credential migration, credential
+  health — now export `VRC_REHEARSAL`, so a forgotten redirection in any of
+  them is a refusal.
+* **Publication rehearsals** already went through `RehearsalIsolation` and
+  inherit every improvement above.
+
+### The tests that do the dangerous thing on purpose
+
+`Scripts/test-rehearsal-isolation.sh` aims state-changing commands straight at
+the live database and requires a refusal: the exact `vrc connection` command
+that caused the incident, a symlink to the live database, traversal into the
+support directory, the write-ahead log, and a missing `--database` in rehearsal
+mode. It then proves the guard is still *usable* — a disposable copy is
+accepted and the change lands there — and ends with a **tripwire**: the live
+database is checksummed before and after, with its connection states and
+history row count, and the suite fails loudly if a single byte moved.
+
+15 shell cases, 15 Swift cases. The Swift ones are classification-only against
+the real path, so nothing opens or writes it.
+
+### Verified
+
+* **589 Swift tests**, 1899 assertions.
+* Shell: rehearsal-isolation 15/15, credential-health 15/15, backup-restore
+  10/10, scanner 15/15, migrate-credentials 14/14, profile-inspector 7/7.
+* Parity `b3398471…c604f5`, identical macOS and Linux, unchanged.
+* Scanner clean, five baselined historical findings.
+* Tripwire: live database unchanged — listings 1 and 2 `failing`, 3
+  `connected`, 59 connection events, max sync run 293.
+
+### Deliberately not done
+
+**The two connection-state entries from §29 are preserved exactly, including
+their incorrect `actor owner` labels.** They were written by my command, not by
+the owner. Correcting them needs an append-only entry and separate approval;
+nothing has been reversed or rewritten.
+
+No credential was read or modified, no reservation touched, nothing installed,
+no AWS change, outbound publishing still disabled.

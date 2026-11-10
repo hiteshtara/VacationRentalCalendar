@@ -147,22 +147,143 @@ public enum RehearsalIsolation {
         }
     }
 
+    /// The path SQLite understands as "no file at all". Always disposable.
+    public static let inMemoryPath = ":memory:"
+
+    /// The production database, canonicalised the same way candidates are.
+    public static var productionDatabasePath: String {
+        canonical(AppPaths.databaseURL.path)
+    }
+
+    /// Reduces a path to the thing that will actually be opened.
+    ///
+    /// Three normalisations, each of which a plain string comparison misses,
+    /// and each of which is a way to name the live database while appearing
+    /// not to:
+    ///
+    /// 1. **Symlinks are resolved.** `/tmp` is a symlink to `/private/tmp` on
+    ///    macOS, so the same scratch file has two spellings — and, far worse, a
+    ///    link inside a temporary directory can point straight at production.
+    /// 2. **`.` and `..` are collapsed**, so traversal cannot walk back into
+    ///    the support directory from somewhere that looked safe.
+    /// 3. **Case is folded.** APFS is case-insensitive by default, so two
+    ///    spellings that differ only in case are one file.
+    ///
+    /// Relative paths are resolved against the current directory, because that
+    /// is what SQLite would do with them.
+    public static func canonical(_ path: String) -> String {
+        guard path != inMemoryPath else { return inMemoryPath }
+        let absolute = path.hasPrefix("/")
+            ? path
+            : FileManager.default.currentDirectoryPath + "/" + path
+        let resolved = URL(fileURLWithPath: absolute)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        // A symlink to a file that does not exist resolves to itself, which is
+        // correct: there is nothing there to damage yet.
+        //
+        // Case is NOT folded here. APFS is case-insensitive, so comparisons
+        // must be, but a refusal has to quote the path the caller actually
+        // gave or the message sends them looking for a file that does not
+        // exist under that spelling. Folding happens in `matches` instead.
+        return resolved
+    }
+
+    /// Whether a path names the live database. Exposed for the test suite, so
+    /// it can assert the classification without reaching for internals.
+    public static func matchesProductionForTesting(_ path: String) -> Bool {
+        matches(canonical(path), productionDatabasePath)
+    }
+
+    /// Whether two canonical paths name the same file, on a filesystem where
+    /// case usually does not distinguish them.
+    static func matches(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.compare(rhs, options: .caseInsensitive) == .orderedSame
+    }
+
+    /// Whether `candidate` sits inside `directory`.
+    static func isInside(_ candidate: String, _ directory: String) -> Bool {
+        candidate.lowercased().hasPrefix(directory.lowercased() + "/")
+    }
+
+    /// Whether `databasePath` is provably not production and not beside it.
+    ///
+    /// Fail closed: this answers "has it proved itself disposable?", never "is
+    /// there a reason to worry?". Compare `DestructiveTestIsolation`, which
+    /// takes the same stance for the PostgreSQL suite.
+    public static func isDisposable(
+        databasePath: String,
+        productionPath: String = AppPaths.databaseURL.path
+    ) -> Bool {
+        do {
+            try assertIsolated(databasePath: databasePath, productionPath: productionPath)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// Throws unless `path` is demonstrably not the production database.
+    ///
+    /// **An environment variable is never accepted as proof.** This resolves
+    /// the path that will really be opened and compares it with the path the
+    /// application itself would open. On 2026-11-10 a rehearsal was "isolated"
+    /// by pointing `HOME` at a temporary directory; macOS resolves the
+    /// application support directory without consulting `HOME`, so the CLI
+    /// opened production and changed two live feeds' connection state. The
+    /// copy being watched was never touched, so the rehearsal's own
+    /// before/after check saw nothing wrong.
     public static func assertIsolated(
         databasePath: String,
         productionPath: String = AppPaths.databaseURL.path
     ) throws {
-        let candidate = URL(fileURLWithPath: databasePath).standardizedFileURL.path
-        let production = URL(fileURLWithPath: productionPath).standardizedFileURL.path
-        guard candidate != production else {
+        // In memory is the one unconditionally safe answer: there is no file.
+        guard databasePath != inMemoryPath else { return }
+
+        let candidate = canonical(databasePath)
+        let production = canonical(productionPath)
+        guard !matches(candidate, production) else {
             throw Violation.wouldUseProductionDatabase(candidate)
         }
         // Also refuse anything inside the application support directory, so a
-        // sibling file there cannot be mistaken for a sandbox.
-        let supportDirectory = AppPaths.supportDirectory.standardizedFileURL.path
-        guard !candidate.hasPrefix(supportDirectory + "/") else {
+        // sibling file there cannot be mistaken for a sandbox. That covers the
+        // WAL and shared-memory files, which hold recent writes, and the
+        // backups, which are the thing a failed rehearsal would need.
+        let supportDirectory = canonical(AppPaths.supportDirectory.path)
+        guard !matches(candidate, supportDirectory),
+              !isInside(candidate, supportDirectory) else {
             throw Violation.wouldUseProductionDatabase(candidate)
         }
+        // And refuse anything beside the protected database itself, for a
+        // caller that injected a production path of its own.
+        let productionDirectory = (production as NSString).deletingLastPathComponent
+        guard !productionDirectory.isEmpty, productionDirectory != "/" else { return }
+        guard !matches(candidate, productionDirectory) else {
+            throw Violation.wouldUseProductionDatabase(candidate)
+        }
+    }
+}
+
+/// Whether this process is a rehearsal, and so must never open the live
+/// database at all.
+///
+/// Distinct from `RehearsalIsolation`, which answers "is this path safe?".
+/// This answers "am I allowed to fall back to the default path?" — and in a
+/// rehearsal the answer is no, because the default path IS production. Test
+/// scripts set it so that forgetting to pass a database is a refusal rather
+/// than a write to the real one.
+///
+/// Opting IN to extra safety, so an exact value is required only to keep the
+/// meaning unambiguous, not to guard against accidental enabling.
+public enum RehearsalMode {
+    public static let variable = "VRC_REHEARSAL"
+    public static let value = "disposable-database-only"
+
+    public static func isActive(
+        in environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment[variable] == value
     }
 }
 

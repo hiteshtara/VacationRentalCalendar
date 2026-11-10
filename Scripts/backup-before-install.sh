@@ -36,6 +36,27 @@ source "$(dirname "$0")/credential-health.sh"
 
 SUPPORT="${VRC_SUPPORT_DIR:-${HOME}/Library/Application Support/VacationRentalCalendar}"
 DB="${SUPPORT}/VacationRentalCalendar.sqlite"
+
+# In rehearsal mode the database this will touch must be PROVABLY disposable.
+#
+# VRC_SUPPORT_DIR being set is not proof of anything — it can be set to the
+# live directory, and on 2026-11-10 a redirection that was assumed to isolate a
+# rehearsal silently did not. So the path is resolved (`pwd -P` follows
+# symlinks) and compared with the live one, case-folded because APFS is
+# case-insensitive.
+if [ "${VRC_REHEARSAL:-}" = "disposable-database-only" ]; then
+    _live_dir="${HOME}/Library/Application Support/VacationRentalCalendar"
+    _live_real="$( (cd "${_live_dir}" 2>/dev/null && pwd -P) || printf '%s' "${_live_dir}" )"
+    _mine_real="$( (cd "${SUPPORT}" 2>/dev/null && pwd -P) || printf '%s' "${SUPPORT}" )"
+    _fold() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+    if [ "$(_fold "${_mine_real}")" = "$(_fold "${_live_real}")" ]; then
+        printf 'REFUSED: %s is set, so this rehearsal must not touch the live data.\n' \
+            "VRC_REHEARSAL" >&2
+        printf '  resolved support directory: %s\n' "${_mine_real}" >&2
+        printf '  which is the live one. Point VRC_SUPPORT_DIR somewhere disposable.\n' >&2
+        exit 1
+    fi
+fi
 SERVICE="com.vacationrentalcalendar.feed-url"
 
 say()  { printf '%s\n' "$*"; }

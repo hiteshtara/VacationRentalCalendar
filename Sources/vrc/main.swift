@@ -13,14 +13,68 @@ func value(for flag: String) -> String? {
     return arguments[index + 1]
 }
 
+/// Progress and provenance, on stderr so it never pollutes parsed output.
+func note(_ message: String) {
+    FileHandle.standardError.write(Data(("vrc: " + message + "\n").utf8))
+}
+
 func bail(_ message: String) -> Never {
     FileHandle.standardError.write(Data(("error: " + message + "\n").utf8))
     exit(1)
 }
 
+/// Opens the database this invocation should act on, and says which one.
+///
+/// Three ways in, and the resolved path is always announced on stderr. That
+/// line exists because of 2026-11-10: a rehearsal pointed `HOME` at a
+/// temporary directory, assumed that redirected the database, and changed two
+/// live feeds' connection state. macOS resolves the application support
+/// directory without consulting `HOME`, so this process opened production
+/// while the copy being watched stayed untouched. Printing the path makes that
+/// mistake visible in one glance instead of after the write.
+///
+///   --memory            an in-memory database; nothing on disk
+///   --database <path>   a specific file, REFUSED unless provably disposable
+///   (neither)           the live database — refused in rehearsal mode
 func makeStore() -> RentalStore {
     do {
-        if flags.contains("--memory") { return try RentalStore.makeInMemory() }
+        if flags.contains("--memory") {
+            note("database :memory:")
+            return try RentalStore.makeInMemory()
+        }
+
+        if let path = value(for: "--database") {
+            // Verified, not trusted. The check resolves symlinks, collapses
+            // traversal and folds case, because each of those is a way to name
+            // the live database while appearing not to.
+            do {
+                try RehearsalIsolation.assertIsolated(databasePath: path)
+            } catch {
+                bail("""
+                    \((error as? LocalizedError)?.errorDescription ?? "\(error)")
+
+                      --database must point somewhere disposable. Use --memory, or a
+                      path outside \(AppPaths.supportDirectory.path).
+                    """)
+            }
+            note("database \(RehearsalIsolation.canonical(path))")
+            return try RentalStore(
+                database: Database(path: path),
+                credentials: InMemoryFeedCredentialStore()
+            )
+        }
+
+        if RehearsalMode.isActive() {
+            bail("""
+                REFUSED: \(RehearsalMode.variable)=\(RehearsalMode.value) is set, so this \
+                process must not open the live database.
+
+                  Pass --memory or --database <disposable path>. Defaulting to the live
+                  database is exactly what this mode exists to prevent.
+                """)
+        }
+
+        note("database \(RehearsalIsolation.productionDatabasePath)")
         return try RentalStore.makeDefault()
     } catch {
         bail("could not open the database: \(error)")

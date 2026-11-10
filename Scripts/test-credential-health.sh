@@ -39,6 +39,13 @@ pass=0; fail=0
 ok()  { printf '  \033[32mok\033[0m   %s\n' "$*"; pass=$((pass+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=$((fail+1)); }
 
+# Rehearsal mode. Not decoration: it makes a FORGOTTEN redirection a refusal
+# instead of a write to the live database. On 2026-11-10 a rehearsal relied on
+# an environment variable to isolate itself, the variable did not do what was
+# assumed, and two live feeds were changed. Scripts sourced from here resolve
+# the path they are about to touch and refuse if it is the real one.
+export VRC_REHEARSAL="disposable-database-only"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
