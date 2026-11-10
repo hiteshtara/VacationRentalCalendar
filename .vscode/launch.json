@@ -259,6 +259,26 @@
             "target": "vrc-migrate",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release vrc-migrate"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Debug vrc-lambda-feed",
+            "target": "vrc-lambda-feed",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug vrc-lambda-feed"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VacationRentalCalendar}",
+            "name": "Release vrc-lambda-feed",
+            "target": "vrc-lambda-feed",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release vrc-lambda-feed"
         }
     ]
 }

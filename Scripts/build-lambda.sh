@@ -40,7 +40,7 @@ IMAGE="swift:6.3.3-amazonlinux2023"
 # Which environment's functions to update. Staging by default, so a careless
 # --deploy cannot reach production: that needs the prefix stated explicitly.
 PREFIX="${VRC_FUNCTION_PREFIX:-vrc-staging}"
-FUNCTIONS=(fetch process publish api sweeper)
+FUNCTIONS=(fetch process publish api sweeper feed)
 OUT=".build/lambda"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -74,13 +74,13 @@ swift run vrc-test > /tmp/vrc-test.log 2>&1 || true
 grep -E "tests passed|tests failed" /tmp/vrc-test.log | sed "s/^/TESTS /" || true
 grep "FAILED" /tmp/vrc-test.log | sed "s/^/TESTFAIL /" || true
 
-for f in fetch process publish api sweeper; do
+for f in fetch process publish api sweeper feed; do
   swift build -c release --product "vrc-lambda-$f" >/tmp/b.log 2>&1 || {
     echo "BUILD_FAILED $f"; grep -E "error:" /tmp/b.log | head -3; exit 1; }
 done
 
 mkdir -p /src/pkg && rm -rf /src/pkg/*
-for f in fetch process publish api sweeper; do
+for f in fetch process publish api sweeper feed; do
   d="/src/pkg/$f"; mkdir -p "$d/lib"
   cp ".build/release/vrc-lambda-$f" "$d/bootstrap"; chmod +x "$d/bootstrap"
   ldd "$d/bootstrap" 2>/dev/null | awk "{print \$3}" | grep -E "^/" | while read -r so; do

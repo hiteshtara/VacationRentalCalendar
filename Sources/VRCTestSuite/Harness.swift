@@ -105,6 +105,7 @@ public enum TestRegistry {
             + TransactionLifecycleTests.cases
             + DataStoreParityTests.cases
             + DestructiveIsolationTests.cases
+            + FeedEndpointTests.cases
             + PostgresIntegrationTests.cases
             + DecisionRouteTests.cases
             + CloudSyncClientTests.cases

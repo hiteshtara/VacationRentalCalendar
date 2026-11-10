@@ -18,6 +18,7 @@ let package = Package(
         .executable(name: "vrc-lambda-publish", targets: ["vrc-lambda-publish"]),
         .executable(name: "vrc-lambda-api", targets: ["vrc-lambda-api"]),
         .executable(name: "vrc-lambda-sweeper", targets: ["vrc-lambda-sweeper"]),
+        .executable(name: "vrc-lambda-feed", targets: ["vrc-lambda-feed"]),
         .library(name: "VRCCore", targets: ["VRCCore"]),
     ],
     dependencies: [
@@ -84,6 +85,11 @@ let package = Package(
             name: "vrc-lambda-publish",
             dependencies: ["VRCCore", "VRCLambda"],
             path: "Sources/vrc-lambda-publish"
+        ),
+        .executableTarget(
+            name: "vrc-lambda-feed",
+            dependencies: ["VRCCore", "VRCLambda"],
+            path: "Sources/vrc-lambda-feed"
         ),
         .executableTarget(
             name: "vrc-lambda-api",
