@@ -1575,3 +1575,172 @@ not authorized. The options, for a decision:
    documentation key *only*;
 3. rewrite history and force-push — clean, and the branch is unmerged, but it
    rewrites commits already published.
+
+## 20. The Booking.com connection, end to end (2026-11-10)
+
+Booking.com, Airbnb and Vrbo are all connected and verified as of 17:02:30Z.
+Getting there took most of a day and turned up **two bugs in this app**, one
+undocumented behaviour in Booking.com's Extranet, and one piece of Airbnb
+behaviour that is easy to mistake for a bug here. This section is the whole
+story, because almost none of it is recoverable from the diff.
+
+### Where it started
+
+Property `17482435` had a calendar connection named `loda` stuck on
+**Activating**. The obvious reading — "Booking.com is rejecting our feed" —
+was wrong, and chasing it cost hours.
+
+### Thing 1: our feed was not valid iCalendar (real, fixed, not the cause)
+
+Covered in §19. The short version: a `VCALENDAR` with zero components
+violates RFC 5545 §3.4, and that is what we served for a destination with
+nothing approved. Fixed with a `VTIMEZONE` rather than a placeholder `VEVENT`,
+because an outbound feed's events *are* its statement of unavailability.
+
+**It was worth fixing and it was not what blocked Booking.com.** Keep those
+separate. The fix is justified by the standard, not by the outcome.
+
+### Thing 2: "Activating" does not mean what it looks like
+
+Booking.com's own legend:
+
+> **Activating** — We are activating your calendar connection, waiting to
+> connect to the other end for the first time.
+
+"The other end connecting" means **us fetching Booking.com's export URL** —
+not Booking.com fetching ours. The status flipped to **OK** within seconds of
+the first `curl` of their export link, and not before.
+
+So a connection sits at *Activating* forever until something pulls their
+calendar. All five historical connections (`loda`, `ll`, `hy`, and two named
+`VacationRentalCalendar`) had never been fetched by anything, because their
+export URL had never been given to this app.
+
+### Thing 3: the wizard's hidden gate
+
+On the export step, **"Done" stays disabled until you click "Copy link".**
+
+That single detail explains every stuck connection. The setup was always
+abandoned at that screen, so Booking.com never recorded the connection as
+finished. Two further traps around it:
+
+* **"Complete setup" appears only on older rows.** The most recently created
+  connection shows **Remove** instead. That is why `loda` looked unrecoverable
+  — the link existed, just not on the row being looked at.
+* Once a connection reaches **OK**, the export URL is **no longer shown
+  anywhere**. Capture it during setup or create a new connection to see it
+  again.
+
+Also worth knowing: Booking.com **auto-fills the calendar name from the pasted
+URL's host**, so the name field silently became
+`om62jzjcqr6…on.awsVacationRentalCalendar`. Clear it before submitting.
+
+### Thing 4: Airbnb does not re-export imported blocks
+
+A separate report — "Airbnb is not refreshing", Dec 1–7 blocked on Airbnb but
+missing from our calendar — turned out not to be a refresh problem at all. The
+app was fetching Airbnb successfully **8 times in 10 minutes**, and Airbnb's
+export genuinely did not contain those nights.
+
+Airbnb had a connected calendar named "book" importing from Booking.com. A
+platform does not re-export blocks that arrived from an imported calendar —
+otherwise two platforms syncing each other would loop forever. So those nights
+were blocked in Airbnb's UI and absent from Airbnb's `.ics` simultaneously,
+by design.
+
+Confirmed by fetching Airbnb's export directly: 4 VEVENTs, 921 bytes, no
+December dates other than 17–19.
+
+**The diagnostic rule:** a block visible in a platform's UI but missing from
+its iCal export is almost always either an imported block or an availability
+*rule* (advance notice, preparation time, trip length). Neither exports.
+Before suspecting this app, fetch the platform's export directly and count the
+`VEVENT`s.
+
+That direct Airbnb ↔ Booking.com link has since been removed, which is the
+topology this project wants: one hub, not platforms syncing behind its back.
+
+### Bug 1 — a new URL did not revive a revoked feed
+
+Commit `1af0adc`. `FeedConnectionState.revoked` has
+`shouldAttemptImport == false`, which is correct. But the latch has to be
+released when the owner supplies a **different** URL: the platform's verdict
+was about the old token.
+
+`ListingRepository.update` released it only for `credentialUnreadable`. So
+Airbnb and Vrbo recovered whenever re-entered after a rebuild, and Booking.com
+could never recover at all. The symptom was precise and misleading: the
+Keychain item's `mdat` showed the paste had saved, the app reported
+"disconnected by the platform" one second later, and `sync_runs` recorded **no
+HTTP status and zero events seen** — because nothing was ever sent.
+
+The app's own banner said *"It will not be retried until you supply a new
+one."* It did not implement that.
+
+Now expressed as a rule over `shouldAttemptImport`, with `disconnectedByOwner`
+excluded: typing a URL is not the same as asking for a feed to be switched
+back on.
+
+### Bug 2 — the credential reference is not versioned for a revoked feed
+
+**Still open.** `ListingRepository.swift:94` gates reference versioning on the
+same single state:
+
+```swift
+if listing.connectionState == .credentialUnreadable,
+   credentials.exists(reference: reference) { … }
+```
+
+Pasting a new URL while the listing is `revoked` therefore writes **into the
+existing Keychain item**, inheriting an access list that names an older build.
+The write succeeds — writing and reading are separately authorised — and the
+next import fails as `credential_unreadable`.
+
+Observable consequence: the first paste appears to fail, and the owner has to
+paste a second time. That is exactly what happened today; the ref only became
+`booking-17482435-v2` on the second attempt.
+
+The fix is the same `isClearedByANewURL` rule already added for Bug 1.
+
+### A trap that nearly produced a false green
+
+`ListingRepository.insert` **does not persist `connection_state`** — it only
+ever moves through `setConnectionState`, so every change leaves an audit row.
+The first version of the Bug 1 tests passed `connectionState:` to the
+initialiser, which silently did nothing. The "revoked" fixture was never
+revoked, and the headline test **passed against the unfixed code**.
+
+If you write a test involving connection state, set it with
+`setConnectionState` and read the listing back.
+
+### Verified final state
+
+| Direction | Evidence |
+|---|---|
+| Airbnb → app | HTTP 200, 4 events |
+| Vrbo → app | HTTP 200, 3 events |
+| Booking.com → app | HTTP 200, 2 events, 17:02:30Z, ref `booking-17482435-v2` |
+| app → Booking.com | our endpoint served Booking.com at 16:43:15Z, 2s after submit |
+| Booking.com connection | **OK**, Last exported "Just now" |
+
+Booking.com exports two events, both `CLOSED - Not available`
+(2026-11-10→12-01 and 2027-04-01→2028-05-10). Both classify as
+`unknownUnavailable` and sit in the review queue; neither propagates to Airbnb
+or Vrbo. **That is correct.** Booking.com labels reservations and owner blocks
+identically, and this app does not guess.
+
+Suite: **412 tests**. Parity digest unchanged, macOS and Linux identical.
+
+### Open items
+
+1. **Bug 2 above** — one-line condition change, same rule as Bug 1.
+2. **"Decide what to export"** is still *Booked and closed dates*. Switching it
+   to *Booked dates only* would make everything we receive unambiguously a real
+   reservation. Owner's decision; it affects all connections.
+3. **The secret scanner's history scan is still red** (see §19) from the
+   synthetic fixtures in `d262eda`, already on the public remote. Working-tree
+   scan is clean.
+4. The app surfaces no last-fetch time and **discards parser warnings**
+   entirely — `ImportService` collects them and only the CLI prints them. That
+   is why "is it broken or is there nothing new?" was unanswerable from the UI
+   and needed a database query to settle.
