@@ -1983,3 +1983,84 @@ Ready, with these preconditions:
 
 Nothing has been installed, no migration run against live data, no AWS
 resource touched, outbound publishing still disabled.
+
+## 23. Two defects the installation exposed (2026-11-10)
+
+Commit `55a78ad`. Both were found by installing the build and using it, not by
+reading the code — and neither would have been found by the test suite as it
+stood.
+
+### The app could not read credentials its own bundled CLI could
+
+Symptom: after installing, all three feeds showed "In Keychain" and "the saved
+URL cannot be read", and the portfolio said 0/3 connected — eleven minutes
+after the bundled helper had fetched all three with HTTP 200.
+
+**Not stale UI.** `sync_runs` records real attempts: success with HTTP 200 at
+18:11 from `Contents/MacOS/vrc`, and `credential_unreadable` at 18:22 from
+`Contents/MacOS/VacationRentalCalendar`. Within the hour the helper could not
+read them either.
+
+**Cause.** `FeedCredentialStore.save` updates in place when an item exists —
+deliberately, so a working entry keeps the access list the owner approved.
+`migrate-cloud-credential.sh` ran while the listings were `connected`, so
+`isClearedByANewURL` was false, nothing versioned, and the update path
+preserved an access list naming the **previous build's binaries**. The new
+ones held only the transient grant from the migration's own prompts; once that
+lapsed, both were locked out.
+
+Preserving the grant is right for an ordinary save and exactly wrong for a
+re-home, whose entire premise is that the code objects have changed.
+
+**Fix.** `ListingRepository.update(_:rehomeCredential:)` forces a fresh
+reference regardless of connection state; `vrc set-url --rehome` exposes it
+and the migration script passes it. The old entry is left in place — nothing
+deleted, no URL regenerated.
+
+**The misleading message was right.** `build-app.sh` printed "migrated; the
+helper still cannot read it" for all three and then summarised "need manual
+re-entry: 0". The per-line warning was accurate and the summary was wrong.
+
+### `vrc doctor` reported unreadable credentials as readable
+
+`(try? credentials.url(ref)) == nil` is a **double optional**: nil only when
+the read THREW. A reference pointing at nothing came back `.some(nil)` and was
+counted as readable. That is why doctor said "all readable" at 18:09 while the
+migration was warning otherwise.
+
+Replaced with `RentalStore.unreadableCredentials()`, which flattens it, covers
+dangling references, ignores listings whose URL lives in the database column,
+and is tested.
+
+### Nine conflicts on a property with nothing booked
+
+Every observation at 39 G Street is a `cancellationBlock` — nights Airbnb
+closed after a host cancellation, which this app exists to keep on sale — and
+they overlap each other constantly. The detector reported nine conflicts and
+the portfolio flagged "needs attention".
+
+A conflict has to be actionable. If **neither** side claims the property is
+unavailable, nothing is colliding. Pairs where neither side satisfies
+`describesGenuineUnavailability` are now skipped — the same allow-list that
+decides what may be exported, so a new `BlockKind` is governed here too rather
+than forgotten. One side is enough: a confirmed reservation under dates
+another platform cancelled still surfaces.
+
+Left alone, a real double booking would have been the tenth row in a list of
+nine false ones.
+
+Verified read-only against the live database: **conflicts 9 → 0**, with the 9
+observations, 10 classifications, 2 decisions, 2 publication UIDs and 10 audit
+rows untouched, and all twelve Keychain entries present.
+
+### Outstanding: the live credentials are still unreadable
+
+The fix is in the source. The **installed** build (`82cc52b`) predates it and
+has no `--rehome`, so repairing the live credentials needs a reinstall
+followed by `./Scripts/migrate-cloud-credential.sh`, which reads the existing
+values with one macOS prompt each and writes them to fresh references
+(`-v6`). **No URL needs re-entering** — the values are still in the Keychain
+and the migration moves them.
+
+Until then the app shows all three feeds disconnected. Imports are not
+retried in that state, so nothing is being fetched and nothing is at risk.
