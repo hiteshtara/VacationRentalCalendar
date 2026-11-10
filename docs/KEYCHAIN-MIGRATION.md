@@ -384,18 +384,38 @@ from here.
 
 ### Step 1 — Register the App ID
 
+**There is no Keychain Sharing capability in the portal, and none is needed.**
+
+Keychain Sharing is an **Xcode** capability, not an App ID capability — which
+is why it does not appear under Capabilities or App Services. Its only effect
+is to write the `keychain-access-groups` entitlement into the signature.
+
+The *authorization* comes from the profile, and a provisioning profile
+automatically carries `keychain-access-groups` with a `<TeamID>.*` wildcard
+whether or not any capability is enabled. Apple's own worked example shows a
+profile for an App ID with nothing enabled containing:
+
+```xml
+<key>keychain-access-groups</key>
+<array><string>SKMME9E2Y8.*</string></array>
+```
+
+A trailing-wildcard entry authorizes any group with that prefix, so
+`26JLFSV9YS.*` covers `26JLFSV9YS.com.vacationrentalcalendar.shared`.
+
+So:
+
 1. <https://developer.apple.com/account> → **Certificates, Identifiers &
    Profiles** → **Identifiers** → **+**
 2. Select **App IDs** → **Continue** → type **App** → **Continue**
 3. **Description:** `Vacation Rental Calendar`
-4. **Bundle ID:** select **Explicit** and enter exactly
-   `com.vacationrentalcalendar.app`
-   *(Explicit, not wildcard — Keychain Sharing needs an explicit App ID.)*
-5. Under **Capabilities**, tick **Keychain Sharing**, then its **Edit**/
-   **Configure** button and add the group:
-   `com.vacationrentalcalendar.shared`
-   *(Without the `26JLFSV9YS.` prefix — the portal adds it.)*
+4. **Bundle ID:** **Explicit**, exactly `com.vacationrentalcalendar.app`
+5. **Select no capabilities.** None is required for this.
 6. **Continue** → **Register**
+
+This is an inference from how profiles are issued, not something Apple states
+for Developer ID specifically — which is exactly why step 3a below verifies it
+on the actual profile before anything is built.
 
 ### Step 2 — Create the Developer ID provisioning profile
 
@@ -416,6 +436,26 @@ cp ~/Downloads/VRC_Developer_ID.provisionprofile \
 
 It is gitignored — a profile is team-specific and has no business in a public
 repository.
+
+### Step 3a — VERIFY the profile before building anything
+
+```
+./Scripts/inspect-provisioning-profile.sh
+```
+
+It decodes the profile and reports which access groups it actually
+authorizes, then says plainly whether
+`26JLFSV9YS.com.vacationrentalcalendar.shared` is among them. If it is not,
+stop: signing with the entitlement would be killed by AMFI on launch, and no
+amount of building will reveal why.
+
+The inspector has its own tests — `Scripts/test-profile-inspector.sh`, 7 cases
+covering wildcards, exact matches, unrelated groups, another team's wildcard
+and a near-miss team prefix. Worth having: its first version reported a
+perfectly good profile as authorizing nothing, because `GROUPS` is a readonly
+special variable in bash holding the user's group IDs. The assignment was
+silently ignored and the check compared against a gid. Only the tests caught
+it.
 
 ### Step 4 — Tell me, and I will run tests A–F
 
