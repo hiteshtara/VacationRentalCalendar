@@ -2254,3 +2254,124 @@ the single largest source of day-to-day breakage in this project.
 No membership purchased, no entitlements added, no sandbox enabled, no
 container migration written, no StoreKit, nothing submitted. PRs #10 and #11
 remain open and unmerged.
+
+## 27. The Refresh button that did nothing (2026-11-10)
+
+### The report
+
+The owner clicked Refresh on Airbnb, then on Vrbo, then on Booking.com, under
+Settings → Calendar feeds. Only Airbnb imported. They were explicit: *don't
+assume I clicked incorrectly.* They were right not to.
+
+### What the evidence said
+
+`sync_runs` held exactly one row after the `f74bbb7` install — run 290, listing
+2, 22:08:46 → 22:08:56, HTTP 200, 7 events. For listings 1 and 3 there was no
+success, **no failure, and no `listing_connection_events` row**. That last part
+is what settles it: every exit path in `ImportService.importFeed` ends in
+`try? syncRuns.record(run)`, including the disconnected and
+unreadable-credential paths. No row at all means the function was never entered.
+
+So the click was lost before the import path. The only gate between the button
+and `AppState.refresh(listing:)` was the view's own modifier:
+
+```swift
+.disabled(!hasCredential || state.isRefreshing)
+```
+
+Both branches were checked rather than assumed:
+
+* `hasCredential` was **true** for all three. All three Keychain items were
+  present — verified with an attribute-only lookup, which reads no secret and
+  therefore cannot prompt or be refused by an ACL.
+* The UI was **not** frozen. `ImportService` is a nonisolated `Sendable` struct,
+  so `await importFeed` suspends off the main actor; a sample of the running
+  process showed the main thread idle in the event loop with no Keychain or
+  import frames.
+
+That leaves `state.isRefreshing`: one app-wide flag, set for the whole of one
+feed's import. Airbnb's import held it for **ten seconds** — the owner's
+Keychain prompt was inside that window — and for those ten seconds every
+per-feed Refresh button in the application rendered disabled. SwiftUI discards
+clicks on a disabled control silently. No import, no record, no message.
+
+### The shape of the fault
+
+It is the same shape as the 4-second Keychain deadline in §23 and the
+unconditional `tombstoneMissing` in §23: **a safety mechanism that fails
+silently.** The flag existed to stop two imports running at once, which is a
+real requirement — the Keychain is a shared resource and an abandoned read
+poisons every later call in the process. What was wrong was the remedy:
+refusing the work instead of deferring it, and refusing it invisibly.
+
+### The fix
+
+[`FeedRefreshQueue`](Sources/VRCCore/Logic/FeedRefreshQueue.swift) replaces the
+flag. Two rules:
+
+1. **One feed refreshing never disables another.** `isBusy` and `state(of:)`
+   are asked about a specific listing, so only that row goes quiet.
+2. **A request is never dropped.** Imports stay strictly serial, but a request
+   that cannot start now is *queued* and run in turn. Every outcome —
+   `startNow`, `queued`, `alreadyPending` — carries an `ownerMessage`, because a
+   click with no visible answer is indistinguishable from the dead button this
+   replaced, even when coalescing it was the right thing to do.
+
+[`FeedRefreshEligibility`](Sources/VRCCore/Logic/FeedRefreshEligibility.swift)
+is the second half. A feed can wait in the queue for as long as the imports
+ahead of it take, and in that time the owner can archive a property or
+disconnect a feed. Eligibility is therefore re-checked **at the moment a queued
+feed's turn comes**, not when it was clicked; a refusal is reported and the feed
+released, never left showing "Queued" for ever.
+
+In the view, each row now shows its own `ProgressView` and reads
+`Refresh` / `Refreshing…` / `Queued` — three distinct labels, where the old
+button said "Refresh" whether it was working, waiting or dead. The status bar
+shows the live message instead of a fixed "Reading calendars…" string, which
+would otherwise hide the acknowledgement for as long as any feed was importing.
+
+The app-wide flag survives only as a computed `hasWorkInFlight`, used by the
+window's progress indicator and the two "Refresh all" controls — never by a
+per-feed control. A test asserts `FeedsView` contains no `state.isRefreshing`,
+so the mistake cannot come back unnoticed.
+
+### What is tested, and what cannot be
+
+39 tests across `RefreshQueue`, `RefreshEligibility` and
+`RefreshQueue multi-property`: rapid repeated clicks importing exactly once,
+three feeds running once each in click order, a failing feed not blocking the
+ones behind it, six feeds over two properties, a mixed property importing its
+three configured feeds and skipping its three unconfigured ones, and a property
+archived mid-queue skipping only its own feeds.
+
+**The ten-line loop in `AppState` is not unit-tested.** This project has
+Command Line Tools only, so there is no way to host the SwiftUI target in a
+test. The loop is therefore built entirely out of the primitives above —
+`request`, `finish`, `nextRunnable` — and the test harness drives those same
+shipped primitives rather than reimplementing their logic. Two source-level
+assertions cover what is left: that the queue lives on `AppState` and not in a
+view, and that `importFeed` stays non-throwing, because a `throws` there would
+unwind the serial loop on the first failure and silently abandon everything
+queued behind it — the exact class of loss this type exists to end.
+
+### Not done
+
+**The fix is not installed.** The owner's instruction was to finish it without
+reinstalling, so the running application is still `f74bbb7` and still has the
+dead button. Until it is rebuilt, the way to refresh two feeds is to click one,
+**wait for its row to finish**, then click the next — or to use Refresh all,
+which imports every feed in one pass.
+
+Also unchanged by design: `performBulkRefresh` still passes every listing to
+`importFeed`, so an unconfigured feed keeps producing its `skipped` run and its
+audit trail. Eligibility filtering applies to *queued* requests, which is what
+can go stale while waiting.
+
+### Two corrections to the earlier record
+
+* The `19:04:14` last-sync shown for Vrbo and Booking.com is a value **I**
+  wrote by hand during the install rehearsal — an integer epoch exactly three
+  hours before the 22:04:14Z launch. It is not evidence of a failed sync.
+* The two publication UIDs live on `availability_decisions.publication_uid`,
+  not in `feed_publications`, which is empty. An earlier count of "0 UIDs" was
+  a query against the wrong table.

@@ -136,6 +136,7 @@ struct FeedsView: View {
     private func feedRow(_ listing: PlatformListing) -> some View {
         let isEditing = editingListingID == listing.id
         let hasCredential = state.hasStoredCredential(for: listing)
+        let refreshState = state.refreshState(for: listing)
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
@@ -170,11 +171,28 @@ struct FeedsView: View {
                 }
                 .controlSize(.small)
 
-                Button("Refresh") {
-                    Task { await state.refresh(listing: listing) }
+                // This row's own progress, and nothing else's. The button
+                // used to be disabled whenever ANY feed was refreshing, so a
+                // click on another row landed on a dead control and was lost
+                // without so much as a failed sync record. Each state reads
+                // differently too — "Refreshing…" and "Queued" are both
+                // visible answers, where the old button just greyed out.
+                HStack(spacing: 4) {
+                    if refreshState.showsProgress {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.6)
+                            .frame(width: 10, height: 10)
+                    }
+                    Button(refreshState.buttonLabel) {
+                        Task { await state.refresh(listing: listing) }
+                    }
+                    .controlSize(.small)
+                    .disabled(!hasCredential || !refreshState.acceptsClick)
                 }
-                .controlSize(.small)
-                .disabled(!hasCredential || state.isRefreshing)
+                .help(refreshState == .queued
+                      ? "Waiting for the current refresh to finish."
+                      : "Import this calendar now.")
             }
 
             // Requirement 8: last successful sync and any error, per feed.

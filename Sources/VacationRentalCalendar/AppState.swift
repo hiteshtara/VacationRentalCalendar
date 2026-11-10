@@ -39,7 +39,27 @@ final class AppState: ObservableObject {
     @Published var showPlatformRestrictions = false
 
     // Status
-    @Published private(set) var isRefreshing = false
+    /// Which feeds are importing and which are waiting their turn.
+    ///
+    /// This replaced a single app-wide `isRefreshing` flag. That flag was held
+    /// for the whole of one feed's import and the per-feed Refresh button was
+    /// disabled on it, so refreshing Airbnb left Vrbo's and Booking.com's
+    /// buttons dead for ten seconds — and a click in that window was discarded
+    /// with no import, no `sync_run` and no message. See `FeedRefreshQueue`.
+    @Published private(set) var refreshQueue = FeedRefreshQueue()
+
+    /// Any refresh at all is in flight. For the window's progress indicator
+    /// and the Refresh all button — never for a per-feed button, which is the
+    /// mistake this replaced.
+    var isRefreshing: Bool { refreshQueue.hasWorkInFlight }
+
+    /// What THIS feed's row should show. The only thing a per-feed Refresh
+    /// button may gate itself on — never the app-wide flag, which is the
+    /// mistake that made a click on another row do nothing at all.
+    func refreshState(for listing: PlatformListing) -> FeedRefreshQueue.FeedState {
+        guard let id = listing.id else { return .idle }
+        return refreshQueue.state(of: id)
+    }
     @Published private(set) var statusMessage = ""
     @Published private(set) var lastError: String?
     @Published private(set) var notificationAvailability: ConflictNotifier.Availability = .notBundled
@@ -486,10 +506,18 @@ final class AppState: ObservableObject {
     // MARK: - Importing
 
     func refreshAll(autoRefreshOnly: Bool = false) async {
-        guard let store, !isRefreshing else { return }
-        isRefreshing = true
+        guard let store, refreshQueue.beginBulk() else { return }
+        await performBulkRefresh(store: store, autoRefreshOnly: autoRefreshOnly)
+        refreshQueue.endBulk()
+        // Anything the owner clicked during the pass queued behind it rather
+        // than being dropped, so it runs now.
+        await drainRefreshQueue()
+    }
+
+    private func performBulkRefresh(
+        store: RentalStore, autoRefreshOnly: Bool
+    ) async {
         statusMessage = "Reading calendars…"
-        defer { isRefreshing = false }
 
         let service = store.makeImportService(fetcher: URLSessionFeedFetcher())
         let targets = autoRefreshOnly
@@ -522,14 +550,80 @@ final class AppState: ObservableObject {
     }
 
     func refresh(listing: PlatformListing) async {
-        guard let store else { return }
-        isRefreshing = true
-        defer { isRefreshing = false }
+        guard let store, let listingID = listing.id else { return }
+        let outcome = refreshQueue.request(listingID: listingID)
+        // Every outcome is reported, including the two that start nothing. A
+        // click that produces no visible answer is indistinguishable from the
+        // dead button this replaced, even when coalescing it was right.
+        statusMessage = "\(listing.label): \(outcome.ownerMessage)"
+        guard outcome == .startNow else { return }
+        await runRefreshes(startingWith: listing, store: store)
+    }
+
+    /// Imports one feed, then whatever queued behind it, one at a time.
+    ///
+    /// Serial on purpose: the Keychain is the shared resource and an abandoned
+    /// read poisons every later call in the process. Serialising is not the
+    /// same as discarding, which is what the old flag did.
+    private func runRefreshes(
+        startingWith listing: PlatformListing, store: RentalStore
+    ) async {
         let service = store.makeImportService(fetcher: URLSessionFeedFetcher())
-        let report = await service.importFeed(for: listing)
-        reload()
-        statusMessage = "\(listing.label): \(report.run.summaryLine)"
-        lastError = report.run.outcome == .failure ? report.run.errorMessage : nil
+        var current: PlatformListing? = listing
+
+        while let target = current, let targetID = target.id {
+            let report = await service.importFeed(for: target)
+            reload()
+            statusMessage = "\(target.label): \(report.run.summaryLine)"
+            lastError = report.run.outcome == .failure ? report.run.errorMessage : nil
+            refreshQueue.finish(listingID: targetID)
+            current = takeNextQueuedListing()
+        }
+    }
+
+    /// Promotes the next queued feed that is still worth importing.
+    ///
+    /// A feed can wait here for as long as the imports ahead of it take, and
+    /// the owner can archive a property or disconnect a feed in that time. Its
+    /// eligibility is therefore re-checked at the moment its turn comes rather
+    /// than when it was clicked, and a refusal is reported instead of being
+    /// run anyway or dropped in silence.
+    private func takeNextQueuedListing() -> PlatformListing? {
+        var refusals: [String] = []
+        let nextID = refreshQueue.nextRunnable(
+            isRunnable: { [weak self] id in
+                guard let self else { return false }
+                return self.eligibility(ofListingID: id).canRun
+            },
+            onSkip: { [weak self] id in
+                guard let self, let listing = self.listing(id: id) else { return }
+                refusals.append(
+                    "\(listing.label): \(self.eligibility(ofListingID: id).explanation)")
+            }
+        )
+        if !refusals.isEmpty { statusMessage = refusals.joined(separator: " · ") }
+        guard let nextID else { return nil }
+        return listing(id: nextID)
+    }
+
+    private func listing(id: Int64) -> PlatformListing? {
+        listings.first { $0.id == id }
+    }
+
+    /// Whether a queued feed is still worth importing. A listing that has gone
+    /// away entirely is refused, so a stale id cannot wedge the queue.
+    private func eligibility(ofListingID id: Int64) -> FeedRefreshEligibility {
+        guard let listing = listing(id: id) else { return .propertyArchived }
+        return FeedRefreshEligibility.of(
+            listing: listing,
+            property: properties.first { $0.id == listing.propertyID },
+            hasStoredCredential: hasStoredCredential(for: listing)
+        )
+    }
+
+    private func drainRefreshQueue() async {
+        guard let store, let next = takeNextQueuedListing() else { return }
+        await runRefreshes(startingWith: next, store: store)
     }
 
     private func scheduleAutoRefresh() {

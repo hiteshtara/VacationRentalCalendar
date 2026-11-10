@@ -237,8 +237,15 @@ struct RootView: View {
             Divider()
             HStack(spacing: 10) {
                 if state.isRefreshing {
+                    // The live message, not a fixed string. A click that is
+                    // coalesced or queued is answered here, and a generic
+                    // "Reading calendars…" would hide that answer for as long
+                    // as any feed was importing.
                     ProgressView().controlSize(.small)
-                    Text("Reading calendars…").font(.caption)
+                    Text(state.statusMessage.isEmpty
+                         ? "Reading calendars…" : state.statusMessage)
+                        .font(.caption)
+                        .lineLimit(1)
                 } else if let error = state.lastError {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
                     Text(error).font(.caption).foregroundStyle(.red).lineLimit(1)
