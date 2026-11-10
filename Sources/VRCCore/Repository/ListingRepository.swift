@@ -129,7 +129,7 @@ public struct ListingRepository: Sendable {
         guard let id = listing.id else { return }
         let (column, reference) = try persistURL(listing)
         // A freshly entered URL supersedes whatever was wrong before.
-        if listing.hasURL, listing.connectionState == .credentialUnreadable {
+        if listing.hasURL, listing.connectionState.isClearedByANewURL {
             try? setConnectionState(
                 listingID: id, to: .unknown,
                 detail: "A new URL was entered.", actor: "owner"
