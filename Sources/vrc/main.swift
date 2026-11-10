@@ -40,6 +40,7 @@ func runHelp() {
     USAGE
       vrc seed                     Insert the configured properties and listings
       vrc set-url --listing <id>   Store a feed URL (read from stdin, never argv)
+                                   --stdin for authorized migration (no prompt)
       vrc status                   Show properties, listings, events, review queue
       vrc import [--listing <id>]  Fetch feeds read-only and reconcile
       vrc review                   List everything awaiting your decision
@@ -94,6 +95,12 @@ func runHelp() {
 func runSetURL() async {
     let store = makeStore()
     let dryRun = flags.contains("--dry-run")
+    // Non-interactive mode, for Scripts/migrate-cloud-credential.sh only. The
+    // terminal requirement below exists to stop a URL being echoed as it is
+    // typed; a pipe echoes nothing, so the protection is not weakened. Every
+    // other check — https, fetch, parse — still applies, and the URL is still
+    // never in argv.
+    let fromStdin = flags.contains("--stdin")
 
     guard let listingID = value(for: "--listing").flatMap(Int64.init) else {
         bail("--listing <id> is required (see `vrc status`)")
@@ -128,7 +135,7 @@ func runSetURL() async {
     print("")
     print("  Your typing will not be shown. The URL is never printed, never")
     print("  written to the database, and never stored in this project.")
-    if !SecureInput.standardInputIsTerminal {
+    if !SecureInput.standardInputIsTerminal && !fromStdin {
         print("")
         print("  NOTE: standard input is not a terminal, so echo cannot be")
         print("        suppressed. Saving is refused in this mode — run this")
@@ -136,7 +143,10 @@ func runSetURL() async {
     }
     print("")
 
-    guard let pasted = SecureInput.readLine(prompt: "  Paste the iCal export URL, then press Return: ") else {
+    let pastedOrNil = fromStdin
+        ? readLine(strippingNewline: true)
+        : SecureInput.readLine(prompt: "  Paste the iCal export URL, then press Return: ")
+    guard let pasted = pastedOrNil else {
         bail("no URL supplied")
     }
     let url = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -177,17 +187,19 @@ func runSetURL() async {
         return
     }
 
-    guard SecureInput.standardInputIsTerminal else {
+    guard SecureInput.standardInputIsTerminal || fromStdin else {
         bail("refusing to save a credential read without echo suppression — "
             + "run this in Terminal")
     }
 
-    print("")
-    FileHandle.standardError.write(Data("  Save this URL to the Keychain? [y/N] ".utf8))
-    let answer = (readLine(strippingNewline: true) ?? "").lowercased()
-    guard answer.hasPrefix("y") else {
-        print("  Not saved. Your existing entry is untouched.")
-        return
+    if !fromStdin {
+        print("")
+        FileHandle.standardError.write(Data("  Save this URL to the Keychain? [y/N] ".utf8))
+        let answer = (readLine(strippingNewline: true) ?? "").lowercased()
+        guard answer.hasPrefix("y") else {
+            print("  Not saved. Your existing entry is untouched.")
+            return
+        }
     }
 
     var updated = listing
@@ -924,13 +936,23 @@ func runDoctor() {
         }
         print("")
         let signature = CodeSignatureInfo.current()
-        check("code signature survives a rebuild", signature.kind.survivesRebuild,
+        check("code identity is stable across rebuilds", signature.kind.identityIsStable,
               signature.kind.rawValue
                   + (signature.authority.map { " — \($0)" } ?? ""))
-        if !signature.kind.survivesRebuild {
-            print("     Run ./Scripts/fix-signing.sh once to stop the repeated")
-            print("     Keychain prompts after every rebuild.")
+        if !signature.kind.identityIsStable {
+            print("     Run ./Scripts/fix-signing.sh once for a stable identity.")
         }
+        // Readability is a separate question from identity, and the only one
+        // that matters operationally. `vrc doctor` previously reported the
+        // presence of a Keychain REFERENCE as though it were access.
+        let unreadable = (try? store.listings.all())?.filter {
+            !$0.credentialRef.isEmpty
+                && (try? store.credentials.url(reference: $0.credentialRef)) == nil
+        }.count ?? 0
+        check("this build can actually READ its stored credentials", unreadable == 0,
+              unreadable == 0
+                  ? "all readable"
+                  : "\(unreadable) unreadable — run ./Scripts/migrate-cloud-credential.sh")
         print("")
         print("Credential store: \(store.credentials.storageDescription)")
         print("Code signature:   \(signature.kind.rawValue)"

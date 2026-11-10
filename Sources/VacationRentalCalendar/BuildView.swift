@@ -58,9 +58,9 @@ private struct SignatureRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 7) {
-            Image(systemName: state.signature.kind.survivesRebuild
+            Image(systemName: state.signature.kind.identityIsStable
                   ? "checkmark.seal" : "exclamationmark.triangle")
-                .foregroundStyle(state.signature.kind.survivesRebuild ? .green : .orange)
+                .foregroundStyle(state.signature.kind.identityIsStable ? .green : .orange)
             Text(state.signature.explanation)
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)

@@ -29,9 +29,51 @@ bad()  { printf '  \033[31mFOUND\033[0m %s\n' "$*"; found=$((found+1)); }
 scan() {
     local label="$1" pattern="$2" target="$3"
     local hits
-    hits=$(printf '%s' "${target}" | grep -cE "${pattern}" 2>/dev/null || true)
+    # `--` because a pattern starting with "-" (the private key block) would
+    # otherwise be parsed as options, which silently matched nothing for as
+    # long as that pattern has existed. LC_ALL=C because history blobs are
+    # binary and a UTF-8 locale makes grep and sed refuse the input.
+    hits=$(printf '%s' "${target}" | LC_ALL=C grep -cE -- "${pattern}" 2>/dev/null || true)
     if [ "${hits:-0}" -gt 0 ]; then
         bad "${label} (${hits} occurrence(s))"
+    fi
+}
+
+
+# The one exemption, and the reasoning for it.
+#
+# AWS publishes a fixed example access key id throughout its SigV4
+# documentation. It is not a credential, has never belonged to any account, and
+# appears in this repository's signing tests and in one commit message. Without
+# an exemption the history scan fails permanently, and a gate that always fails
+# is a gate people stop reading.
+#
+# The exemption is deliberately the narrowest possible: ONE exact 20-character
+# value, removed by literal string substitution. It is NOT a rule about the
+# suffix "EXAMPLE", NOT a relaxation of the pattern, and NOT a per-file
+# allowlist. Any other AKIA/ASIA-shaped string — including one sharing a line
+# with the example — still matches, because only the exact token is removed and
+# everything around it is left intact.
+#
+# The value is assembled from two pieces so that this file does not itself
+# contain the 20-character token, which would otherwise make the scanner report
+# its own source.
+documented_example_key() { printf '%s%s' 'AKIA' 'IOSFODNN7EXAMPLE'; }
+
+without_documented_example() {
+    local filtered
+    # LC_ALL=C: history blobs are binary, and a UTF-8 locale makes macOS sed
+    # abort with "illegal byte sequence" and emit NOTHING — which would hand
+    # back empty content and silently disable this check. That is precisely
+    # the hole an exemption must not open, so the result is validated below.
+    filtered="$(printf '%s' "$1" | LC_ALL=C sed "s/$(documented_example_key)//g")"
+    # Fail closed: if filtering produced nothing from non-empty input, the
+    # exemption is not working and the UNFILTERED content is scanned instead.
+    # A false positive is recoverable; a false negative is not.
+    if [ -n "$1" ] && [ -z "${filtered}" ]; then
+        printf '%s' "$1"
+    else
+        printf '%s' "${filtered}"
     fi
 }
 
@@ -40,7 +82,7 @@ patterns() {
     scan "Airbnb iCal export URL"   'airbnb\.com/calendar/ical/[0-9]+\.ics\?t=[0-9a-f]{16}' "${content}"
     scan "Vrbo iCal export URL"     'vrbo\.com/icalendar/[0-9a-f]{24}' "${content}"
     scan "Booking.com iCal export"  'ical\.booking\.com/v1/export\?t=[0-9a-f-]{30}' "${content}"
-    scan "AWS access key id"        '\b(AKIA|ASIA)[0-9A-Z]{16}\b' "${content}"
+    scan "AWS access key id"        '\b(AKIA|ASIA)[0-9A-Z]{16}\b' "$(without_documented_example "${content}")"
     scan "AWS secret access key"    'aws_secret_access_key[[:space:]]*[=:]' "${content}"
     scan "private key block"        '-----BEGIN [A-Z ]*PRIVATE KEY-----' "${content}"
     scan "guest email"              'guestEmail[[:space:]]*[=:][[:space:]]*"[^"]+@' "${content}"

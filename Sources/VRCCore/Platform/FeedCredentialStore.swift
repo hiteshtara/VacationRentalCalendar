@@ -192,7 +192,15 @@ public struct CodeSignatureInfo: Sendable {
         case adHoc
         case certificate
 
-        public var survivesRebuild: Bool { self == .certificate }
+        /// Whether the code's *identity* is stable across rebuilds.
+        ///
+        /// NOT whether Keychain access survives one. It does not: items are
+        /// written with `SecTrustedApplicationCreateFromPath`, which pins the
+        /// binary's code hash at the moment of writing, so a rebuild loses
+        /// access even when the certificate and designated requirement are
+        /// byte-identical. Conflating the two caused a real outage — an app
+        /// update silently disconnected every platform feed.
+        public var identityIsStable: Bool { self == .certificate }
     }
 
     public var kind: Kind

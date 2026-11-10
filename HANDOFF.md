@@ -1283,3 +1283,84 @@ Lambda free tier; S3 GETs are `$0.0000004` each (**$0.00014/month**); the object
 is 297 bytes. The only standing cost is the CloudWatch log group, capped at
 14-day retention. Call it **well under $0.01/month**, against the staging
 environment's existing ~$2.
+
+---
+
+## 18. Credential durability and the scanner exemption (2026-11-10)
+
+### Why feeds keep disconnecting after an update
+
+`SecTrustedApplicationCreateFromPath` **pins the binary's code hash** when an
+item is written. A rebuild changes that hash, so access is lost even when the
+certificate and designated requirement are byte-identical, and macOS refuses
+without prompting. **A stable designated requirement does not preserve Keychain
+access** — the codebase claimed it did in three places, that claim was believed,
+and nobody checked a live read. Full analysis in [docs/KEYCHAIN.md](docs/KEYCHAIN.md).
+
+### Implemented: Option C, authorized migration
+
+`Scripts/migrate-cloud-credential.sh` now migrates **feed URLs as well as the
+AWS key**. Per listing it asks macOS for permission, pipes the value to the new
+helper, and verifies readability afterwards.
+
+- The URL travels only through a pipe — never disk, log, argv or shell history.
+- Old entries are preserved; nothing deleted, nothing rotated.
+- Unreadable items are reported as **needing re-entry**, never as migrated
+  (exit 2), so a caller can tell the difference.
+- `vrc set-url --stdin` exists solely for this path. It skips the interactive
+  confirmation and keeps every other check — https only, fetched and parsed
+  before saving, never printed.
+
+### Corrected false claims
+
+| Where | Was | Now |
+|---|---|---|
+| `build-app.sh` | "Keychain approvals will survive rebuilds" | states the code-hash pinning and points at the migration |
+| `build-app.sh` | "Keychain permissions will stick" | "designated requirement unchanged since the last build" |
+| `CodeSignatureInfo.Kind.survivesRebuild` | name asserted the falsehood | `identityIsStable` — what it always measured |
+| `vrc doctor` | reported a Keychain *reference* existing | now also checks **this build can actually READ** each credential |
+
+`build-app.sh --install` performs a **real read** after installing and names the
+migration when items are unreadable. Stored connection status is never treated
+as evidence.
+
+### Documented, not built
+
+**Option B**, a stable credential helper built once and never rebuilt, and
+**Option A**, the Data Protection Keychain with an access group. B's weakness is
+that "never rebuilt" is a promise the build system cannot enforce, and its blast
+radius is larger when it does break. A is the only real fix but needs a verified
+Apple Developer Team ID, and whether a self-signed certificate can carry a usable
+access group is **untested** — it should be tested before anyone relies on it.
+
+### The scanner exemption, and two bugs the tests caught
+
+One exact-match exemption was added for AWS's published SigV4 documentation
+example key — a value that was never a credential, appearing in
+`SigningTests.swift` (blob in `4f42fca`) and in `f0267a9`'s commit message. It
+is **one exact 20-character token removed by literal substitution**: not a
+suffix rule, not a pattern relaxation, not a file allowlist. The scanner's own
+source never contains the token contiguously, so it cannot flag itself.
+
+`Scripts/test-check-no-secrets.sh` proves the gate still holds — 11 cases, each
+building a throwaway repository and asserting the real script's verdict. It
+immediately caught two genuine faults:
+
+1. **The exemption blanked the check on binary input.** macOS `sed` aborts with
+   `illegal byte sequence` on history blobs and emits nothing, which handed back
+   empty content and silently disabled the AWS-key scan entirely. Fixed with
+   `LC_ALL=C` **and** a fail-closed guard: if filtering empties non-empty input,
+   the *unfiltered* content is scanned. A false positive is recoverable; a false
+   negative is not.
+2. **The private-key pattern had never worked.** `scan()` passed the pattern to
+   `grep` without `--`, so `-----BEGIN …` was parsed as options and matched
+   nothing — for as long as that pattern has existed. Fixed.
+
+Neither was the exemption's intended risk, and neither would have been found
+without the tests.
+
+### Remaining manual action
+
+Airbnb and Vrbo feed URLs were re-entered by the owner (references now `-v5`),
+so no migration is outstanding today. The migration path exists for the **next**
+rebuild, and `build-app.sh` will now say so instead of claiming success.

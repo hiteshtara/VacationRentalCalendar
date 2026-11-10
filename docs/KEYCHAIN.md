@@ -116,3 +116,101 @@ the existing value preserves the exact IAM key.
 - `vrc cloud check --json` writes JSON to stdout only; errors go to stderr and
   are secret-free.
 - The migration script never echoes a value and never writes one to disk.
+
+
+---
+
+# Durable credential storage: where this goes next
+
+Written 2026-11-10, after an app update silently disconnected Airbnb, Vrbo and
+Booking.com. Option C is implemented; B and A are designs, **not built**.
+
+## The invariant that actually governs this
+
+`FeedCredentialStore.makeAccess()` writes items with
+`SecTrustedApplicationCreateFromPath`. In the legacy file-based keychain that
+call **pins the binary's code hash at the moment the item is written**. Rebuild
+the binary and the hash changes, so the entry no longer matches — even when the
+signing certificate and the designated requirement are byte-identical. macOS
+then returns `errSecAuthFailed` (-25293) and does not prompt, because the
+requester is not on the list.
+
+**A stable designated requirement does not preserve Keychain access.** The
+codebase asserted the opposite in three places (`build-app.sh` twice, and a
+property literally named `survivesRebuild`), and that claim caused the outage:
+it was believed, so nobody checked a live read. Those claims are now corrected
+and the property is `identityIsStable`, which is what it always measured.
+
+## Option C — authorized migration (IMPLEMENTED)
+
+`Scripts/migrate-cloud-credential.sh` now carries the feed URLs as well as the
+AWS key. For each listing it asks macOS for permission to read the existing
+item, pipes the value to the newly installed helper, and verifies the helper
+can read it afterwards.
+
+- The URL never reaches disk, a log, argv, or shell history — only a pipe.
+- Old entries are left in place; nothing is deleted and nothing is rotated.
+- An item that cannot be read is reported as **needing re-entry**, never as
+  migrated. The script exits 2 in that case so a caller can tell.
+- `vrc set-url --stdin` exists for this path alone. It skips the interactive
+  confirmation but keeps every check: https only, fetched and parsed before
+  saving, never printed.
+
+**What it does not do:** prevent the breakage. It repairs it, at the cost of
+one macOS prompt per item per rebuild.
+
+## Option B — a stable credential helper (DESIGNED, NOT BUILT)
+
+A small binary, built once, signed once, installed once, and **not rebuilt with
+the application**. It owns every Keychain item; the GUI and `vrc` ask it.
+
+**Security.** Strictly better than today in one respect and no worse in any
+other: the ACL names exactly one code object instead of two, and that object is
+tiny enough to audit in full. It must return only what the caller needs — the
+existing `vrc cloud check --json` precedent returns sanitised JSON, never the
+credential — and for feed URLs it must *use* the URL (fetch and return parsed
+events) rather than hand it back, or it becomes a confused deputy that launders
+credentials to any local process that asks.
+
+**Upgrade procedure.** This is the hard part, and the reason it is not built
+yet. "Never rebuilt" is not a property a build system enforces; it is a
+promise. It needs:
+  * its own version number and its own release step, separate from the app;
+  * a refusal to rebuild it as part of `build-app.sh`;
+  * and when it genuinely must change, a deliberate migration — which is
+    Option C again, so C remains necessary even once B exists.
+
+**Failure recovery.** If the helper is replaced accidentally, every credential
+becomes unreadable at once — a larger blast radius than today, where the app
+and the CLI fail independently. Recovery is Option C. This is the trade: fewer
+breakages, each one bigger.
+
+**Verdict.** Worth building only if rebuild-induced breakage keeps happening
+after C is in place. C removes the pain; B removes the recurrence, at the cost
+of a constraint the build system cannot enforce.
+
+## Option A — Data Protection Keychain + access group (FUTURE)
+
+`kSecUseDataProtectionKeychain` selects the iOS-style keychain, where items are
+scoped by **access group** rather than by code hash. Any build signed with the
+same team identifier and the same `keychain-access-groups` entitlement can read
+them, regardless of rebuilds. This is the only option that removes the problem
+rather than managing it.
+
+**Blocked on identity.** The app is signed with a self-signed certificate and
+reports `TeamIdentifier=not set`. Access groups are normally prefixed by a team
+identifier, so this likely requires a paid Apple Developer account and a
+provisioning profile.
+
+**Unverified.** Whether a self-signed certificate can carry a usable access
+group on macOS has not been tested here, and should be, before anyone commits
+to it. Treat the above as the shape of the answer, not as a promise.
+
+## The rule that comes out of all this
+
+**Verify readability; never infer it.** Stored connection status reflects the
+last fetch, which may predate an install. `build-app.sh` now performs a real
+read after installing and says plainly when credentials need migrating, and
+`vrc doctor` distinguishes "a Keychain reference exists" from "this build can
+read it" — a distinction it previously blurred, and the one that hid this
+failure in plain sight.

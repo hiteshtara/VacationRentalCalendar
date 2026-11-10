@@ -1,7 +1,8 @@
 #!/bin/bash
 #
-# Moves the existing AWS staging credential to the newly installed `vrc`
-# helper, WITHOUT rotating the IAM key.
+# Moves the existing credentials — the AWS staging key AND each platform's
+# private feed URL — to the newly installed `vrc` helper, WITHOUT rotating
+# anything.
 #
 #   ./Scripts/migrate-cloud-credential.sh
 #
@@ -14,9 +15,15 @@
 # partition list cannot be widened without your login password. See
 # docs/KEYCHAIN.md for the full investigation.
 #
-# This is the one manual step after a helper rebuild. It does NOT create a new
-# AWS key. It reads the secret you already stored, with your approval, and hands
-# it to the new helper in memory so the new helper owns a readable copy.
+# This is the one manual step after a helper rebuild. It creates no new AWS key
+# and no new feed URL. It reads what you already stored, with your approval, and
+# hands it to the new helper in memory so the new helper owns a readable copy.
+#
+# Feed URLs are included because they break in exactly the same way and had no
+# migration path: an app update silently disconnected Airbnb, Vrbo and
+# Booking.com, and the only remedy was re-typing URLs the owner had to find
+# again. A credential that cannot be read is reported as needing re-entry — it
+# is never reported as migrated.
 #
 # WHAT IT DOES NOT DO
 #
@@ -80,4 +87,82 @@ if "$HELPER" cloud check >/dev/null 2>&1; then
 else
     say "Stored, but the service did not answer on the first try. Open the app and"
     say "press Refresh from AWS, or run:  $HELPER cloud check"
+fi
+
+# ---------------------------------------------------------------- feed URLs --
+#
+# Same failure, same remedy. Each listing's URL lives under its own reference,
+# which `vrc status` prints and the database records. The URL itself is never
+# printed, never written to a file, and never placed on a command line — it
+# travels from `security` to the helper through a pipe and nothing else.
+
+step "Migrating private feed URLs"
+
+DB="${HOME}/Library/Application Support/VacationRentalCalendar/VacationRentalCalendar.sqlite"
+if [ ! -f "$DB" ]; then
+    say "No local database at the expected path; skipping feed URLs."
+    exit 0
+fi
+
+migrated=0; already=0; needs_entry=0
+
+# `.backup` rather than reading the live file: a plain read misses the WAL.
+TMPDB="$(mktemp -t vrcmig).sqlite"
+sqlite3 "$DB" ".backup '${TMPDB}'" 2>/dev/null || { say "Could not read the database; skipping feed URLs."; exit 0; }
+
+while IFS='|' read -r listing_id platform ref label; do
+    [ -n "${ref:-}" ] || continue
+    say ""
+    say "  ${platform} (listing ${listing_id}) — reference ${ref}"
+
+    # Does the new helper already read it? Then leave it completely alone.
+    if "$HELPER" keychain 2>/dev/null | grep -F "[${ref}]" | grep -q "^  ok"; then
+        say "    already readable by this build — nothing to do"
+        already=$((already + 1))
+        continue
+    fi
+
+    # Read the old item. macOS prompts; choose "Always Allow". The value is
+    # captured into a shell variable and never echoed.
+    URL="$(security find-generic-password -s "$SERVICE" -a "$ref" -w 2>/dev/null)"
+    if [ -z "${URL:-}" ]; then
+        say "    could not be read, even with authorization."
+        say "    ACTION REQUIRED: re-enter this URL under Feeds in the app."
+        say "    (The old entry is untouched. Nothing was deleted or rotated.)"
+        needs_entry=$((needs_entry + 1))
+        continue
+    fi
+
+    # Hand it over through a pipe. --stdin skips the interactive confirmation
+    # but keeps every check: https only, fetched and parsed before saving.
+    if printf '%s\n' "${URL}" | "$HELPER" set-url --listing "${listing_id}" --stdin >/dev/null 2>&1; then
+        unset URL
+        if "$HELPER" keychain 2>/dev/null | grep -F "${platform}" | grep -q "^  ok"; then
+            say "    migrated and verified readable"
+        else
+            say "    migrated; the helper still cannot read it — re-entry may be required"
+        fi
+        migrated=$((migrated + 1))
+    else
+        unset URL
+        say "    the helper refused to store it (the URL may no longer be valid)."
+        say "    ACTION REQUIRED: re-enter this URL under Feeds in the app."
+        needs_entry=$((needs_entry + 1))
+    fi
+done <<EOF
+$(sqlite3 "$TMPDB" "SELECT id, platform, credential_ref, label FROM platform_listings WHERE credential_ref <> '' ORDER BY id;" 2>/dev/null)
+EOF
+
+rm -f "$TMPDB"
+
+step "Feed URL summary"
+say "  migrated:           ${migrated}"
+say "  already readable:   ${already}"
+say "  need manual re-entry: ${needs_entry}"
+if [ "${needs_entry}" -gt 0 ]; then
+    say ""
+    say "Some URLs could not be migrated. They are bearer credentials this script"
+    say "cannot recover; re-enter them under Feeds in the app. Nothing was deleted,"
+    say "nothing was rotated, and no platform availability was touched."
+    exit 2
 fi

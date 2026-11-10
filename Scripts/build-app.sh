@@ -122,7 +122,7 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -qF "${IDENTITY_N
     echo "Found the local signing identity; trying it."
     if sign_bounded "${IDENTITY_NAME}" "${BUNDLE_ID}.probe" "${APP}/Contents/MacOS/vrc"; then
         SIGN_WITH="${IDENTITY_NAME}"
-        echo "Signed with the certificate — Keychain approvals will survive rebuilds."
+        echo "Signed with the certificate."
     else
         echo ""
         echo "  !! macOS is waiting for you to approve codesign's access to the"
@@ -150,8 +150,15 @@ sign_bounded "${SIGN_WITH}" "${BUNDLE_ID}" "${APP}" \
 codesign --verify --deep --strict "${APP}" && echo "signature verifies"
 
 # Record the designated requirement and compare it with the previous build.
-# A stable requirement is the whole point of signing with a certificate: it is
-# what lets a Keychain permission survive a rebuild.
+#
+# A stable requirement is worth having, but it does NOT preserve Keychain
+# access. Items here are created with SecTrustedApplicationCreateFromPath,
+# which pins the binary's CODE HASH at the moment the item is written. A
+# rebuild changes that hash even when the certificate and the designated
+# requirement are byte-identical, and macOS then refuses without prompting.
+# Earlier versions of this script claimed the opposite and that claim caused a
+# real outage: an update silently disconnected Airbnb, Vrbo and Booking.com.
+# Run ./Scripts/migrate-cloud-credential.sh after an install.
 REQ_FILE=".build/last-designated-requirement"
 # stdout only, and normalised — see Scripts/fix-signing.sh for why.
 CURRENT_REQ="$(codesign -d -r- "${APP}" 2>/dev/null | grep 'designated' | head -1 \
@@ -160,7 +167,7 @@ CURRENT_REQ="$(codesign -d -r- "${APP}" 2>/dev/null | grep 'designated' | head -
 if [ -f "${REQ_FILE}" ]; then
     PREVIOUS_REQ="$(cat "${REQ_FILE}")"
     if [ "${CURRENT_REQ}" = "${PREVIOUS_REQ}" ]; then
-        echo "signature is stable across rebuilds — Keychain permissions will stick"
+        echo "designated requirement unchanged since the last build"
     else
         echo ""
         echo "  !! The signature changed since the last build."
@@ -175,7 +182,7 @@ printf '%s' "${CURRENT_REQ}" > "${REQ_FILE}"
 
 case "${CURRENT_REQ}" in
     *"certificate root"*|*"certificate leaf"*|*anchor*)
-        echo "  signed with a certificate — Keychain permissions survive rebuilds"
+        echo "  signed with a certificate — stable identity, but see the Keychain note above"
         ;;
     *cdhash*)
         echo "  note: ad-hoc signed. Run ./Scripts/fix-signing.sh once to stop"
@@ -191,6 +198,24 @@ if [ "${INSTALL}" = true ]; then
     cp -R "${APP}" "/Applications/${APP_NAME}.app"
     echo "Installed at /Applications/${APP_NAME}.app"
     TARGET="/Applications/${APP_NAME}.app"
+
+    # Verify what the previous version merely asserted. Stored connection
+    # status is not evidence: it reflects the last fetch, which may predate
+    # this install. Only an actual read proves anything.
+    step "Verifying credential readability (not stored status)"
+    UNREADABLE="$("/Applications/${APP_NAME}.app/Contents/MacOS/vrc" keychain 2>/dev/null \
+                  | grep -c "^  FAIL" || true)"
+    if [ "${UNREADABLE:-0}" -gt 0 ]; then
+        echo "  ${UNREADABLE} stored credential(s) are NOT readable by this build."
+        echo "  This is expected after a rebuild and is NOT a failed install."
+        echo "  Fix it without rotating anything:"
+        echo "      ./Scripts/migrate-cloud-credential.sh"
+        echo "  Any item that cannot be migrated must be re-entered under Feeds."
+        KEYCHAIN_NEEDS_MIGRATION=1
+    else
+        echo "  all stored credentials are readable by this build"
+        KEYCHAIN_NEEDS_MIGRATION=0
+    fi
 
     # A rebuilt helper has a new code hash, so it can no longer read the AWS
     # credential a previous build stored (see docs/KEYCHAIN.md). If a credential
