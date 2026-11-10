@@ -86,6 +86,19 @@ public struct ListingRepository: Sendable {
         case .database:
             return (listing.icalURL, listing.credentialRef)
         case .keychain:
+            // No URL, no reference. A reference with nothing behind it is
+            // indistinguishable from a broken credential: `doctor` reports it
+            // unreadable and the credential migration raises an authorization
+            // prompt that cannot possibly succeed. Three such placeholders
+            // buried a real failure on 2026-11-10.
+            //
+            // An existing reference is always kept, even with no URL, so a
+            // listing whose credential is temporarily unreadable does not
+            // quietly lose the pointer to it.
+            guard listing.hasURL || !listing.credentialRef.isEmpty else {
+                return ("", "")
+            }
+
             var reference = listing.credentialRef.isEmpty
                 ? Self.credentialReference(
                     platform: listing.platform, listingLabel: listing.label,

@@ -122,5 +122,44 @@ public enum CredentialRehomeTests {
                 icalURL: "https://a.test/f.ics", urlStorage: .database))
             expect.equal(try store.unreadableCredentials().count, 0)
         },
+        TestCase(group: "Credential re-home",
+                 name: "a listing with no URL yet claims no credential reference") { expect in
+            // A reference with nothing behind it is indistinguishable from a
+            // broken credential: doctor calls it unreadable and the migration
+            // raises a prompt that cannot succeed. The reference is derived
+            // when a URL is first saved, so there is nothing to gain by
+            // reserving one early.
+            let store = try RentalStore.makeInMemory()
+            let property = try store.properties.insert(Property(name: "Test Cottage"))
+            let inserted = try store.listings.insert(PlatformListing(
+                propertyID: property.id!, platform: .airbnb, label: "Airbnb — Test Cottage",
+                urlStorage: .keychain))
+
+            let stored = try store.listings.find(id: inserted.id!)!
+            expect.equal(stored.credentialRef, "", "no URL, so no reference")
+            expect.equal(try store.unreadableCredentials().count, 0,
+                         "and it must not be reported as a broken credential")
+        },
+
+        TestCase(group: "Credential re-home",
+                 name: "the reference appears when a URL is first saved") { expect in
+            // The other half: leaving it empty must not break the normal path.
+            let store = try RentalStore.makeInMemory()
+            let property = try store.properties.insert(Property(name: "Test Cottage"))
+            let inserted = try store.listings.insert(PlatformListing(
+                propertyID: property.id!, platform: .airbnb, label: "Airbnb — Test Cottage",
+                urlStorage: .keychain))
+
+            var withURL = try store.listings.find(id: inserted.id!)!
+            withURL.icalURL = "https://a.test/f.ics"
+            try store.listings.update(withURL)
+
+            let after = try store.listings.find(id: inserted.id!)!
+            expect.ok(!after.credentialRef.isEmpty, "a reference is derived on first save")
+            expect.contains(after.credentialRef, "p\(property.id!)",
+                            "and it is scoped to the property")
+            expect.equal(try store.credentials.url(reference: after.credentialRef),
+                         "https://a.test/f.ics")
+        },
     ] }
 }

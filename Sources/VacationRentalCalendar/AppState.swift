@@ -721,14 +721,20 @@ final class AppState: ObservableObject {
             let property = try store.properties.insert(Property(name: name, address: address))
             if let id = property.id {
                 for platform in [RentalPlatform.airbnb, .vrbo, .bookingCom] {
+                    // No credential reference until a URL is actually stored.
+                    // A reference with nothing behind it is indistinguishable
+                    // from a broken credential: `doctor` reports it as
+                    // unreadable, and the credential migration raises an
+                    // authorization prompt that can never succeed. Three such
+                    // placeholders buried a real failure on 2026-11-10.
+                    //
+                    // `persistURL` derives the reference the first time a URL
+                    // is saved, so nothing is lost by leaving it empty.
                     try store.listings.insert(PlatformListing(
                         propertyID: id,
                         platform: platform,
                         label: "\(platform.displayName) — \(name)",
                         urlStorage: .keychain,
-                        credentialRef: ListingRepository.credentialReference(
-                            platform: platform, listingLabel: name, propertyID: id
-                        ),
                         autoRefreshEnabled: false
                     ))
                 }

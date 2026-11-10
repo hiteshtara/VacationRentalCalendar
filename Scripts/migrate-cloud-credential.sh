@@ -38,7 +38,28 @@
 set -uo pipefail
 
 SERVICE="com.vacationrentalcalendar.feed-url"
-HELPER="/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc"
+# Overridable so the selection logic can be tested without the real Keychain
+# or a real install. Untestable migration tooling is how you discover it
+# prompts six times for three credentials.
+HELPER="${VRC_HELPER_OVERRIDE:-/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc}"
+
+# Optional targeting: migrate one listing instead of all of them. After a
+# partial failure the remaining credential should cost ONE prompt, not a fresh
+# round over everything that already works.
+ONLY_LISTING=""
+ONLY_PLATFORM=""
+# Skip the AWS credential entirely. Recovering ONE feed URL must not raise
+# prompts for anything else — that noise is what hid a real failure on
+# 2026-11-10.
+FEEDS_ONLY=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --feeds-only) FEEDS_ONLY=true; shift ;;
+        --listing)  ONLY_LISTING="${2:-}"; shift 2 ;;
+        --platform) ONLY_PLATFORM="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
 KEY_ID_REF="aws-access-key-id"
 SECRET_REF="aws-secret-access-key"
 
@@ -47,11 +68,13 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 [ -x "$HELPER" ] || { say "No installed helper at $HELPER — run ./Scripts/build-app.sh --install first."; exit 1; }
 
+if [ "${FEEDS_ONLY}" = true ]; then
+    say "Skipping the AWS credential (--feeds-only)."
+else
 step "Checking whether the new helper already reads its credential"
 if "$HELPER" cloud status 2>/dev/null | grep -q "readable"; then
-    say "The helper already reads its AWS credential. Nothing to migrate."
-    exit 0
-fi
+    say "The helper already reads its AWS credential — leaving it alone."
+else
 
 step "Reading the existing credential (macOS will ask your permission)"
 say "Choose \"Always Allow\" at each prompt."
@@ -63,11 +86,11 @@ SECRET="$(security find-generic-password -s "$SERVICE" -a "$SECRET_REF" -w 2>/de
 
 if [ -z "${KEY_ID}" ] || [ -z "${SECRET}" ]; then
     say ""
-    say "Could not read the existing credential. Either the prompt was declined,"
-    say "or no credential is stored. Nothing was changed, and your IAM key is"
-    say "untouched. You can store it again with:  $HELPER cloud set-credentials"
-    exit 1
-fi
+    say "Could not read the AWS credential. Either the prompt was declined, or"
+    say "none is stored. Nothing was changed and your IAM key is untouched."
+    say "Store it again with:  $HELPER cloud set-credentials"
+    say "Continuing to the feed URLs, which are separate credentials."
+else
 
 step "Handing it to the new helper, in memory"
 # Two lines on stdin: key id, then secret. Never on the command line.
@@ -76,17 +99,19 @@ rc=$?
 unset KEY_ID SECRET
 
 if [ "$rc" -ne 0 ]; then
-    say "The helper did not store the credential (exit $rc)."
-    exit "$rc"
-fi
-
-step "Verifying the helper can now reach the service"
-if "$HELPER" cloud check >/dev/null 2>&1; then
-    say "Done. The new helper owns a readable copy. The same IAM key — not a new one."
-    say "The old keychain entry is left in place; nothing was deleted."
+    say "The helper did not store the AWS credential (exit $rc). Continuing to feeds."
 else
-    say "Stored, but the service did not answer on the first try. Open the app and"
-    say "press Refresh from AWS, or run:  $HELPER cloud check"
+    step "Verifying the helper can now reach the service"
+    if "$HELPER" cloud check >/dev/null 2>&1; then
+        say "Done. The new helper owns a readable copy. The same IAM key — not a new one."
+        say "The old keychain entry is left in place; nothing was deleted."
+    else
+        say "Stored, but the service did not answer on the first try. Open the app and"
+        say "press Refresh from AWS, or run:  $HELPER cloud check"
+    fi
+fi
+fi
+fi
 fi
 
 # ---------------------------------------------------------------- feed URLs --
@@ -98,7 +123,7 @@ fi
 
 step "Migrating private feed URLs"
 
-DB="${HOME}/Library/Application Support/VacationRentalCalendar/VacationRentalCalendar.sqlite"
+DB="${VRC_DB_OVERRIDE:-${HOME}/Library/Application Support/VacationRentalCalendar/VacationRentalCalendar.sqlite}"
 if [ ! -f "$DB" ]; then
     say "No local database at the expected path; skipping feed URLs."
     exit 0
@@ -110,8 +135,31 @@ migrated=0; already=0; needs_entry=0
 TMPDB="$(mktemp -t vrcmig).sqlite"
 sqlite3 "$DB" ".backup '${TMPDB}'" 2>/dev/null || { say "Could not read the database; skipping feed URLs."; exit 0; }
 
+skipped=0
+
 while IFS='|' read -r listing_id platform ref label; do
     [ -n "${ref:-}" ] || continue
+
+    # Targeting, when asked for.
+    if [ -n "${ONLY_LISTING}" ] && [ "${listing_id}" != "${ONLY_LISTING}" ]; then continue; fi
+    if [ -n "${ONLY_PLATFORM}" ] && [ "${platform}" != "${ONLY_PLATFORM}" ]; then continue; fi
+
+    # A listing that has never had a URL stored has a reference but nothing
+    # behind it. Reading it can only fail, and the attempt costs an
+    # authorization prompt — so the prompts that matter get lost among prompts
+    # that cannot possibly succeed. That is exactly what happened on
+    # 2026-11-10: three synthetic listings produced three pointless prompts and
+    # the one real failure went unnoticed in the noise.
+    #
+    # WITHOUT -w this reads attributes only. It never prompts, never blocks,
+    # and never touches secret material.
+    if ! security find-generic-password -s "$SERVICE" -a "$ref" >/dev/null 2>&1; then
+        say ""
+        say "  ${platform} (listing ${listing_id}) — no credential stored; skipped without prompting"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
     say ""
     say "  ${platform} (listing ${listing_id}) — reference ${ref}"
 
@@ -156,9 +204,10 @@ EOF
 rm -f "$TMPDB"
 
 step "Feed URL summary"
-say "  migrated:           ${migrated}"
-say "  already readable:   ${already}"
-say "  need manual re-entry: ${needs_entry}"
+say "  migrated:                ${migrated}"
+say "  skipped (no credential): ${skipped}"
+say "  already readable:        ${already}"
+say "  need manual re-entry:    ${needs_entry}"
 if [ "${needs_entry}" -gt 0 ]; then
     say ""
     say "Some URLs could not be migrated. They are bearer credentials this script"
