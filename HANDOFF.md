@@ -684,6 +684,14 @@ matters.
 | Instance | `vrc-staging-pitr-writer`, `db.serverless` | **deleted** |
 | IAM role | `vrc-pitr-lambda-api` | **never created** — refused by the session's permission policy |
 
+Teardown re-verified 2026-11-10T00:05Z, after deletion completed: RDS holds
+only `vrc-staging-main` and `vrc-staging-main-writer`; **zero** cluster
+snapshots (the delete used `--skip-final-snapshot`); the only retained
+automated backup is `vrc-staging-main`'s own; no `pitr`-named resource anywhere
+in RDS; no new secret, Lambda, IAM role, log group or subnet group. The drill
+reused the pre-existing `vrc-staging-db` subnet group and security group rather
+than creating any, so there is nothing of its own left to clean up.
+
 Lifetime: cluster `23:37:33Z` → `~23:55Z` (~18 min); writer `~23:41Z` → `23:52Z`
 (~11 min, of which ~5 available).
 
