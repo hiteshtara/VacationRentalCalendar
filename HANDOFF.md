@@ -1932,6 +1932,7 @@ What follows is the honest split.
 | Booking.com `CLOSED` | classified `unknownUnavailable`, needs review, never exported, **still drawn** |
 | Lane stacking and overflow | pre-existing `Presentation` tests |
 | Per-property isolation | portfolio counts, review filtering, no cross-property conflicts |
+| Portfolio month strip | one continuous bar per event, clipped and flagged at month edges |
 
 **Still requires visual inspection** — none of this can be asserted here:
 
@@ -1944,6 +1945,23 @@ What follows is the honest split.
 * confirmation dialogs reading sensibly in situ (archive, withdraw approval)
 * window resizing and small-width layout
 * that the live 9 observations render where expected across November–December
+* the portfolio strip at narrow widths, where 28–31 day columns get thin
+
+### The portfolio calendar
+
+A month strip per property, every property on one screen. A strip rather than
+a repeated seven-column grid, because the comparison a portfolio exists for is
+BETWEEN properties on the same date, and a week grid stacked per property
+makes exactly that comparison impossible. Read-only: no selection that changes
+state, no range dragging, no control that could alter availability.
+
+Its geometry is `CalendarLayout.monthStrip`, not view code. The first version
+computed lanes and clipping inside SwiftUI; that is precisely what this
+codebase avoids, and it moved to VRCCore before being committed so it could be
+tested and could not drift from the week grid. Four tests cover continuous
+month-long bars, clipping at both ends for an event that overruns the month,
+checkout-exclusive lane sharing, and events outside the month producing
+nothing.
 
 ### Readiness for a controlled installation
 
