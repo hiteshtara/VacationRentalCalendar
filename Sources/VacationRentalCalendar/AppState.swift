@@ -67,11 +67,12 @@ final class AppState: ObservableObject {
     private var refreshTask: Task<Void, Never>?
 
     enum Section: String, CaseIterable, Identifiable, Hashable {
-        case calendar, reservations, availability, review, cloud, settings
+        case portfolio, calendar, reservations, availability, review, cloud, settings
         var id: String { rawValue }
 
         var title: String {
             switch self {
+            case .portfolio: return "Portfolio"
             case .calendar: return "Calendar"
             case .reservations: return "Reservations"
             case .availability: return "Availability"
@@ -83,6 +84,7 @@ final class AppState: ObservableObject {
 
         var symbol: String {
             switch self {
+            case .portfolio: return "square.grid.2x2"
             case .calendar: return "calendar"
             case .reservations: return "bed.double"
             case .availability: return "slider.horizontal.3"
@@ -306,7 +308,13 @@ final class AppState: ObservableObject {
             if let propertyID = selectedPropertyID {
                 syncStates = (try? store.outbound.allStates(propertyID: propertyID)) ?? []
             }
-            if selectedPropertyID == nil { selectedPropertyID = properties.first?.id }
+            // Never leave the selection on an archived property: the rest of
+            // the app would show a property the portfolio says is gone.
+            let active = properties.filter { !$0.isArchived }
+            if selectedPropertyID == nil
+                || !active.contains(where: { $0.id == selectedPropertyID }) {
+                selectedPropertyID = active.first?.id
+            }
             lastError = nil
         } catch {
             lastError = "Could not read the database: \(error)"
@@ -666,6 +674,45 @@ final class AppState: ObservableObject {
         updated.autoRefreshEnabled = enabled
         try? store.listings.update(updated)
         reload()
+    }
+
+    // MARK: - Property management
+
+    /// Active properties only — what the sidebar and portfolio show.
+    /// `properties` keeps everything so an archived property's name still
+    /// resolves on its historical events.
+    var activeProperties: [Property] { properties.filter { !$0.isArchived } }
+
+    var portfolioRows: [PortfolioRow] { (try? store?.portfolio()) .flatMap { $0 } ?? [] }
+
+    func updateProperty(_ property: Property) {
+        guard let store else { return }
+        do {
+            try store.properties.update(property)
+            statusMessage = "\(property.name) updated."
+        } catch {
+            statusMessage = "That property could not be saved."
+        }
+        reload()
+    }
+
+    /// Archiving is not deletion: every observation, decision and audit row
+    /// stays exactly where it is. The property simply leaves the portfolio.
+    func archiveProperty(id: Int64) {
+        guard let store else { return }
+        try? store.properties.archive(id: id)
+        if selectedPropertyID == id {
+            selectedPropertyID = activeProperties.first { $0.id != id }?.id
+        }
+        reload()
+        statusMessage = "Property archived. Its history is kept."
+    }
+
+    func unarchiveProperty(id: Int64) {
+        guard let store else { return }
+        try? store.properties.unarchive(id: id)
+        reload()
+        statusMessage = "Property restored to the portfolio."
     }
 
     func addProperty(name: String, address: String) {

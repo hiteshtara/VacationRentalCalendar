@@ -30,7 +30,7 @@ struct RootView: View {
     private var sidebar: some View {
         List(selection: $state.selectedPropertyID) {
             Section("Properties") {
-                ForEach(state.properties) { property in
+                ForEach(state.activeProperties) { property in
                     HStack(spacing: 7) {
                         Image(systemName: "house")
                         VStack(alignment: .leading, spacing: 1) {
@@ -108,6 +108,7 @@ struct RootView: View {
     private var detail: some View {
         VStack(spacing: 0) {
             switch state.selectedSection {
+            case .portfolio: PortfolioView()
             case .calendar: calendarPane
             case .review: ReviewView()
             case .reservations: ReservationsView()
