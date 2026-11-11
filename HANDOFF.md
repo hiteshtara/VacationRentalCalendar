@@ -2951,3 +2951,68 @@ re-entered, nothing is rotated, and the Booking.com feed URL never changes.
 No live credential read, migrated or modified. No reinstall — the running app
 is still `86c31a9`. No connection state altered. The Developer ID bundle exists
 only in `dist-developer-id/`.
+
+## 33. The consolidated migration runbook (2026-11-11)
+
+[docs/MIGRATION-RUNBOOK.md](docs/MIGRATION-RUNBOOK.md) — twelve steps, each
+with explicit stop conditions, plus a verified rollback. Awaiting approval;
+nothing in it has been executed.
+
+### Three gaps the runbook exposed
+
+Writing it as *executable* steps rather than prose turned up two missing
+pieces and one stale artefact.
+
+**`CredentialMigration` had no production caller at all.** It was fully tested
+and wired to nothing, so there was no command to run the migration with.
+`--migrate-credentials` now exists on the main application — the only code
+object that can use the data protection Keychain, since the entitlement cannot
+be carried by a bare executable, which rules out the `vrc` helper.
+
+**The completeness gate was not runnable.** `MigrationCompleteness` existed but
+nothing surfaced it, so step 8 had nothing to call. `--migration-status` now
+reports it without migrating.
+
+**The Developer ID bundle predated the dark-wake fix.** It was built at
+19:10 on 2026-11-10; the `-25320` classification landed in `acc0a2a` the next
+morning. The earlier preflight therefore passed against a build that would have
+latched all three feeds again on the next Power Nap. Rebuilt: CFBundleVersion
+96, CDHash `50eb2e030765dbb8ad5afed0d41a1212d2df1f90`, clean tree at `acc0a2a`.
+The fix is verified **present in the signed binary by its own strings** —
+`nowhere to show the request`, `known verdict about the saved URL`,
+`MIGRATION INCOMPLETE` — and absent from the installed build, rather than
+inferred from the commit date.
+
+### Exercised against the real Keychain, without reading anything
+
+`--migration-status` enumerated all 18 legacy items attributes-only, checked the
+destination, reported `not migrated — using the legacy Keychain` with 18
+outstanding, and exited 1. **No authorization dialog**, confirmed against
+`SecurityAgent`, `authd` and `coreauthd` logs.
+
+`KeychainFeedCredentialStore.allReferences()` does the enumeration with
+`kSecReturnAttributes` and no `kSecReturnData`, so it reads no value and cannot
+prompt. It is inside `#if canImport(Security)`, so Linux never compiles it.
+
+### Attribution, corrected in advance
+
+Step 9's connection-state recovery uses
+`--actor assistant-on-owner-approval`, not `owner`. The two rows at
+`2026-11-10 23:30:14` carry `actor owner` incorrectly — they were my command,
+not the owner's. They are left exactly as written; correcting them needs its own
+append-only entry and separate approval.
+
+### Verification, and one gap in it
+
+635 Swift tests, 2179 assertions · preflight `READY`, 0 blockers, re-run against
+the rebuilt bundle · scanner clean · **macOS parity `b3398471…c604f5`,
+unchanged**.
+
+**Linux parity is UNVERIFIED for `f5d4553`.** Docker lost DNS, so
+`libsqlite3-dev` could not be installed and the Linux build failed with
+`could not build C module 'CSQLite'`. The commit message for `f5d4553` claims
+both platforms agree; that claim was not earned and this section is the
+correction. The structural argument is that the only `VRCCore` change is
+`allReferences()`, which sits inside `canImport(Security)` and so is not
+compiled on Linux at all — but an argument is not a measurement. **Re-run
+`Scripts/check-parity.sh` before any deploy.**
