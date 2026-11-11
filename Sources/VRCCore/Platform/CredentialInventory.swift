@@ -33,9 +33,19 @@ public struct CredentialInventory: Sendable, Equatable {
     /// live, and it is exactly what a database-driven migration misses.
     public var presentButUnreferenced: [String]
 
-    /// Referenced by the database but absent from the Keychain. A dangling
-    /// reference: migrating cannot fix it and proceeding would hide it.
+    /// Referenced by a listing that WAS configured, but absent from the
+    /// Keychain. A real secret has been lost: migrating cannot fix it and
+    /// proceeding would hide it, so this is the one stop condition here.
     public var referencedButMissing: [String]
+
+    /// Placeholder names belonging to listings that were never given a URL.
+    ///
+    /// Kept strictly apart from `referencedButMissing`. Every listing is
+    /// created with a reference name, so a name with nothing behind it is the
+    /// normal state of an unconfigured feed — there is nothing to find and
+    /// nothing to lose. Treating these as missing secrets made the entire live
+    /// inventory unmigratable over three listings that have never been set up.
+    public var unconfiguredPlaceholders: [String]
 
     /// Everything a migration should attempt, in a stable order.
     public var toMigrate: [String] {
@@ -50,11 +60,36 @@ public struct CredentialInventory: Sendable, Equatable {
     public init(
         referencedAndPresent: [String] = [],
         presentButUnreferenced: [String] = [],
-        referencedButMissing: [String] = []
+        referencedButMissing: [String] = [],
+        unconfiguredPlaceholders: [String] = []
     ) {
         self.referencedAndPresent = referencedAndPresent
         self.presentButUnreferenced = presentButUnreferenced
         self.referencedButMissing = referencedButMissing
+        self.unconfiguredPlaceholders = unconfiguredPlaceholders
+    }
+
+    /// Whether a listing has ever had a credential stored for it.
+    ///
+    /// **Evidenced, not inferred.** Every listing is created carrying a
+    /// reference name, so the string existing proves nothing at all — that is
+    /// exactly what made three never-configured Test Cottage feeds look like
+    /// three lost secrets. Three things do count as evidence:
+    ///
+    /// 1. a URL stored in the database (the other storage mode),
+    /// 2. an import that actually succeeded,
+    /// 3. a connection state only reachable after a credential existed — a
+    ///    feed cannot be `connected`, `failing`, `revoked`, disconnected by
+    ///    the owner, or have an unreadable item, without one having been there.
+    ///
+    /// `unknown` and `notConfigured` are therefore NOT evidence: they are
+    /// where a listing starts.
+    public static func wasConfigured(
+        _ listing: PlatformListing, hasSuccessfulImport: Bool
+    ) -> Bool {
+        listing.hasURL
+            || hasSuccessfulImport
+            || listing.connectionState.impliesStoredCredential
     }
 
     /// Compares what the database refers to with what the Keychain holds.
@@ -62,15 +97,23 @@ public struct CredentialInventory: Sendable, Equatable {
     /// Both lists are names only. No value is read to build this, which is why
     /// it is safe to run before a migration and before any approval.
     public static func compare(
-        databaseReferences: [String],
+        configuredReferences: [String],
+        unconfiguredReferences: [String] = [],
         keychainReferences: [String]
     ) -> CredentialInventory {
-        let referenced = Set(databaseReferences.filter { !$0.isEmpty })
+        let configured = Set(configuredReferences.filter { !$0.isEmpty })
+        let unconfigured = Set(unconfiguredReferences.filter { !$0.isEmpty })
+            .subtracting(configured)
         let present = Set(keychainReferences.filter { !$0.isEmpty })
+
+        // Anything PRESENT travels, however it was classified. A placeholder
+        // with a stored value is a secret, not a placeholder, so classification
+        // can never be the reason something is left behind.
         return CredentialInventory(
-            referencedAndPresent: referenced.intersection(present).sorted(),
-            presentButUnreferenced: present.subtracting(referenced).sorted(),
-            referencedButMissing: referenced.subtracting(present).sorted()
+            referencedAndPresent: configured.intersection(present).sorted(),
+            presentButUnreferenced: present.subtracting(configured).sorted(),
+            referencedButMissing: configured.subtracting(present).sorted(),
+            unconfiguredPlaceholders: unconfigured.subtracting(present).sorted()
         )
     }
 
@@ -82,9 +125,15 @@ public struct CredentialInventory: Sendable, Equatable {
                 + "which a database-driven migration would miss: "
                 + presentButUnreferenced.joined(separator: ", "))
         }
+        if !unconfiguredPlaceholders.isEmpty {
+            lines.append("  \(unconfiguredPlaceholders.count) listing(s) were never "
+                + "configured, so they have nothing to migrate: "
+                + unconfiguredPlaceholders.joined(separator: ", "))
+        }
         if !referencedButMissing.isEmpty {
-            lines.append("  REFUSE: \(referencedButMissing.count) reference(s) point at "
-                + "nothing: " + referencedButMissing.joined(separator: ", "))
+            lines.append("  REFUSE: \(referencedButMissing.count) CONFIGURED listing(s) "
+                + "reference a secret that is not in the Keychain: "
+                + referencedButMissing.joined(separator: ", "))
         }
         return lines.joined(separator: "\n")
     }

@@ -41,6 +41,22 @@ public enum FeedConnectionState: String, CaseIterable, Sendable, Identifiable {
         }
     }
 
+    /// Whether reaching this state proves a credential was once stored.
+    ///
+    /// Used to tell an unconfigured listing from a configured one whose secret
+    /// has gone missing — the first is normal, the second is a lost credential
+    /// and must stop a migration. A feed cannot reach any of these without an
+    /// item having existed; `unknown` and `notConfigured` are where a listing
+    /// starts, so they prove nothing.
+    public var impliesStoredCredential: Bool {
+        switch self {
+        case .connected, .failing, .revoked, .disconnectedByOwner, .credentialUnreadable:
+            return true
+        case .notConfigured, .unknown:
+            return false
+        }
+    }
+
     /// Whether the app should keep fetching this feed.
     ///
     /// A revoked credential is never retried: the platform has already given

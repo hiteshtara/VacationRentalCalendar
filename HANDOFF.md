@@ -2810,3 +2810,144 @@ embedded provisioning profile:
 
 No live credential read, migrated or modified. No reinstall. No connection
 state altered. The two incorrect `actor owner` entries still stand.
+
+## 32. Preparing the Developer ID and data protection transition (2026-11-10)
+
+### The inventory fix
+
+`CredentialInventory` treated the three Test Cottage placeholder references as
+missing secrets, which made the entire live inventory unmigratable over three
+listings that have never been set up. The distinction is now strict and
+evidenced:
+
+* **unconfigured** — a listing carrying a reference name nothing was ever
+  stored under. Normal. Nothing to find, nothing to lose, not a blocker.
+* **configured but missing** — a listing that *did* have a credential whose
+  Keychain item is gone. A real secret lost. **Still a stop condition.**
+
+`wasConfigured` decides, from evidence rather than from the reference string —
+which proves nothing, since every listing is created with one. Evidence is: a
+URL in the database, an import that actually succeeded, or a connection state
+only reachable after a credential existed (`FeedConnectionState.impliesStoredCredential`:
+connected, failing, revoked, disconnectedByOwner, credentialUnreadable).
+`unknown` and `notConfigured` are where a listing starts and so prove nothing.
+
+Anything **present** in the Keychain travels regardless of classification: a
+placeholder with a value is a secret, not a placeholder, so classification can
+never be the reason something is left behind.
+
+The live inventory is now **safe to migrate**: 3 configured, 3 unconfigured, 18
+items to carry, 0 blockers.
+
+### Verified: Developer ID + profile + data protection, in the real bundle
+
+`dist-developer-id/VacationRentalCalendar.app`, built and signed but **not
+installed**:
+
+```
+Authority=Developer ID Application: hitesh tara (26JLFSV9YS)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+team-signed true · running-team 26JLFSV9YS · data-protection true
+access-group 26JLFSV9YS.com.vacationrentalcalendar.shared
+```
+
+The embedded entitlement carries the resolved access group and the
+provisioning profile is embedded before signing.
+
+**The designated requirement changes**, and this matters:
+
+| build | designated requirement |
+|---|---|
+| installed (local cert) | `identifier "…app" and certificate root = H"5828da64…"` |
+| Developer ID | `identifier "…app" and anchor apple generic and … certificate leaf[subject.OU] = "26JLFSV9YS"` |
+
+The new one is anchored to Apple and the team OU, so it survives rebuilds *and*
+certificate renewal. But it does **not** satisfy the old one, so the legacy
+items' trusted-application entries — recorded against the local-cert
+requirement — will not match the Developer ID build. Combined with the
+`cdhash:` partitions of §31, that means **the first read of each legacy secret
+under the new identity will require authorization.** That is unavoidable: only
+the owner can unlock those items for a new code identity. It happens once.
+
+### The outbound token needs its own path
+
+`feed-key-1-booking_com-v1` trusts only `/usr/bin/security`, partition
+`apple-tool:`. The app has never been able to read it, and unlike a feed URL it
+cannot be re-entered — Booking.com is already subscribed to the URL containing
+it, so re-issuing means handing the platform a new URL.
+
+`SecretImport` plus the app's new `--import-secret <reference>` mode handle it.
+The value arrives on **stdin only** — never an argument, because a command line
+is visible in `ps` and recorded in shell history. Nothing is echoed; only a
+12-character digest is printed. An empty or whitespace-only value is **refused
+rather than written**, so a cancelled upstream read cannot destroy a credential
+by overwriting it with nothing. The write is verified by reading it back and
+comparing digests, and the legacy entry is never read, altered or deleted.
+
+### Rehearsed, with disposable credentials only
+
+`Migration rehearsal`, 12 cases over an 18-reference set shaped like the live
+one (3 feed URLs, 2 AWS keys, 1 outbound token, 12 superseded entries), every
+value an obvious fake:
+
+* all 18 migrate in one run; all four secret classes arrive, not just the feeds
+* the legacy store is byte-identical afterwards — migration **copies**
+* a partial failure (`-34018` on three references) is counted per reference,
+  loses nothing, and the sources stay readable
+* retrying after a partial failure completes the set and leaves the already
+  migrated ones alone
+* running twice migrates nothing the second time
+* a reference with nothing behind it is `notConfigured`, not a failure
+* an unreadable source is named for re-entry, never copied as an empty value
+* rollback removes the copies and leaves every legacy secret; the layered store
+  then serves from legacy again
+* no reference name changes anywhere, so no platform URL changes
+* a plan is printable and contains no value
+
+Plus `test-keychain-integration.sh` **23/23** on real hardware, including
+**ten rebuilds with no prompts** — the measured proof that the §31 cause is
+gone.
+
+### The live migration plan
+
+Prerequisites: notarytool profile `vrc-notary` does not exist yet (only needed
+to notarize). Nothing below is approved.
+
+1. **Quit the app.** Verify no process and no helper.
+2. **Backup** with `Scripts/backup-before-install.sh` (0.5s, attributes only,
+   executes nothing). Verify `integrity_check ok`, row counts, no feed URL.
+3. **Record the inventory** — 18 items, 6 active, 0 blockers. **Stop if the
+   count is not 18 or any configured reference is missing.**
+4. **Install the Developer ID build** from `dist-developer-id/`. Expect the
+   designated requirement to change; this is a deliberate identity change, not
+   a mismatch to stop on.
+5. **Launch and confirm** `team-signed true`, `data-protection true`, access
+   group `26JLFSV9YS.com.vacationrentalcalendar.shared`.
+6. **Migrate.** Expect **up to six one-time Keychain prompts** — one per
+   secret, because the new identity is not yet on any legacy ACL. Approve each.
+   **Stop** if a prompt is refused, if any step reports `sourceUnreadable`, or
+   if `-34018` appears (entitlement not authorized).
+7. **The outbound token**, which the app cannot read, via
+   `security … -w | VacationRentalCalendar --import-secret feed-key-1-booking_com-v1`.
+   One prompt, piped, never printed. **Stop** if the digest does not verify.
+8. **Verify no prompts.** Refresh all three feeds — expect HTTP 200 with
+   Airbnb 7, Vrbo 3, Booking.com 2, and **no dialog**. Then quit, relaunch,
+   refresh again — still no dialog.
+9. **Prove the class of bug is gone:** rebuild, reinstall, refresh. No prompt.
+   This is the step that distinguishes this from every previous fix.
+10. **Confirm preservation** — 18 Keychain items still present, all 6 active
+    readable, January reservation, classifications, decisions, both UIDs, audit
+    history, and connection states unchanged.
+
+**Rollback**, verified in rehearsal: delete the data-protection copies. The
+layered store falls through to the legacy entries, which were never touched,
+and refreshes continue exactly as before. Reinstall the local-cert build from
+`Backups/20261110T234504Z` to return the previous identity. No credential is
+re-entered, nothing is rotated, and the Booking.com feed URL never changes.
+
+### Not done
+
+No live credential read, migrated or modified. No reinstall — the running app
+is still `86c31a9`. No connection state altered. The Developer ID bundle exists
+only in `dist-developer-id/`.

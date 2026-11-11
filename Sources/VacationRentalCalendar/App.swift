@@ -82,6 +82,64 @@ struct VacationRentalCalendarApp: App {
         exit(CredentialStoreSelection.shouldUseDataProtection ? 0 : 1)
     }
 
+    /// Imports one secret from standard input.
+    ///
+    ///     security find-generic-password -s <service> -a <ref> -w \
+    ///         | VacationRentalCalendar --import-secret <ref>
+    ///
+    /// For the Booking.com outbound feed token, which this application cannot
+    /// read: its ACL trusts only `/usr/bin/security` and its partition is
+    /// `apple-tool:`. Unlike a feed URL it cannot be re-entered, because
+    /// Booking.com is already subscribed to the URL containing it.
+    ///
+    /// The value arrives on **stdin only**. Never an argument: a command line
+    /// is visible in `ps` and recorded in shell history, and a feed token is a
+    /// bearer credential for a whole booking calendar. Nothing is echoed and
+    /// only a digest is printed.
+    static func runImportSecretIfRequested() {
+        let arguments = CommandLine.arguments
+        guard let flag = arguments.firstIndex(of: "--import-secret") else { return }
+        guard flag + 1 < arguments.count else {
+            FileHandle.standardError.write(Data(
+                "error: --import-secret needs a reference name\n".utf8))
+            exit(2)
+        }
+        let reference = arguments[flag + 1]
+
+        // Refuse an interactive terminal. The designed caller is a pipe from
+        // `security`; reading from a TTY here would mean the owner typing a
+        // token that is already stored, which is both pointless and a way to
+        // get it wrong.
+        guard isatty(FileHandle.standardInput.fileDescriptor) == 0 else {
+            FileHandle.standardError.write(Data("""
+                error: pipe the value in; do not type it and do not pass it as an argument.
+                  security find-generic-password -s com.vacationrentalcalendar.feed-url \\
+                      -a \(reference) -w | <this app> --import-secret \(reference)
+
+                """.utf8))
+            exit(2)
+        }
+
+        let incoming = String(
+            data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        do {
+            let store = try RentalStore.makeDefault()
+            let report = try SecretImport.perform(
+                reference: reference, value: incoming, into: store.credentials)
+            // Digest only. There is no code path here that prints the value.
+            print(report.description)
+            print("stored in \(store.credentials.storageDescription)")
+            print("the legacy entry was not read, altered or deleted")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data(
+                ("error: " + ((error as? LocalizedError)?.errorDescription
+                              ?? "\(error)") + "\n").utf8))
+            exit(1)
+        }
+    }
+
     static func runCredentialHealthIfRequested() {
         guard CommandLine.arguments.contains("--credential-health") else { return }
         func out(_ text: String) { print(text) }
@@ -141,6 +199,7 @@ struct VacationRentalCalendarApp: App {
     init() {
         Self.runCredentialStoreIfRequested()
         Self.runCredentialHealthIfRequested()
+        Self.runImportSecretIfRequested()
         Self.runSelfCheckIfRequested()
     }
 

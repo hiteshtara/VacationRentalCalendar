@@ -123,6 +123,8 @@ public enum TestRegistry {
             + KeychainCancellationTests.cases
             + RehearsalIsolationTests.cases
             + CredentialInventoryTests.cases
+            + MigrationRehearsalTests.cases
+            + SecretImportTests.cases
             + PostgresIntegrationTests.cases
             + DecisionRouteTests.cases
             + CloudSyncClientTests.cases
