@@ -129,6 +129,7 @@ public enum TestRegistry {
             + CalendarVisibilityTests.cases
             + TimelineLayoutTests.cases
             + ProtectionStatusTests.cases
+            + OutboundPolicyTests.cases
             + PostgresIntegrationTests.cases
             + DecisionRouteTests.cases
             + CloudSyncClientTests.cases
