@@ -10,8 +10,17 @@ public enum UpsertResult: String, Sendable {
 }
 
 public struct EventRepository: Sendable {
-    let database: Database
-    public init(database: Database) { self.database = database }
+    let database: DataStore
+    public init(database: DataStore) { self.database = database }
+
+    /// Explicit column list rather than `SELECT *`.
+    ///
+    /// The Postgres schema adds generated `stay daterange` and
+    /// `last_seen_ts timestamptz` columns for the exclusion constraints. The
+    /// RDS Data API refuses to return a `daterange` in a result set (HTTP 400),
+    /// so `SELECT *` breaks over the Data API even though it is fine on SQLite.
+    /// Naming the base columns keeps both backends identical. Found by B5.
+    static let columns = "id, listing_id, event_key, uid, recurrence_id, platform, summary, details, location, check_in, check_out, is_all_day, feed_status, sequence, last_modified, content_hash, first_seen_at, last_seen_at, is_tombstoned, has_unsupported_recurrence"
 
     private func decode(_ row: Row) -> CalendarEvent {
         CalendarEvent(
@@ -89,7 +98,7 @@ public struct EventRepository: Sendable {
     }
 
     public func find(eventKey: String) throws -> CalendarEvent? {
-        try database.queryOne("SELECT * FROM events WHERE event_key = ?;", [.text(eventKey)])
+        try database.queryOne("SELECT \(Self.columns) FROM events WHERE event_key = ?;", [.text(eventKey)])
             .map(decode)
     }
 
@@ -116,21 +125,32 @@ public struct EventRepository: Sendable {
     public func forListing(_ listingID: Int64, includeTombstoned: Bool = false) throws -> [CalendarEvent] {
         let clause = includeTombstoned ? "" : "AND is_tombstoned = 0"
         return try database.query("""
-            SELECT * FROM events WHERE listing_id = ? \(clause) ORDER BY check_in;
+            SELECT \(Self.columns) FROM events WHERE listing_id = ? \(clause) ORDER BY check_in;
             """, [.integer(listingID)]).map(decode)
     }
 
     public func allActive() throws -> [CalendarEvent] {
         try database.query("""
-            SELECT * FROM events
+            SELECT \(Self.columns) FROM events
             WHERE is_tombstoned = 0 AND feed_status != 'cancelled'
             ORDER BY check_in;
             """).map(decode)
     }
 
+    /// How many live observations a listing currently holds.
+    ///
+    /// Used to refuse a mass withdrawal: a feed that parses to zero events for
+    /// a listing that currently has some is far more likely to be truncated
+    /// than to mean every booking was cancelled.
+    public func activeCount(listingID: Int64) throws -> Int {
+        try database.scalarInt("""
+            SELECT COUNT(*) FROM events WHERE listing_id = ? AND is_tombstoned = 0;
+            """, [.integer(listingID)])
+    }
+
     public func all(includeTombstoned: Bool = true) throws -> [CalendarEvent] {
         let clause = includeTombstoned ? "" : "WHERE is_tombstoned = 0"
-        return try database.query("SELECT * FROM events \(clause) ORDER BY check_in;")
+        return try database.query("SELECT \(Self.columns) FROM events \(clause) ORDER BY check_in;")
             .map(decode)
     }
 
@@ -138,7 +158,7 @@ public struct EventRepository: Sendable {
     public func inRange(start: Date, end: Date, includeTombstoned: Bool = false) throws -> [CalendarEvent] {
         let clause = includeTombstoned ? "" : "AND is_tombstoned = 0"
         return try database.query("""
-            SELECT * FROM events
+            SELECT \(Self.columns) FROM events
             WHERE check_in < ? AND check_out > ? \(clause)
             ORDER BY check_in;
             """, [SQLValue(end), SQLValue(start)]).map(decode)

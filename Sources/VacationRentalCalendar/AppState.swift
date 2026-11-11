@@ -23,14 +23,60 @@ final class AppState: ObservableObject {
     /// Keys ticked in the review queue for a batch decision.
     @Published var reviewSelection: Set<String> = []
 
+    // Availability editing
+    @Published var rangeStart: Date?
+    @Published var rangeEnd: Date?
+    @Published var plannedActions: [RentalPlatform: AvailabilityAction] = [:]
+    @Published var planReason: String = ""
+    @Published private(set) var decisions: [AvailabilityDecision] = []
+    @Published private(set) var auditEntries: [AuditEntry] = []
+    @Published private(set) var syncStates: [DestinationSyncState] = []
+    @Published private(set) var findings: [ConflictFinding] = []
+
+    /// Presentation only. Hiding restrictions declutters the calendar and
+    /// changes nothing about export eligibility, conflict detection or the
+    /// review queue — a test asserts exactly that.
+    @Published var showPlatformRestrictions = false
+
     // Status
-    @Published private(set) var isRefreshing = false
+    /// Which feeds are importing and which are waiting their turn.
+    ///
+    /// This replaced a single app-wide `isRefreshing` flag. That flag was held
+    /// for the whole of one feed's import and the per-feed Refresh button was
+    /// disabled on it, so refreshing Airbnb left Vrbo's and Booking.com's
+    /// buttons dead for ten seconds — and a click in that window was discarded
+    /// with no import, no `sync_run` and no message. See `FeedRefreshQueue`.
+    @Published private(set) var refreshQueue = FeedRefreshQueue()
+
+    /// Any refresh at all is in flight. For the window's progress indicator
+    /// and the Refresh all button — never for a per-feed button, which is the
+    /// mistake this replaced.
+    var isRefreshing: Bool { refreshQueue.hasWorkInFlight }
+
+    /// What THIS feed's row should show. The only thing a per-feed Refresh
+    /// button may gate itself on — never the app-wide flag, which is the
+    /// mistake that made a click on another row do nothing at all.
+    func refreshState(for listing: PlatformListing) -> FeedRefreshQueue.FeedState {
+        guard let id = listing.id else { return .idle }
+        return refreshQueue.state(of: id)
+    }
     @Published private(set) var statusMessage = ""
     @Published private(set) var lastError: String?
     @Published private(set) var notificationAvailability: ConflictNotifier.Availability = .notBundled
     @Published private(set) var hasAskedForNotifications = false
     @Published private(set) var signature: CodeSignatureInfo = .init(kind: .unsigned)
     @Published private(set) var storeFailure: String?
+
+    // MARK: Cloud (AWS staging)
+    //
+    // Read-only. Nothing here publishes, approves, or enables a schedule --
+    // the app can look at the cloud service and nothing more.
+    @Published private(set) var cloud: CloudSnapshot = .unknown
+    @Published private(set) var isCloudRefreshing = false
+    @Published private(set) var cloudConfiguration: CloudConnection.Availability =
+        .notConfigured(missing: ["endpoint"])
+    /// How many long periods the one-off sweep brought back for review.
+    private(set) var longPeriodsFlagged = 0
 
     // Settings
     @Published var autoRefreshEnabled = true
@@ -41,28 +87,30 @@ final class AppState: ObservableObject {
     private var refreshTask: Task<Void, Never>?
 
     enum Section: String, CaseIterable, Identifiable, Hashable {
-        case calendar, review, conflicts, export, feeds, history
+        case portfolio, calendar, reservations, availability, review, cloud, settings
         var id: String { rawValue }
 
         var title: String {
             switch self {
+            case .portfolio: return "Portfolio"
             case .calendar: return "Calendar"
+            case .reservations: return "Reservations"
+            case .availability: return "Availability"
             case .review: return "Needs Review"
-            case .conflicts: return "Conflicts"
-            case .export: return "Filtered Export"
-            case .feeds: return "Feeds"
-            case .history: return "Sync History"
+            case .cloud: return "Cloud"
+            case .settings: return "Settings"
             }
         }
 
         var symbol: String {
             switch self {
+            case .portfolio: return "square.grid.2x2"
             case .calendar: return "calendar"
+            case .reservations: return "bed.double"
+            case .availability: return "slider.horizontal.3"
             case .review: return "questionmark.circle"
-            case .conflicts: return "exclamationmark.triangle"
-            case .export: return "square.and.arrow.up"
-            case .feeds: return "antenna.radiowaves.left.and.right"
-            case .history: return "clock.arrow.circlepath"
+            case .cloud: return "cloud"
+            case .settings: return "gearshape"
             }
         }
     }
@@ -82,6 +130,9 @@ final class AppState: ObservableObject {
             do {
                 let created = try RentalStore.makeDefault()
                 try SeedData.apply(to: created)
+                // Raises the review flag on unusually long periods. Never
+                // changes a classification — see LongPeriodReview.
+                self.longPeriodsFlagged = (try? LongPeriodReview.runOnce(in: created))?.count ?? 0
                 self.store = created
             } catch {
                 self.storeFailure = "The local database could not be opened: \(error)"
@@ -90,9 +141,148 @@ final class AppState: ObservableObject {
         self.signature = CodeSignatureInfo.current()
         self.reload()
         loadSettings()
+        refreshCloudConfiguration()
     }
 
     var isReady: Bool { store != nil }
+
+    // MARK: - Cloud
+
+    /// Endpoint configuration, read from SQLite only.
+    ///
+    /// The GUI never reads the AWS credential from the Keychain -- it cannot, on
+    /// this machine (see docs/KEYCHAIN.md). Whether the credential is actually
+    /// usable is answered by the helper on refresh, not here. This only reports
+    /// whether an endpoint has been stored and whether the helper is present.
+    func refreshCloudConfiguration() {
+        guard let store else { return }
+        let endpoint = ((try? store.settings.string(CloudConnection.endpointSettingKey)) ?? nil) ?? ""
+        let region = ((try? store.settings.string(CloudConnection.regionSettingKey)) ?? nil) ?? "us-east-1"
+        if endpoint.isEmpty {
+            cloudConfiguration = .notConfigured(missing: ["endpoint"])
+        } else if let url = URL(string: endpoint), CloudConnection.isSecure(endpoint) {
+            cloudConfiguration = .configured(endpoint: url, region: region)
+        } else {
+            cloudConfiguration = .insecureEndpoint(endpoint)
+        }
+        if case .configured = cloudConfiguration {} else if cloud.status == nil {
+            cloud = CloudSnapshot(health: .notConfigured(cloudConfiguration.summary))
+        }
+    }
+
+    var isCloudConfigured: Bool {
+        if case .configured = cloudConfiguration { return true }
+        return false
+    }
+
+    /// Asks the AWS service for its status, through the bundled helper.
+    ///
+    /// Read-only: the helper calls GET /status and GET /availability and
+    /// nothing else. It cannot publish, approve a decision, or enable a
+    /// schedule. The helper returns only CloudStatusPayload -- no secret ever
+    /// crosses back into this process.
+    func refreshFromCloud() {
+        guard !isCloudRefreshing else { return }
+        refreshCloudConfiguration()
+        guard isCloudConfigured else {
+            cloud = CloudSnapshot(health: .notConfigured(cloudConfiguration.summary))
+            return
+        }
+
+        isCloudRefreshing = true
+        // In process. Previously this spawned the bundled `vrc` helper and
+        // parsed its stdout; the same work now runs here through VRCCore.
+        //
+        // Three reasons, in order of how much they have cost. The helper is a
+        // second code object with its own credential access, and the app
+        // disagreeing with its own helper about whether a credential is
+        // readable has been the most expensive bug class in this project. A
+        // bare nested executable cannot carry the keychain entitlement, so
+        // after the Keychain migration it could not do this work at all. And
+        // parsing a subprocess's output is a problem nobody needs when the
+        // logic is already a library.
+        //
+        // Aurora auto-pauses, so the first call after an idle period wakes it
+        // and can be slow; it stays off the main actor for that reason.
+        let settings = store?.settings
+        let credentials = store?.credentials
+        Task { [weak self] in
+            let payload: CloudStatusPayload? = await Task.detached(priority: .userInitiated) {
+                guard let settings, let credentials else { return nil }
+                return CloudStatusService.status(
+                    for: CloudConnection(settings: settings, credentials: credentials))
+            }.value
+
+            await MainActor.run {
+                guard let self else { return }
+                self.isCloudRefreshing = false
+                if let payload {
+                    self.cloud = Self.snapshot(from: payload)
+                } else {
+                    // The failure is kept and shown. An indicator that can only
+                    // say "fine" is worse than none.
+                    self.cloud = CloudSnapshot(
+                        health: .unreachable("The local store is not open."),
+                        status: self.cloud.status,
+                        intervals: self.cloud.intervals,
+                        checkedAt: Date())
+                }
+            }
+        }
+    }
+
+    /// Maps the helper's sanitized payload onto the snapshot the interface
+    /// shows. The reconstructed Status carries only the payload's fields.
+    private static func snapshot(from payload: CloudStatusPayload) -> CloudSnapshot {
+        let health: CloudSnapshot.Health
+        switch payload.health {
+        case .healthy: health = .healthy
+        case .degraded: health = .degraded(payload.message)
+        case .unreachable: health = .unreachable(payload.message)
+        case .insecureEndpoint: health = .unreachable(payload.message)
+        case .notConfigured: health = .notConfigured(payload.message)
+        }
+
+        guard payload.ok else {
+            return CloudSnapshot(health: health, checkedAt: Date())
+        }
+
+        let status = CloudSyncClient.Status(
+            liveSourceEvents: payload.liveSourceEvents ?? 0,
+            approvedDecisions: payload.approvedDecisions ?? 0,
+            publishedDecisions: payload.publishedDecisions ?? 0,
+            openConflicts: payload.openConflicts ?? 0,
+            lastSuccessfulImport: payload.lastSuccessfulImport ?? "",
+            outboundEnabled: payload.outboundEnabled ?? false,
+            remoteSynchronised: payload.remoteSynchronised ?? false,
+            failingSources: payload.failingSources,
+            staleSources: payload.staleSources)
+        let intervals = payload.intervals.map {
+            CloudSyncClient.BlockingInterval(
+                property: $0.property, from: $0.from, to: $0.to,
+                basis: $0.basis, source: $0.source)
+        }
+        return CloudSnapshot(health: health, status: status,
+                             intervals: intervals, checkedAt: Date())
+    }
+
+    /// Cloud intervals that have no counterpart in the local calendar, so the
+    /// interface can show what the cloud knows and the Mac does not.
+    var cloudOnlyIntervals: [CloudSyncClient.BlockingInterval] {
+        let localNights: Set<String> = Set(events.flatMap { item -> [String] in
+            var nights: [String] = []
+            var day = item.event.checkIn
+            while day < item.event.checkOut {
+                nights.append(DayMath.icalDateString(day))
+                day = DayMath.adding(days: 1, to: day)
+            }
+            return nights
+        })
+        return cloud.intervals.filter { interval in
+            guard let from = CloudInterval.day(interval.from) else { return true }
+            return !localNights.contains(DayMath.icalDateString(from))
+        }
+    }
 
     func start() {
         Task { [weak self] in await self?.refreshNotificationStatus() }
@@ -134,7 +324,23 @@ final class AppState: ObservableObject {
             events = try store.classifiedEvents()
             conflicts = try store.conflicts()
             syncRuns = try store.syncRuns.recent(limit: 100)
-            if selectedPropertyID == nil { selectedPropertyID = properties.first?.id }
+            findings = ConflictAnalyzer().analyse(
+                events: events,
+                listings: listings,
+                acknowledgedIDs: try store.conflictAcks.acknowledgedIDs()
+            )
+            decisions = try store.availability.all()
+            auditEntries = try store.auditLog.recent(limit: 200)
+            if let propertyID = selectedPropertyID {
+                syncStates = (try? store.outbound.allStates(propertyID: propertyID)) ?? []
+            }
+            // Never leave the selection on an archived property: the rest of
+            // the app would show a property the portfolio says is gone.
+            let active = properties.filter { !$0.isArchived }
+            if selectedPropertyID == nil
+                || !active.contains(where: { $0.id == selectedPropertyID }) {
+                selectedPropertyID = active.first?.id
+            }
             lastError = nil
         } catch {
             lastError = "Could not read the database: \(error)"
@@ -160,9 +366,67 @@ final class AppState: ObservableObject {
         properties.first { $0.id == selectedPropertyID }
     }
 
+    /// Everything for the selected property. The authority for exports,
+    /// conflicts and review — never filtered by a display toggle.
     var visibleEvents: [ClassifiedEvent] {
         guard let id = selectedPropertyID else { return events }
         return events.filter { $0.propertyID == id }
+    }
+
+    /// What the calendar draws. Restrictions and undecided blocks are hidden
+    /// by default so reservations and real conflicts stand out; confirmed
+    /// reservations and owner blocks are never hidden.
+    var calendarEvents: [ClassifiedEvent] {
+        guard !showPlatformRestrictions else { return visibleEvents }
+        return visibleEvents.filter { item in
+            switch item.displayStatus {
+            case .confirmed, .ownerBlock, .maintenance:
+                return true
+            case .cancellationBlock, .platformRestriction, .needsReview, .unknown:
+                return false
+            }
+        }
+    }
+
+    /// How many the toggle is currently hiding.
+    var hiddenRestrictionCount: Int {
+        showPlatformRestrictions ? 0 : visibleEvents.count - calendarEvents.count
+    }
+
+    var reservations: [ClassifiedEvent] {
+        visibleEvents
+            .filter { $0.classification.kind == .confirmedReservation }
+            .sorted { $0.event.checkIn < $1.event.checkIn }
+    }
+
+    // MARK: - Conflict categories
+
+    var visibleFindings: [ConflictFinding] {
+        guard let id = selectedPropertyID else { return findings }
+        return findings.filter { $0.propertyID == id }
+    }
+
+    func findings(_ category: ConflictCategory) -> [ConflictFinding] {
+        visibleFindings.filter { $0.category == category }
+    }
+
+    var bookingConflictCount: Int {
+        findings(.bookingConflict).filter { !$0.acknowledged }.count
+    }
+
+    var availabilityDifferences: [AvailabilityDifference] {
+        guard let id = selectedPropertyID else { return [] }
+        return AvailabilityOverview().differences(
+            from: DayMath.utcMidnight(Date()), days: 120, propertyID: id,
+            events: visibleEvents, listings: listingsForSelectedProperty
+        )
+    }
+
+    func availability(on day: Date) -> DayAvailability? {
+        guard let id = selectedPropertyID else { return nil }
+        return AvailabilityOverview().day(
+            day, propertyID: id, events: visibleEvents, listings: listingsForSelectedProperty
+        )
     }
 
     var reviewQueue: [ClassifiedEvent] {
@@ -242,27 +506,46 @@ final class AppState: ObservableObject {
     // MARK: - Importing
 
     func refreshAll(autoRefreshOnly: Bool = false) async {
-        guard let store, !isRefreshing else { return }
-        isRefreshing = true
+        guard let store, refreshQueue.beginBulk() else { return }
+        await performBulkRefresh(store: store, autoRefreshOnly: autoRefreshOnly)
+        refreshQueue.endBulk()
+        // Anything the owner clicked during the pass queued behind it rather
+        // than being dropped, so it runs now.
+        await drainRefreshQueue()
+    }
+
+    private func performBulkRefresh(
+        store: RentalStore, autoRefreshOnly: Bool
+    ) async {
         statusMessage = "Reading calendars…"
-        defer { isRefreshing = false }
 
         let service = store.makeImportService(fetcher: URLSessionFeedFetcher())
         let targets = autoRefreshOnly
             ? listings.filter(\.autoRefreshEnabled)
             : listings
 
-        var seen = 0, created = 0, changed = 0, review = 0
+        var seen = 0, created = 0, changed = 0, review = 0, skipped = 0
         var failures: [String] = []
 
         for listing in targets {
+            // Every listing is offered, including ones belonging to an archived
+            // property or with no URL. `importFeed` re-reads the property and
+            // refuses them itself, writing an explicit skipped run — so the
+            // pass cannot import something out of service, and the history
+            // shows the refusal rather than a silent gap. Filtering them out
+            // here instead would import nothing and record nothing.
             let report = await service.importFeed(for: listing)
             seen += report.run.eventsSeen
             created += report.run.eventsInserted
             changed += report.run.eventsUpdated
             review += report.run.eventsNeedingReview
-            if report.run.outcome == .failure {
+            switch report.run.outcome {
+            case .failure:
                 failures.append("\(listing.label): \(report.run.errorMessage ?? "failed")")
+            case .skipped, .disconnected:
+                skipped += 1
+            case .success:
+                break
             }
         }
 
@@ -273,19 +556,83 @@ final class AppState: ObservableObject {
         if created > 0 { parts.append("\(created) new") }
         if changed > 0 { parts.append("\(changed) changed") }
         if review > 0 { parts.append("\(review) need review") }
+        if skipped > 0 { parts.append("\(skipped) skipped") }
         statusMessage = parts.joined(separator: " · ")
         lastError = failures.isEmpty ? nil : failures.joined(separator: "\n")
     }
 
     func refresh(listing: PlatformListing) async {
-        guard let store else { return }
-        isRefreshing = true
-        defer { isRefreshing = false }
+        guard let store, let listingID = listing.id else { return }
+        // An explicit click is the one moment a Keychain dialog is reasonable,
+        // so clear any hold-off left by an automatic refresh that had its
+        // authorization cancelled. Touches no credential value or reference.
+        if !listing.credentialRef.isEmpty {
+            store.allowCredentialRetry(reference: listing.credentialRef)
+        }
+        let outcome = refreshQueue.request(listingID: listingID)
+        // Every outcome is reported, including the two that start nothing. A
+        // click that produces no visible answer is indistinguishable from the
+        // dead button this replaced, even when coalescing it was right.
+        statusMessage = "\(listing.label): \(outcome.ownerMessage)"
+        guard outcome == .startNow else { return }
+        await runRefreshes(startingWith: listing, store: store)
+    }
+
+    /// Imports one feed, then whatever queued behind it, one at a time.
+    ///
+    /// Serial on purpose: the Keychain is the shared resource and an abandoned
+    /// read poisons every later call in the process. Serialising is not the
+    /// same as discarding, which is what the old flag did.
+    private func runRefreshes(
+        startingWith listing: PlatformListing, store: RentalStore
+    ) async {
         let service = store.makeImportService(fetcher: URLSessionFeedFetcher())
-        let report = await service.importFeed(for: listing)
-        reload()
-        statusMessage = "\(listing.label): \(report.run.summaryLine)"
-        lastError = report.run.outcome == .failure ? report.run.errorMessage : nil
+        var current: PlatformListing? = listing
+
+        while let target = current, let targetID = target.id {
+            let report = await service.importFeed(for: target)
+            reload()
+            statusMessage = "\(target.label): \(report.run.summaryLine)"
+            lastError = report.run.outcome == .failure ? report.run.errorMessage : nil
+            refreshQueue.finish(listingID: targetID)
+            current = takeNextQueuedListing()
+        }
+    }
+
+    /// Promotes the next queued feed.
+    ///
+    /// The only thing refused here is a listing that no longer exists — a
+    /// property delete cascades to its listings, so a queued id can outlive
+    /// its row, and there is nothing to import or even to record a run
+    /// against. Everything else is handed to `ImportService`, including a feed
+    /// whose property was archived or whose connection was dropped while it
+    /// waited. That is deliberate: the import path refuses those itself and
+    /// writes an explicit skipped run, so the refusal reaches the history
+    /// instead of disappearing inside the queue. Refusing them here as well
+    /// would be the same decision taken twice, in two places, with only one of
+    /// them leaving a trace.
+    private func takeNextQueuedListing() -> PlatformListing? {
+        var vanished: [Int64] = []
+        let nextID = refreshQueue.nextRunnable(
+            isRunnable: { [weak self] id in self?.listing(id: id) != nil },
+            onSkip: { id in vanished.append(id) }
+        )
+        if !vanished.isEmpty {
+            statusMessage = vanished.count == 1
+                ? "A queued calendar was removed before its turn."
+                : "\(vanished.count) queued calendars were removed before their turn."
+        }
+        guard let nextID else { return nil }
+        return listing(id: nextID)
+    }
+
+    private func listing(id: Int64) -> PlatformListing? {
+        listings.first { $0.id == id }
+    }
+
+    private func drainRefreshQueue() async {
+        guard let store, let next = takeNextQueuedListing() else { return }
+        await runRefreshes(startingWith: next, store: store)
     }
 
     private func scheduleAutoRefresh() {
@@ -374,6 +721,18 @@ final class AppState: ObservableObject {
         reload()
     }
 
+    func acknowledge(finding: ConflictFinding) {
+        guard let store else { return }
+        try? store.conflictAcks.acknowledge(conflictID: finding.id)
+        reload()
+    }
+
+    func unacknowledge(finding: ConflictFinding) {
+        guard let store else { return }
+        try? store.conflictAcks.unacknowledge(conflictID: finding.id)
+        reload()
+    }
+
     func acknowledge(conflict: ReservationConflict) {
         guard let store else { return }
         try? store.conflictAcks.acknowledge(conflictID: conflict.id)
@@ -395,7 +754,8 @@ final class AppState: ObservableObject {
         updated.urlStorage = .keychain
         if updated.credentialRef.isEmpty {
             updated.credentialRef = ListingRepository.credentialReference(
-                platform: listing.platform, listingLabel: listing.label
+                platform: listing.platform, listingLabel: listing.label,
+                propertyID: listing.propertyID
             )
         }
         do {
@@ -425,20 +785,65 @@ final class AppState: ObservableObject {
         reload()
     }
 
+    // MARK: - Property management
+
+    /// Active properties only — what the sidebar and portfolio show.
+    /// `properties` keeps everything so an archived property's name still
+    /// resolves on its historical events.
+    var activeProperties: [Property] { properties.filter { !$0.isArchived } }
+
+    var portfolioRows: [PortfolioRow] { (try? store?.portfolio()) .flatMap { $0 } ?? [] }
+
+    func updateProperty(_ property: Property) {
+        guard let store else { return }
+        do {
+            try store.properties.update(property)
+            statusMessage = "\(property.name) updated."
+        } catch {
+            statusMessage = "That property could not be saved."
+        }
+        reload()
+    }
+
+    /// Archiving is not deletion: every observation, decision and audit row
+    /// stays exactly where it is. The property simply leaves the portfolio.
+    func archiveProperty(id: Int64) {
+        guard let store else { return }
+        try? store.properties.archive(id: id)
+        if selectedPropertyID == id {
+            selectedPropertyID = activeProperties.first { $0.id != id }?.id
+        }
+        reload()
+        statusMessage = "Property archived. Its history is kept."
+    }
+
+    func unarchiveProperty(id: Int64) {
+        guard let store else { return }
+        try? store.properties.unarchive(id: id)
+        reload()
+        statusMessage = "Property restored to the portfolio."
+    }
+
     func addProperty(name: String, address: String) {
         guard let store, !name.isEmpty else { return }
         do {
             let property = try store.properties.insert(Property(name: name, address: address))
             if let id = property.id {
                 for platform in [RentalPlatform.airbnb, .vrbo, .bookingCom] {
+                    // No credential reference until a URL is actually stored.
+                    // A reference with nothing behind it is indistinguishable
+                    // from a broken credential: `doctor` reports it as
+                    // unreadable, and the credential migration raises an
+                    // authorization prompt that can never succeed. Three such
+                    // placeholders buried a real failure on 2026-11-10.
+                    //
+                    // `persistURL` derives the reference the first time a URL
+                    // is saved, so nothing is lost by leaving it empty.
                     try store.listings.insert(PlatformListing(
                         propertyID: id,
                         platform: platform,
                         label: "\(platform.displayName) — \(name)",
                         urlStorage: .keychain,
-                        credentialRef: ListingRepository.credentialReference(
-                            platform: platform, listingLabel: name
-                        ),
                         autoRefreshEnabled: false
                     ))
                 }
@@ -448,6 +853,160 @@ final class AppState: ObservableObject {
         } catch {
             lastError = "Could not add that property: \(error)"
         }
+    }
+
+    // MARK: - Availability
+
+    /// The nights currently selected in the calendar, checkout-exclusive.
+    var selectedRange: (start: Date, end: Date)? {
+        guard let rangeStart, let rangeEnd else { return nil }
+        let lower = min(rangeStart, rangeEnd)
+        let upper = max(rangeStart, rangeEnd)
+        // The user picks the last night; the stored end is the morning after.
+        return (lower, DayMath.adding(days: 1, to: upper))
+    }
+
+    var selectedNights: Int {
+        guard let range = selectedRange else { return 0 }
+        return max(0, DayMath.daysBetween(range.start, range.end))
+    }
+
+    /// Clicking a day starts a range; clicking a second day completes it.
+    func selectDay(_ day: Date) {
+        let value = DayMath.utcMidnight(day)
+        if rangeStart == nil || rangeEnd != nil {
+            rangeStart = value
+            rangeEnd = nil
+        } else {
+            rangeEnd = value
+        }
+    }
+
+    func extendSelection(to day: Date) {
+        if rangeStart == nil { rangeStart = DayMath.utcMidnight(day) }
+        rangeEnd = DayMath.utcMidnight(day)
+    }
+
+    func clearRange() {
+        rangeStart = nil
+        rangeEnd = nil
+        plannedActions = [:]
+        planReason = ""
+    }
+
+    func isDayInSelection(_ day: Date) -> Bool {
+        guard let range = selectedRange else { return false }
+        let value = DayMath.utcMidnight(day)
+        return value >= range.start && value < range.end
+    }
+
+    var currentPlan: AvailabilityPlan? {
+        guard let propertyID = selectedPropertyID, let range = selectedRange,
+              !plannedActions.isEmpty else { return nil }
+        return AvailabilityPlan(
+            propertyID: propertyID, startDay: range.start, endDay: range.end,
+            reason: planReason, actions: plannedActions
+        )
+    }
+
+    /// Works out what the plan would do. Writes nothing.
+    func previewPlan() -> VRCCore.AvailabilityPreview? {
+        guard let store, let plan = currentPlan else { return nil }
+        return try? store.availabilityManager.preview(plan)
+    }
+
+    func submitPlan() {
+        guard let store, let plan = currentPlan else { return }
+        do {
+            let submitted = try store.availabilityManager.submit(plan)
+            reload()
+            let refused = submitted.filter { $0.status == .failed }.count
+            statusMessage = refused == 0
+                ? "\(submitted.count) change\(submitted.count == 1 ? "" : "s") waiting for your approval."
+                : "\(submitted.count - refused) waiting for approval, \(refused) refused."
+            clearRange()
+        } catch {
+            lastError = "Could not save that plan: \(error.localizedDescription)"
+        }
+    }
+
+    func approve(decisionID: Int64) {
+        guard let store else { return }
+        do {
+            let approved = try store.availabilityManager.approve(decisionID: decisionID)
+            reload()
+            statusMessage = "Approved: \(approved.summaryLine). Nothing has been sent anywhere."
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+            reload()
+        }
+    }
+
+    func cancel(decisionID: Int64) {
+        guard let store else { return }
+        do {
+            _ = try store.availabilityManager.cancel(decisionID: decisionID)
+            statusMessage = "Change cancelled."
+        } catch let error as AvailabilityError {
+            // An approved decision refuses a plain cancel. Say so rather than
+            // failing silently, which is how the old `try?` behaved.
+            statusMessage = error.errorDescription ?? "That change could not be cancelled."
+        } catch {
+            statusMessage = "That change could not be cancelled."
+        }
+        reload()
+    }
+
+    /// Deliberately withdrawing an approval. The view asks for confirmation
+    /// first; this is only reached after the owner says yes.
+    func withdrawApproved(decisionID: Int64) {
+        guard let store else { return }
+        do {
+            _ = try store.availabilityManager.withdrawApproved(
+                decisionID: decisionID, confirmation: .ownerConfirmedWithdrawal)
+            statusMessage = "Approval withdrawn. The nights go back on sale here."
+        } catch {
+            statusMessage = "That approval could not be withdrawn."
+        }
+        reload()
+    }
+
+    func cancelAllPending() {
+        guard let store, let propertyID = selectedPropertyID else { return }
+        guard let result = try? store.availabilityManager.cancelPending(propertyID: propertyID)
+        else { return }
+        reload()
+        var message = "Cleared \(result.cancelled) pending change"
+            + (result.cancelled == 1 ? "." : "s.")
+        if result.keptApproved > 0 {
+            // Saying what was KEPT is the point. A sweep that quietly does
+            // less than the button implies is its own surprise.
+            message += " \(result.keptApproved) approved change"
+                + (result.keptApproved == 1 ? " was" : "s were")
+                + " kept — withdraw those individually if you meant to."
+        }
+        statusMessage = message
+    }
+
+    var decisionsForSelectedProperty: [AvailabilityDecision] {
+        guard let id = selectedPropertyID else { return decisions }
+        return decisions.filter { $0.propertyID == id }
+    }
+
+    var pendingDecisions: [AvailabilityDecision] {
+        decisionsForSelectedProperty.filter { $0.status.isPending }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    func destinationFeed(for destination: RentalPlatform) -> DestinationFeed? {
+        guard let store, let id = selectedPropertyID else { return nil }
+        return try? store.outbound.generateFeed(propertyID: id, destination: destination)
+    }
+
+    func auditEntries(forDecision id: Int64) -> [AuditEntry] {
+        guard let store else { return [] }
+        return (try? store.auditLog.entries(forDecision: id)) ?? []
     }
 
     // MARK: - Export

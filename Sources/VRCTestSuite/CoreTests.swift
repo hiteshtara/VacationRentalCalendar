@@ -201,7 +201,8 @@ public enum ClassifierTests {
                  name: "a very long block is flagged as a booking-window artefact") { expect in
             // The third event runs 2027-05-01 to 2027-11-10: 193 nights.
             let (_, proposal) = try classify(Fixtures.airbnbOpaqueBlocks, .airbnb, index: 2)
-            expect.equal(proposal.kind, .unknownUnavailable)
+            expect.equal(proposal.kind, .platformRestriction,
+                         "long horizons now get their own classification")
             expect.ok(proposal.needsReview)
             expect.contains(proposal.rationale, "booking window",
                             "the owner should be told why it looks like an artefact")

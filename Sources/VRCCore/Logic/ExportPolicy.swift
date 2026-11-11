@@ -61,6 +61,13 @@ public struct ExportPolicy: Sendable {
                     + "them could block dates you could still sell."
             )
         }
+        if classification.kind == .platformRestriction {
+            return .exclude(
+                reason: "\(event.platform.displayName) will not take bookings for these dates, "
+                    + "but that is its limit and not the property's. Every platform sets its own "
+                    + "booking window, so this is never copied elsewhere."
+            )
+        }
         if classification.needsReview {
             return .exclude(reason: "Waiting for your review.")
         }
@@ -107,7 +114,7 @@ public struct ExportPolicy: Sendable {
                 reason: "You classified and approved this \(classification.kind.displayName.lowercased())."
             )
 
-        case .cancellationBlock, .unknownUnavailable:
+        case .cancellationBlock, .platformRestriction, .unknownUnavailable:
             // Already handled above; kept exhaustive so a new kind cannot slip
             // through by default.
             return .exclude(reason: "Not eligible for export.")

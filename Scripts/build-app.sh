@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 APP_NAME="VacationRentalCalendar"
 BUNDLE_ID="com.vacationrentalcalendar.app"
 VERSION="1.0.0"
-BUILD="1"
+BUILD="${VRC_BUILD_NUMBER:-1}"
 IDENTITY_NAME="Vacation Rental Calendar Local Signing"
 DIST="dist"
 APP="${DIST}/${APP_NAME}.app"
@@ -49,6 +49,15 @@ cp "${BIN_DIR}/${APP_NAME}" "${APP}/Contents/MacOS/${APP_NAME}"
 cp "${BIN_DIR}/vrc" "${APP}/Contents/MacOS/vrc"
 cp Resources/AppIcon.icns "${APP}/Contents/Resources/AppIcon.icns"
 
+# Build provenance. Without this, "is the installed app the build I just made?"
+# is unanswerable from the bundle, which is exactly the question that wasted an
+# afternoon. `git describe` is not used: this works in a dirty tree too, and
+# says so.
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if git diff --quiet HEAD 2>/dev/null; then GIT_STATE="clean"; else GIT_STATE="modified"; fi
+BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+
 cat > "${APP}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,6 +73,10 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
     <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>        <string>14.0</string>
+    <!-- Declares that this build answers --credential-health. The scripts
+         read this key rather than probing by running the binary: an older
+         build ignores the flag and launches the GUI instead. -->
+    <key>VRCSupportsCredentialHealth</key>      <true/>
     <key>LSApplicationCategoryType</key>     <string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key>       <true/>
     <!-- false: the app keeps a Dock icon as well as its menu-bar item. -->
@@ -71,6 +84,10 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>NSHumanReadableCopyright</key>      <string>Local build. Not for distribution.</string>
     <key>NSSupportsAutomaticTermination</key><false/>
     <key>NSSupportsSuddenTermination</key>   <false/>
+    <key>VRCGitCommit</key>                  <string>${GIT_COMMIT}</string>
+    <key>VRCGitBranch</key>                  <string>${GIT_BRANCH}</string>
+    <key>VRCWorkingTree</key>                <string>${GIT_STATE}</string>
+    <key>VRCBuildDate</key>                  <string>${BUILD_DATE}</string>
 </dict>
 </plist>
 PLIST
@@ -109,7 +126,7 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -qF "${IDENTITY_N
     echo "Found the local signing identity; trying it."
     if sign_bounded "${IDENTITY_NAME}" "${BUNDLE_ID}.probe" "${APP}/Contents/MacOS/vrc"; then
         SIGN_WITH="${IDENTITY_NAME}"
-        echo "Signed with the certificate — Keychain approvals will survive rebuilds."
+        echo "Signed with the certificate."
     else
         echo ""
         echo "  !! macOS is waiting for you to approve codesign's access to the"
@@ -136,6 +153,47 @@ sign_bounded "${SIGN_WITH}" "${BUNDLE_ID}" "${APP}" \
 
 codesign --verify --deep --strict "${APP}" && echo "signature verifies"
 
+# Record the designated requirement and compare it with the previous build.
+#
+# A stable requirement is worth having, but it does NOT preserve Keychain
+# access. Items here are created with SecTrustedApplicationCreateFromPath,
+# which pins the binary's CODE HASH at the moment the item is written. A
+# rebuild changes that hash even when the certificate and the designated
+# requirement are byte-identical, and macOS then refuses without prompting.
+# Earlier versions of this script claimed the opposite and that claim caused a
+# real outage: an update silently disconnected Airbnb, Vrbo and Booking.com.
+# Run ./Scripts/migrate-cloud-credential.sh after an install.
+REQ_FILE=".build/last-designated-requirement"
+# stdout only, and normalised — see Scripts/fix-signing.sh for why.
+CURRENT_REQ="$(codesign -d -r- "${APP}" 2>/dev/null | grep 'designated' | head -1 \
+    | sed -e 's/^[[:space:]]*#[[:space:]]*//' -e 's/[[:space:]]\{1,\}/ /g' \
+          -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+if [ -f "${REQ_FILE}" ]; then
+    PREVIOUS_REQ="$(cat "${REQ_FILE}")"
+    if [ "${CURRENT_REQ}" = "${PREVIOUS_REQ}" ]; then
+        echo "designated requirement unchanged since the last build"
+    else
+        echo ""
+        echo "  !! The signature changed since the last build."
+        echo "     previous: ${PREVIOUS_REQ}"
+        echo "     current:  ${CURRENT_REQ}"
+        echo "     macOS will ask for Keychain permission again."
+        echo "     Fix it permanently with:  ./Scripts/fix-signing.sh"
+        echo ""
+    fi
+fi
+printf '%s' "${CURRENT_REQ}" > "${REQ_FILE}"
+
+case "${CURRENT_REQ}" in
+    *"certificate root"*|*"certificate leaf"*|*anchor*)
+        echo "  signed with a certificate — stable identity, but see the Keychain note above"
+        ;;
+    *cdhash*)
+        echo "  note: ad-hoc signed. Run ./Scripts/fix-signing.sh once to stop"
+        echo "        the repeated Keychain prompts."
+        ;;
+esac
+
 # ------------------------------------------------------------------ install
 
 if [ "${INSTALL}" = true ]; then
@@ -144,6 +202,64 @@ if [ "${INSTALL}" = true ]; then
     cp -R "${APP}" "/Applications/${APP_NAME}.app"
     echo "Installed at /Applications/${APP_NAME}.app"
     TARGET="/Applications/${APP_NAME}.app"
+
+    # Verify what the previous version merely asserted. Stored connection
+    # status is not evidence: it reflects the last fetch, which may predate
+    # this install. Only an actual read proves anything.
+    step "Verifying credential readability (not stored status)"
+    # This probe READS credential values, which requests Keychain
+    # authorization. Doing that beside a running copy of the app is what broke
+    # two live calendars on 2026-11-10: both processes asked for authorization
+    # on the same items, the running app's read was cancelled (-128), and its
+    # import latched credentialUnreadable. So refuse to probe while the app is
+    # running rather than racing it.
+    if pgrep -f "/Applications/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
+        echo "  SKIPPED: ${APP_NAME} is running."
+        echo "  Reading credentials beside a running copy makes both ask for"
+        echo "  Keychain authorization at once, and a cancelled prompt is what"
+        echo "  disconnected two calendars on 2026-11-10. Quit the app and"
+        echo "  re-run if you need this check."
+        KEYCHAIN_NEEDS_MIGRATION=0
+    else
+    # `vrc doctor`, not `vrc keychain` — there has never been a `keychain`
+    # subcommand. The old call failed silently, grep counted zero, and this
+    # reported "all stored credentials are readable" after every install,
+    # whether they were or not. The same dead call appeared twice in
+    # Scripts/migrate-cloud-credential.sh and misreported every migration.
+    #
+    # doctor distinguishes never-configured listings from unreadable ones, so
+    # an unconfigured property no longer counts as a failure here either.
+    UNREADABLE="$("/Applications/${APP_NAME}.app/Contents/MacOS/vrc" doctor 2>/dev/null \
+                  | grep -c "FAIL feed URL readable" || true)"
+    if [ "${UNREADABLE:-0}" -gt 0 ]; then
+        echo "  ${UNREADABLE} stored credential(s) are NOT readable by this build."
+        echo "  This is expected after a rebuild and is NOT a failed install."
+        echo "  Fix it without rotating anything:"
+        echo "      ./Scripts/migrate-cloud-credential.sh"
+        echo "  Any item that cannot be migrated must be re-entered under Feeds."
+        KEYCHAIN_NEEDS_MIGRATION=1
+    else
+        echo "  all stored credentials are readable by this build"
+        KEYCHAIN_NEEDS_MIGRATION=0
+    fi
+    fi
+
+    # A rebuilt helper has a new code hash, so it can no longer read the AWS
+    # credential a previous build stored (see docs/KEYCHAIN.md). If a credential
+    # is present but unreadable, offer to migrate it in place -- this reads the
+    # existing secret with your approval and hands it to the new helper. It does
+    # NOT create or rotate an AWS key. Skipped when there is nothing to migrate,
+    # and skippable entirely with VRC_SKIP_KEYCHAIN_MIGRATION=1.
+    HELPER_BIN="/Applications/${APP_NAME}.app/Contents/MacOS/vrc"
+    if [ "${VRC_SKIP_KEYCHAIN_MIGRATION:-0}" != "1" ] \
+       && "${HELPER_BIN}" cloud status 2>/dev/null | grep -q "could not be read"; then
+        echo ""
+        echo "The rebuilt helper cannot yet read its stored AWS credential."
+        echo "Running ./Scripts/migrate-cloud-credential.sh to re-own it."
+        echo "macOS will ask permission to read the existing secret — choose Always Allow."
+        ./Scripts/migrate-cloud-credential.sh || \
+            echo "  (migration skipped or declined; run it later to restore the Cloud pane)"
+    fi
 else
     TARGET="$(pwd)/${APP}"
 fi
@@ -152,7 +268,8 @@ step "Done"
 cat <<SUMMARY
 Application: ${TARGET}
 Size:        $(du -sh "${TARGET}" | cut -f1)
-Signature:   $(codesign -dv "${TARGET}" 2>&1 | grep -E '^Signature' | head -1)
+Signature:   $(codesign -dvvv "${TARGET}" 2>&1 | sed -n 's/^Authority=/signed by /p' | head -1)
+Requirement: ${CURRENT_REQ}
 
 Open it by double-clicking in Finder, or:
     open "${TARGET}"

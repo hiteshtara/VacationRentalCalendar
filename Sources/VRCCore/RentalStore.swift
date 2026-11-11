@@ -7,7 +7,7 @@ import Foundation
 /// fast enough locally that a background queue would add risk without adding
 /// responsiveness.
 public final class RentalStore: @unchecked Sendable {
-    public let database: Database
+    public let database: DataStore
     public let credentials: FeedCredentialStore
     public let properties: PropertyRepository
     public let listings: ListingRepository
@@ -20,11 +20,34 @@ public final class RentalStore: @unchecked Sendable {
     public let detector: ConflictDetector
     public let exporter: ExportService
     public let policy: ExportPolicy
+    public let availability: AvailabilityRepository
+    public let auditLog: AvailabilityAuditLog
+    public let snapshots: FeedSnapshotRepository
+    public let feedTokens: FeedTokenRepository
+    public private(set) var availabilityManager: AvailabilityManager!
+    public private(set) var outbound: OutboundSyncCoordinator!
 
-    public init(database: Database, credentials: FeedCredentialStore) throws {
+    public init(
+        database: DataStore,
+        credentials: FeedCredentialStore,
+        skipMigration: Bool = false
+    ) throws {
         self.database = database
         self.credentials = credentials
-        try Migrator.migrate(database)
+        // The SQLite migrator builds the local schema. Postgres is migrated by
+        // the numbered files in Migrations/postgres, applied once against the
+        // cluster rather than on every connection — so a cloud store arrives
+        // already migrated and this step is skipped.
+        if skipMigration {
+            // A store whose schema is managed elsewhere, or a test double.
+        } else if let sqlite = database as? Database {
+            try Migrator.migrate(sqlite)
+        } else if try database.scalarInt(
+            "SELECT count(*) FROM schema_migrations") == 0 {
+            throw DataAPIError.notConfigured(
+                "the database has no applied migrations — apply Migrations/postgres/*.sql "
+                + "before pointing the service at it")
+        }
         self.properties = PropertyRepository(database: database)
         self.listings = ListingRepository(database: database, credentials: credentials)
         self.events = EventRepository(database: database)
@@ -36,6 +59,47 @@ public final class RentalStore: @unchecked Sendable {
         self.detector = ConflictDetector()
         self.policy = ExportPolicy()
         self.exporter = ExportService(policy: policy)
+        self.availability = AvailabilityRepository(database: database)
+        self.auditLog = AvailabilityAuditLog(database: database)
+        self.snapshots = FeedSnapshotRepository(database: database)
+        self.feedTokens = FeedTokenRepository(database: database, credentials: credentials)
+
+        // Built after the stored properties so they can close over `self`
+        // safely; the closure only reads, and only on demand.
+        let repositories = (
+            availability: self.availability,
+            audit: self.auditLog,
+            properties: self.properties,
+            listings: self.listings
+        )
+        let provider: @Sendable () throws -> [ClassifiedEvent] = { [unowned self] in
+            try self.classifiedEvents()
+        }
+        self.availabilityManager = AvailabilityManager(
+            decisions: repositories.availability,
+            audit: repositories.audit,
+            properties: repositories.properties,
+            listings: repositories.listings,
+            eventsProvider: provider
+        )
+        self.outbound = OutboundSyncCoordinator(
+            decisions: repositories.availability,
+            manager: availabilityManager,
+            properties: repositories.properties,
+            snapshots: self.snapshots,
+            database: database,
+            eventsProvider: provider,
+            listingsProvider: { [unowned self] in try self.listings.all() },
+            syncRunsProvider: { [unowned self] in try self.syncRuns.recent(limit: 50) },
+            settingsProvider: { [unowned self] in { key in try self.settings.string(key) } },
+            tokensProvider: { [unowned self] in
+                { propertyID, destination in
+                    try self.feedTokens.current(
+                        propertyID: propertyID, destination: destination
+                    )?.credentialRef
+                }
+            }
+        )
     }
 
     /// The real on-disk store.
@@ -44,18 +108,63 @@ public final class RentalStore: @unchecked Sendable {
     /// fallback: a feed URL is a bearer credential for the owner's whole
     /// booking calendar, and silently downgrading its protection would be worse
     /// than failing visibly.
+    /// The real, on-disk store. Keychain-backed, so Apple platforms only.
+    /// Linux builds use `makeInMemory()` or construct a store with their own
+    /// credential source: on the server the credentials come from Secrets
+    /// Manager, not from a Keychain.
+    #if canImport(Security)
     public static func makeDefault() throws -> RentalStore {
         AppPaths.ensureDirectories()
-        let keychain = KeychainFeedCredentialStore(
-            additionalTrustedPaths: AppPaths.siblingExecutablePaths()
-        )
         return try RentalStore(
             database: Database(path: AppPaths.databaseURL.path),
-            credentials: DeadlineFeedCredentialStore(wrapping: keychain)
+            credentials: makeCredentialStore()
         )
     }
 
+    /// The production credential store.
+    ///
+    /// A build signed by this team reads from the data protection Keychain and
+    /// falls back to the login Keychain for anything not migrated yet; writes
+    /// go only to the new store, and the legacy entry is never touched. That
+    /// makes the migration additive and the rollback a one-line change here.
+    ///
+    /// A build that is NOT signed by the team — the development CLI, a local
+    /// build, the test runner — stays entirely on the login Keychain. The data
+    /// protection Keychain needs an entitlement only a properly signed build
+    /// carries, and selecting it without one makes every call fail with
+    /// `-34018` rather than upgrading anything.
+    ///
+    /// Both paths keep the deadline wrapper. The data protection Keychain does
+    /// not prompt, so it should rarely fire, but an unbounded system call is
+    /// not something to introduce on the assumption it is now unnecessary.
+    /// The hold-off wrapper is outermost so a suppressed read returns at once,
+    /// without even entering the deadline machinery. Making a cancelled
+    /// authorization retryable without it would turn one dismissed dialog into
+    /// a dialog per feed per refresh pass.
+    public static func makeCredentialStore() -> FeedCredentialStore {
+        let legacy = KeychainFeedCredentialStore(
+            additionalTrustedPaths: AppPaths.siblingExecutablePaths()
+        )
+        guard CredentialStoreSelection.shouldUseDataProtection else {
+            return AuthorizationCooloffFeedCredentialStore(
+                wrapping: DeadlineFeedCredentialStore(wrapping: legacy))
+        }
+        let modern = DataProtectionFeedCredentialStore(policy: AppleTeam.keychainPolicy)
+        return AuthorizationCooloffFeedCredentialStore(
+            wrapping: DeadlineFeedCredentialStore(
+                wrapping: LayeredFeedCredentialStore(primary: modern, fallback: legacy)))
+    }
+    #endif
+
     /// A throwaway store for tests.
+    /// The same repositories, backed by Aurora. Used by the Lambda handlers so
+    /// they run the tested repository operations rather than their own SQL.
+    public static func makeCloud(
+        store: DataStore, credentials: FeedCredentialStore = InMemoryFeedCredentialStore()
+    ) throws -> RentalStore {
+        try RentalStore(database: store, credentials: credentials)
+    }
+
     public static func makeInMemory() throws -> RentalStore {
         try RentalStore(database: Database.inMemory(), credentials: InMemoryFeedCredentialStore())
     }
@@ -67,6 +176,7 @@ public final class RentalStore: @unchecked Sendable {
             events: events,
             classifications: classifications,
             listings: listings,
+            properties: properties,
             syncRuns: syncRuns,
             fetcher: fetcher,
             classifier: classifier
@@ -116,6 +226,63 @@ public final class RentalStore: @unchecked Sendable {
                 propertyName: propertyNames[propertyID] ?? "Unassigned"
             )
         }
+    }
+
+    /// What a listing's stored credential is actually doing.
+    public enum CredentialStatus: String, Sendable, Equatable {
+        /// No Keychain item exists. The listing has never been set up — which
+        /// is not a fault, and must not be reported as one.
+        case notConfigured
+        /// An item exists and this build can read it.
+        case readable
+        /// An item exists and this build CANNOT read it. The real problem: an
+        /// access list naming a build that no longer exists.
+        case unreadable
+    }
+
+    public struct CredentialReport: Sendable {
+        public let listing: PlatformListing
+        public let status: CredentialStatus
+    }
+
+    /// Per-listing credential state.
+    ///
+    /// The discriminator between "not set up" and "broken" is whether an ITEM
+    /// exists. `exists` reads attributes only, never prompts and never blocks,
+    /// so asking costs nothing.
+    ///
+    /// This distinction is not pedantry: reporting three never-configured
+    /// listings as unreadable made `vrc doctor` permanently red, which is
+    /// exactly how a genuinely unreadable credential stops being noticed.
+    /// Lets the next read of one credential ask for authorization again.
+    ///
+    /// For an explicit refresh by the owner. A dialog is tolerable when they
+    /// just asked for one; the hold-off exists to stop automatic refreshes
+    /// raising a series of them. Does nothing when no hold-off is in place,
+    /// and never touches a credential's value or its reference.
+    public func allowCredentialRetry(reference: String) {
+        (credentials as? AuthorizationCooloffFeedCredentialStore)?
+            .allowRetry(reference: reference)
+    }
+
+    public func credentialHealth() throws -> [CredentialReport] {
+        try listings.all().map { listing in
+            guard !listing.credentialRef.isEmpty,
+                  credentials.exists(reference: listing.credentialRef) else {
+                return CredentialReport(listing: listing, status: .notConfigured)
+            }
+            guard let value = try? credentials.url(reference: listing.credentialRef),
+                  value != nil else {
+                return CredentialReport(listing: listing, status: .unreadable)
+            }
+            return CredentialReport(listing: listing, status: .readable)
+        }
+    }
+
+    /// Listings whose credential exists but cannot be read. A listing that was
+    /// never configured is NOT included — see `credentialHealth`.
+    public func unreadableCredentials() throws -> [PlatformListing] {
+        try credentialHealth().filter { $0.status == .unreadable }.map(\.listing)
     }
 
     public func conflicts() throws -> [ReservationConflict] {

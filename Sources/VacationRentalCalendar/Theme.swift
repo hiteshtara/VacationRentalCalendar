@@ -24,6 +24,7 @@ enum Theme {
         case .ownerBlock: return Color(red: 0.24, green: 0.36, blue: 0.80)
         case .maintenance: return Color(red: 0.71, green: 0.45, blue: 0.10)
         case .cancellationBlock: return Color(red: 0.71, green: 0.29, blue: 0.82)
+        case .platformRestriction: return Color(red: 0.38, green: 0.42, blue: 0.55)
         case .needsReview: return Color(red: 0.88, green: 0.54, blue: 0.12)
         case .unknown: return Color(red: 0.42, green: 0.45, blue: 0.50)
         }
@@ -35,6 +36,7 @@ enum Theme {
         case .ownerBlock: return color(for: EventDisplayStatus.ownerBlock)
         case .maintenanceBlock: return color(for: EventDisplayStatus.maintenance)
         case .cancellationBlock: return color(for: EventDisplayStatus.cancellationBlock)
+        case .platformRestriction: return color(for: EventDisplayStatus.platformRestriction)
         case .unknownUnavailable: return color(for: EventDisplayStatus.unknown)
         }
     }

@@ -1,0 +1,237 @@
+#!/bin/bash
+#
+# Moves the existing credentials — the AWS staging key AND each platform's
+# private feed URL — to the newly installed `vrc` helper, WITHOUT rotating
+# anything.
+#
+#   ./Scripts/migrate-cloud-credential.sh
+#
+# WHY THIS EXISTS
+#
+# On this machine a login-keychain item is readable only by the exact code
+# object that created it: macOS pins the creating binary's code hash in the
+# item's partition list, and a rebuild changes that hash. So when the helper is
+# rebuilt, it can no longer read the credential a previous build stored, and the
+# partition list cannot be widened without your login password. See
+# docs/KEYCHAIN.md for the full investigation.
+#
+# This is the one manual step after a helper rebuild. It creates no new AWS key
+# and no new feed URL. It reads what you already stored, with your approval, and
+# hands it to the new helper in memory so the new helper owns a readable copy.
+#
+# Feed URLs are included because they break in exactly the same way and had no
+# migration path: an app update silently disconnected Airbnb, Vrbo and
+# Booking.com, and the only remedy was re-typing URLs the owner had to find
+# again. A credential that cannot be read is reported as needing re-entry — it
+# is never reported as migrated.
+#
+# WHAT IT DOES NOT DO
+#
+#   - It never writes the secret to disk, a log, or your shell history.
+#   - It never prints the secret.
+#   - It never calls AWS. No key is created, rotated, or deleted.
+#
+# macOS will prompt once per item for permission to read it. Choose "Always
+# Allow" so a later run is silent. The prompt is macOS's own; this script never
+# sees your login password.
+
+set -uo pipefail
+
+# shellcheck source=credential-health.sh
+source "$(dirname "$0")/credential-health.sh"
+
+SERVICE="com.vacationrentalcalendar.feed-url"
+# Overridable so the selection logic can be tested without the real Keychain
+# or a real install. Untestable migration tooling is how you discover it
+# prompts six times for three credentials.
+HELPER="${VRC_HELPER_OVERRIDE:-/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc}"
+
+# Optional targeting: migrate one listing instead of all of them. After a
+# partial failure the remaining credential should cost ONE prompt, not a fresh
+# round over everything that already works.
+ONLY_LISTING=""
+ONLY_PLATFORM=""
+# Skip the AWS credential entirely. Recovering ONE feed URL must not raise
+# prompts for anything else — that noise is what hid a real failure on
+# 2026-11-10.
+FEEDS_ONLY=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --feeds-only) FEEDS_ONLY=true; shift ;;
+        --listing)  ONLY_LISTING="${2:-}"; shift 2 ;;
+        --platform) ONLY_PLATFORM="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+KEY_ID_REF="aws-access-key-id"
+SECRET_REF="aws-secret-access-key"
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+
+[ -x "$HELPER" ] || { say "No installed helper at $HELPER — run ./Scripts/build-app.sh --install first."; exit 1; }
+
+if [ "${FEEDS_ONLY}" = true ]; then
+    say "Skipping the AWS credential (--feeds-only)."
+else
+step "Checking whether the new helper already reads its credential"
+if "$HELPER" cloud status 2>/dev/null | grep -q "readable"; then
+    say "The helper already reads its AWS credential — leaving it alone."
+else
+
+step "Reading the existing credential (macOS will ask your permission)"
+say "Choose \"Always Allow\" at each prompt."
+
+# -w prints only the password field to stdout; captured into a shell variable,
+# never displayed, never written to a file.
+KEY_ID="$(security find-generic-password -s "$SERVICE" -a "$KEY_ID_REF" -w 2>/dev/null)"
+SECRET="$(security find-generic-password -s "$SERVICE" -a "$SECRET_REF" -w 2>/dev/null)"
+
+if [ -z "${KEY_ID}" ] || [ -z "${SECRET}" ]; then
+    say ""
+    say "Could not read the AWS credential. Either the prompt was declined, or"
+    say "none is stored. Nothing was changed and your IAM key is untouched."
+    say "Store it again with:  $HELPER cloud set-credentials"
+    say "Continuing to the feed URLs, which are separate credentials."
+else
+
+step "Handing it to the new helper, in memory"
+# Two lines on stdin: key id, then secret. Never on the command line.
+printf '%s\n%s\n' "${KEY_ID}" "${SECRET}" | "$HELPER" cloud set-credentials --stdin
+rc=$?
+unset KEY_ID SECRET
+
+if [ "$rc" -ne 0 ]; then
+    say "The helper did not store the AWS credential (exit $rc). Continuing to feeds."
+else
+    step "Verifying the helper can now reach the service"
+    if "$HELPER" cloud check >/dev/null 2>&1; then
+        say "Done. The new helper owns a readable copy. The same IAM key — not a new one."
+        say "The old keychain entry is left in place; nothing was deleted."
+    else
+        say "Stored, but the service did not answer on the first try. Open the app and"
+        say "press Refresh from AWS, or run:  $HELPER cloud check"
+    fi
+fi
+fi
+fi
+fi
+
+# ---------------------------------------------------------------- feed URLs --
+#
+# Same failure, same remedy. Each listing's URL lives under its own reference,
+# which `vrc status` prints and the database records. The URL itself is never
+# printed, never written to a file, and never placed on a command line — it
+# travels from `security` to the helper through a pipe and nothing else.
+
+step "Migrating private feed URLs"
+
+DB="${VRC_DB_OVERRIDE:-${HOME}/Library/Application Support/VacationRentalCalendar/VacationRentalCalendar.sqlite}"
+if [ ! -f "$DB" ]; then
+    say "No local database at the expected path; skipping feed URLs."
+    exit 0
+fi
+
+migrated=0; needs_entry=0
+
+# `.backup` rather than reading the live file: a plain read misses the WAL.
+TMPDB="$(mktemp -t vrcmig).sqlite"
+sqlite3 "$DB" ".backup '${TMPDB}'" 2>/dev/null || { say "Could not read the database; skipping feed URLs."; exit 0; }
+
+skipped=0
+
+while IFS='|' read -r listing_id platform ref label; do
+    [ -n "${ref:-}" ] || continue
+
+    # Targeting, when asked for.
+    if [ -n "${ONLY_LISTING}" ] && [ "${listing_id}" != "${ONLY_LISTING}" ]; then continue; fi
+    if [ -n "${ONLY_PLATFORM}" ] && [ "${platform}" != "${ONLY_PLATFORM}" ]; then continue; fi
+
+    # A listing that has never had a URL stored has a reference but nothing
+    # behind it. Reading it can only fail, and the attempt costs an
+    # authorization prompt — so the prompts that matter get lost among prompts
+    # that cannot possibly succeed. That is exactly what happened on
+    # 2026-11-10: three synthetic listings produced three pointless prompts and
+    # the one real failure went unnoticed in the noise.
+    #
+    # WITHOUT -w this reads attributes only. It never prompts, never blocks,
+    # and never touches secret material.
+    if [ "$(credential_status "${ref}")" = "not-configured" ]; then
+        say ""
+        say "  ${platform} (listing ${listing_id}) — no credential stored; skipped without prompting"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    say ""
+    say "  ${platform} (listing ${listing_id}) — reference ${ref}"
+
+    # There is deliberately no "is it already readable?" shortcut here. The
+    # previous one piped `"$HELPER" keychain` — a command that does not exist —
+    # into grep, so it never matched and "already readable" was always zero.
+    # Testing readability properly means attempting a read, which is the very
+    # prompt this is trying to avoid raising unnecessarily. Re-homing a
+    # credential that was already fine is harmless: it writes a new entry and
+    # leaves the old one alone.
+
+    # Read the old item. macOS prompts; choose "Always Allow". The value is
+    # captured into a shell variable and never echoed.
+    URL="$(security find-generic-password -s "$SERVICE" -a "$ref" -w 2>/dev/null)"
+    if [ -z "${URL:-}" ]; then
+        say "    could not be read, even with authorization."
+        say "    ACTION REQUIRED: re-enter this URL under Feeds in the app."
+        say "    (The old entry is untouched. Nothing was deleted or rotated.)"
+        needs_entry=$((needs_entry + 1))
+        continue
+    fi
+
+    # Hand it over through a pipe. --stdin skips the interactive confirmation
+    # but keeps every check: https only, fetched and parsed before saving.
+    if printf '%s\n' "${URL}" | "$HELPER" set-url --listing "${listing_id}" --stdin --rehome >/dev/null 2>&1; then
+        unset URL
+        # Verify against what actually happened, not against a command that
+        # does not exist. `set-url` fetches and parses the feed before storing
+        # it, so its exit status already proves the URL was read and worked;
+        # what remains is confirming a NEW entry landed, which the database
+        # names and `security` can confirm WITHOUT -w — attributes only, no
+        # prompt.
+        #
+        # The old check reported every successful migration as a failure. It
+        # had already cried wolf in the other direction the same day, and a
+        # verification nobody can trust is worse than none.
+        new_ref="$(sqlite3 "$DB" "SELECT credential_ref FROM platform_listings WHERE id = ${listing_id};" 2>/dev/null)"
+        _VRC_HEALTH_SOURCE=""   # the write changed things; ask again
+        if [ -n "${new_ref}" ] && [ "$(credential_status "${new_ref}")" != "not-configured" ]; then
+            if [ "${new_ref}" = "${ref}" ]; then
+                say "    migrated — stored under ${new_ref}"
+            else
+                say "    migrated — stored under ${new_ref} (was ${ref}, which is left in place)"
+            fi
+        else
+            say "    the helper reported success but no entry was found afterwards."
+            say "    ACTION REQUIRED: check this listing under Feeds in the app."
+        fi
+        migrated=$((migrated + 1))
+    else
+        unset URL
+        say "    the helper refused to store it (the URL may no longer be valid)."
+        say "    ACTION REQUIRED: re-enter this URL under Feeds in the app."
+        needs_entry=$((needs_entry + 1))
+    fi
+done <<EOF
+$(sqlite3 "$TMPDB" "SELECT id, platform, credential_ref, label FROM platform_listings WHERE credential_ref <> '' ORDER BY id;" 2>/dev/null)
+EOF
+
+rm -f "$TMPDB"
+
+step "Feed URL summary"
+say "  migrated:                ${migrated}"
+say "  skipped (no credential): ${skipped}"
+say "  need manual re-entry:    ${needs_entry}"
+if [ "${needs_entry}" -gt 0 ]; then
+    say ""
+    say "Some URLs could not be migrated. They are bearer credentials this script"
+    say "cannot recover; re-enter them under Feeds in the app. Nothing was deleted,"
+    say "nothing was rotated, and no platform availability was touched."
+    exit 2
+fi

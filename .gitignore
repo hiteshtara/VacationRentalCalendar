@@ -42,3 +42,6 @@ Samples/private/
 *.mobileprovision
 *.keychain
 *.keychain-db
+
+# Provisioning profiles are team-specific and never belong in Git.
+Resources/Profiles/*.provisionprofile

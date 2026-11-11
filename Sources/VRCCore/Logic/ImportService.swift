@@ -6,17 +6,21 @@ public struct ImportReport: Sendable {
     /// Keys whose classification the import left alone because the owner had
     /// already decided them.
     public var preservedDecisions: Int
+    /// Decisions kept, but sent back for review because the event changed.
+    public var reReviewed: Int
     public var productID: String
 
     public init(
         run: SyncRun,
         warnings: [String] = [],
         preservedDecisions: Int = 0,
+        reReviewed: Int = 0,
         productID: String = ""
     ) {
         self.run = run
         self.warnings = warnings
         self.preservedDecisions = preservedDecisions
+        self.reReviewed = reReviewed
         self.productID = productID
     }
 }
@@ -31,6 +35,7 @@ public struct ImportService: Sendable {
     let events: EventRepository
     let classifications: ClassificationRepository
     let listings: ListingRepository
+    let properties: PropertyRepository
     let syncRuns: SyncRunRepository
     let fetcher: FeedFetching
     let classifier: BlockClassifier
@@ -39,6 +44,7 @@ public struct ImportService: Sendable {
         events: EventRepository,
         classifications: ClassificationRepository,
         listings: ListingRepository,
+        properties: PropertyRepository,
         syncRuns: SyncRunRepository,
         fetcher: FeedFetching,
         classifier: BlockClassifier = BlockClassifier()
@@ -46,6 +52,7 @@ public struct ImportService: Sendable {
         self.events = events
         self.classifications = classifications
         self.listings = listings
+        self.properties = properties
         self.syncRuns = syncRuns
         self.fetcher = fetcher
         self.classifier = classifier
@@ -62,23 +69,116 @@ public struct ImportService: Sendable {
 
         var run = SyncRun(listingID: listingID, startedAt: now)
 
+        // A property the owner has archived is out of service: its calendars
+        // are not fetched, and nothing already observed for them is withdrawn.
+        //
+        // Checked HERE rather than in the caller, deliberately. Every import in
+        // the system comes through this function — the per-feed refresh, the
+        // queue drain, the "Refresh all" pass and the `vrc` CLI — so this is
+        // the only place the rule cannot be bypassed or forgotten. It also
+        // closes a race the caller cannot: a bulk pass walks the listing list
+        // it captured when the pass began, and a queued request carries a
+        // listing value captured when it was clicked, so both can arrive after
+        // the property was archived. The database is consulted at the moment of
+        // the import, not at the moment of the request.
+        //
+        // Read with an explicit do/catch rather than `try?`: this returns an
+        // optional, and `try?` would wrap it in a second one, which is exactly
+        // how the doctor once reported dangling references as readable.
+        let property: Property?
+        do {
+            property = try properties.find(id: listing.propertyID)
+        } catch {
+            // Could not establish what this listing belongs to. Refusing is the
+            // safe direction — an import that cannot be justified must not
+            // withdraw anything.
+            property = nil
+        }
+        if !FeedRefreshEligibility.propertyStatus(property).canRun {
+            run.outcome = .skipped
+            run.finishedAt = Date()
+            run.errorMessage = property == nil
+                ? "The property for this listing could not be found."
+                : "The property is archived."
+            try? syncRuns.record(run)
+            try? listings.recordSync(
+                listingID: listingID, at: now, summary: run.summaryLine
+            )
+            return ImportReport(run: run)
+        }
+
+        // A revoked credential is never retried. The platform has already
+        // given its answer, and repeating the request only fills the history
+        // with failures that look like trouble rather than a settled fact.
+        guard listing.connectionState.shouldAttemptImport else {
+            run.outcome = .disconnected
+            run.finishedAt = Date()
+            run.errorMessage = listing.connectionState.explanation
+            try? syncRuns.record(run)
+            try? listings.recordSync(
+                listingID: listingID, at: now,
+                summary: "Not imported — \(listing.connectionState.displayName.lowercased())"
+            )
+            return ImportReport(run: run)
+        }
+
         // Resolved here, at the one moment it is needed, rather than on every
         // listing read. A Keychain prompt is tolerable when the owner just asked
         // for a refresh; it is not tolerable while drawing a calendar.
         var feedURL = ""
         var resolveError: String?
+        // A TRANSIENT Keychain failure is not a broken credential, and the
+        // difference decides whether this feed is ever read again:
+        // `credentialUnreadable` is never retried.
+        //
+        // This was asked inline as "was it a timeout?", which silently filed
+        // every OTHER transient failure as a dead credential. On 2026-11-10 a
+        // cancelled authorization — OSStatus -128, lasting one second, while a
+        // third feed read fine in the same instant — permanently disconnected
+        // Airbnb and Vrbo. The question is now answered in one place, by
+        // `FeedCredentialError.isRetryableCredentialFailure`, over a
+        // classification of the actual status code.
+        var resolveIsRetryable = false
+        var resolveSummary: String?
         do {
             feedURL = try listings.resolveURL(for: listing)
+        } catch let error as FeedCredentialError {
+            resolveIsRetryable = error.isRetryableCredentialFailure
+            resolveSummary = error.shortSummary
+            resolveError = error.errorDescription ?? "\(error)"
         } catch {
             resolveError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
 
         guard !feedURL.isEmpty else {
-            run.outcome = .skipped
             run.finishedAt = Date()
-            run.errorMessage = resolveError ?? "No calendar URL configured."
+            if let resolveError {
+                // Retryable failures are recorded as a failure and left
+                // `failing`, which `shouldAttemptImport` still allows. Only a
+                // settled refusal — an access list naming another build —
+                // becomes `credentialUnreadable`, which is never retried,
+                // because there each attempt holds the Keychain for the rest
+                // of the process and cannot succeed anyway.
+                run.outcome = resolveIsRetryable ? .failure : .disconnected
+                run.errorMessage = resolveError
+                try? listings.setConnectionState(
+                    listingID: listingID,
+                    to: resolveIsRetryable ? .failing : .credentialUnreadable,
+                    detail: resolveError, actor: "import", at: now
+                )
+                try? listings.recordSync(
+                    listingID: listingID, at: now,
+                    summary: resolveSummary
+                        ?? "Enter this listing's URL again — the saved one cannot be read"
+                )
+            } else {
+                run.outcome = .skipped
+                run.errorMessage = "No calendar URL configured."
+                try? listings.recordSync(
+                    listingID: listingID, at: now, summary: run.summaryLine
+                )
+            }
             try? syncRuns.record(run)
-            try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
             return ImportReport(run: run)
         }
 
@@ -86,11 +186,35 @@ public struct ImportService: Sendable {
         do {
             response = try await fetcher.fetch(urlString: feedURL)
         } catch {
+            let message = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            if let fetchError = error as? FeedFetchError,
+               fetchError.indicatesRevokedCredential {
+                // Settled, not transient. Stop retrying and say so plainly.
+                var status: Int?
+                if case .credentialRejected(let code, _) = fetchError { status = code }
+                run.outcome = .disconnected
+                run.finishedAt = Date()
+                run.errorMessage = message
+                try? syncRuns.record(run)
+                try? listings.setConnectionState(
+                    listingID: listingID, to: .revoked, detail: message,
+                    httpStatus: status, actor: "import", at: now
+                )
+                try? listings.recordSync(
+                    listingID: listingID, at: now,
+                    summary: "Disconnected by the platform — a new export URL is needed"
+                )
+                return ImportReport(run: run)
+            }
+
             run.outcome = .failure
             run.finishedAt = Date()
-            run.errorMessage = (error as? LocalizedError)?.errorDescription
-                ?? error.localizedDescription
+            run.errorMessage = message
             try? syncRuns.record(run)
+            try? listings.setConnectionState(
+                listingID: listingID, to: .failing, detail: message, actor: "import", at: now
+            )
             try? listings.recordSync(listingID: listingID, at: now, summary: run.summaryLine)
             return ImportReport(run: run)
         }
@@ -151,6 +275,8 @@ public struct ImportService: Sendable {
             )
 
             do {
+                // Captured before the upsert so a material change can be seen.
+                let previous = try events.find(eventKey: key)
                 let result = try events.upsert(event, seenAt: now)
                 switch result {
                 case .inserted: report.run.eventsInserted += 1
@@ -165,7 +291,28 @@ public struct ImportService: Sendable {
                 let existing = try classifications.find(eventKey: key)
                 if let existing, existing.isLocked {
                     report.preservedDecisions += 1
-                    if existing.needsReview { report.run.eventsNeedingReview += 1 }
+
+                    // R5: the decision stands, but if the platform changed the
+                    // event materially it may no longer describe it, so it goes
+                    // back to the queue rather than silently continuing to apply.
+                    var kept = existing
+                    if let previous, result == .updated {
+                        let assessment = MaterialChange.assess(
+                            previous: previous, updated: event, platform: listing.platform
+                        )
+                        if assessment.isMaterial, !existing.needsReview {
+                            kept = MaterialChange.flagForReReview(
+                                existing, assessment: assessment, at: now
+                            )
+                            try classifications.save(kept)
+                            report.reReviewed += 1
+                            report.warnings.append(
+                                "\(listing.platform.displayName): "
+                                    + "\(assessment.explanation) Sent back for review."
+                            )
+                        }
+                    }
+                    if kept.needsReview { report.run.eventsNeedingReview += 1 }
                 } else {
                     let proposal = classifier.classify(
                         event: icalEvent,
@@ -182,16 +329,42 @@ public struct ImportService: Sendable {
             }
         }
 
-        do {
-            report.run.eventsTombstoned = try events.tombstoneMissing(
-                listingID: listingID, keysStillPresent: keysSeen, at: now
+        // An empty calendar that parsed cleanly is NOT evidence that every
+        // booking vanished. It is equally consistent with a truncated
+        // response, a platform outage serving a stub, or a feed URL that now
+        // points at an empty listing — and CLAUDE.md is explicit that a
+        // failed, empty or truncated feed withdraws nothing.
+        //
+        // Getting this wrong is the dangerous direction for an IMPORT:
+        // tombstoning a reservation makes those nights look free here, which
+        // is how a double booking happens. Keeping a stale block only
+        // withholds inventory, which is visible and recoverable.
+        //
+        // So a feed that yields zero events for a listing that currently has
+        // some is refused, loudly, rather than believed.
+        let previouslyActive = (try? events.activeCount(listingID: listingID)) ?? 0
+        if keysSeen.isEmpty && previouslyActive > 0 {
+            report.warnings.append(
+                "The feed parsed but contained no events, while \(previouslyActive) "
+                    + "are currently held. Nothing was withdrawn — an empty feed is not "
+                    + "proof that bookings were cancelled. Check the listing on the platform."
             )
-        } catch {
-            report.warnings.append("Could not tombstone removed events: \(error)")
+            report.run.eventsTombstoned = 0
+        } else {
+            do {
+                report.run.eventsTombstoned = try events.tombstoneMissing(
+                    listingID: listingID, keysStillPresent: keysSeen, at: now
+                )
+            } catch {
+                report.warnings.append("Could not tombstone removed events: \(error)")
+            }
         }
 
         report.run.outcome = .success
         report.run.finishedAt = Date()
+        try? listings.setConnectionState(
+            listingID: listingID, to: .connected, detail: "", actor: "import", at: now
+        )
         if let recorded = try? syncRuns.record(report.run) { report.run = recorded }
         try? listings.recordSync(
             listingID: listingID, at: now, summary: report.run.summaryLine
@@ -208,6 +381,10 @@ public struct ImportService: Sendable {
         var reports: [ImportReport] = []
         for listing in listingsToImport {
             if autoRefreshOnly && !listing.autoRefreshEnabled { continue }
+            // Revoked feeds are skipped even on an explicit refresh-all, so a
+            // dead connection cannot flood the history with failures.
+            if !listing.connectionState.shouldAttemptImport, listing.hasURL == false,
+               listing.connectionState == .notConfigured { continue }
             reports.append(await importFeed(for: listing, now: now))
         }
         return reports

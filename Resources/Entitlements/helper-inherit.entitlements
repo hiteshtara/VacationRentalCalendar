@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Entitlements for the bundled `vrc` helper under the App Store path. NOT YET
+  USED.
+
+  A sandboxed app's child process must inherit the parent's container, and
+  `com.apple.security.inherit` is the only entitlement it may carry — the
+  sandbox refuses a child that asks for anything else alongside it. The
+  keychain access group is therefore inherited rather than requested.
+
+  Under Developer ID the helper needs no entitlements file at all beyond the
+  access group, because there is no container to inherit.
+
+  Note the standing recommendation in docs/DISTRIBUTION.md: prefer removing
+  the nested helper entirely and calling VRCCore in process. This file exists
+  for the path where it is kept.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.inherit</key>
+    <true/>
+</dict>
+</plist>

@@ -1,0 +1,3102 @@
+# Handoff
+
+State of play for whoever picks this up next — a new Claude Code session, or a
+person. Written to be followed **without** prior conversation history.
+
+Updated 2026-11-09. Read [CLAUDE.md](CLAUDE.md) first for the rules and the
+traps; this file is "where things stand and exactly what to do".
+
+---
+
+## The integration suite truncates — and is now prevented from truncating anything shared
+
+**This is enforced in code as of `096d0ba`. It is no longer a rule to remember.**
+
+`swift run vrc-test "PostgreSQL integration"` deletes rows: its setup empties
+`properties`, `reservations`, `holds`, `events`, `classifications`,
+`availability_decisions`, `platform_listings`, `sync_runs` and more before each
+case, so it can compare a known workflow against a known starting point. That is
+correct for a scratch database and destructive anywhere else.
+
+**What went wrong.** On 2026-11-09 the suite was pointed at the shared staging
+cluster to validate B6 and emptied it, destroying the synthetic demo rows, 2
+synthetic approved decisions and the Airbnb `platform_listings` row.
+`Scripts/seed-staging-demo.sql` restores only the property, one reservation and
+one hold, so the rest was gone. No real data was lost — the 7 events, 7
+classifications and 2 Vrbo decisions live in local SQLite, were never a
+target, and are re-verified in §9.
+
+**What now prevents it.**
+[`DestructiveTestIsolation`](Sources/VRCCore/Database/DestructiveTestIsolation.swift)
+fails closed: a target is refused unless it proves itself disposable, and all
+four of these must hold.
+
+| | Requirement | Refused if |
+|---|---|---|
+| 1 | `VRC_DESTRUCTIVE_TESTS=i-understand-this-truncates` | unset, or any other value — `1`, `true`, `yes` are all refused |
+| 2 | Not on the deny-list: `vrc-staging-main`, `prod`, `production`, `priyanka`, `vrc-live` | matched case-insensitively as a substring, checked **first** and overriding everything else, so `vrc-staging-main-scratch` is still refused |
+| 3 | A cluster identifier containing `scratch`, `throwaway`, `disposable`, `pitr`, `ephemeral` or `sandbox` | any other name, including one nobody has considered — allow-list, not deny-list |
+| 4 | `app_settings.disposable_database = 'true'` **in the target database** | absent, not `true`, or **unreadable** — an unknown answer is a refusal |
+
+Requirement 4 is the strongest, because it travels with the database rather than
+with the invocation: a shared cluster does not have the marker and cannot acquire
+one by accident. `app_settings` is deliberately excluded from the truncation list
+so the marker survives the operation it authorizes.
+
+The guard sits **inside** `truncateForTest`, the only function in the suite that
+deletes rows, rather than being a precondition each caller must remember. The
+local `psql` path goes through the same door — a port is no safe harbour, since a
+tunnel can put a shared cluster behind `127.0.0.1`.
+
+**Verified against the real cluster, not only in unit tests.** Pointed at
+`vrc-staging-main` with full consent *and* a marker, every case refuses, and
+staging's row counts are identical before and after (`properties=2`,
+`reservations=1`, `holds=3`, `availability_audit=41`). On a marked local sandbox
+the group still runs 10/10 — which is the half no refusal test can prove.
+
+Compare `RehearsalIsolation`, which solves the same shape of problem for
+publication rehearsals against the local SQLite database.
+
+---
+
+## 0. One-line status
+
+The Mac app is installed and working, it shows **live data from the deployed AWS
+staging backend**, and as of 2026-11-10 it holds **real imported observations**:
+**Airbnb 4 events and Vrbo 3 events**, fetched from the live feeds. Booking.com
+is the only feed still disconnected (§13). Staging validation is complete
+(A1–A5, B1–B9, Phase C). Scheduled imports and outbound publishing remain
+**off** at every layer.
+
+Two things need the owner's attention, both in §13 and §14: Booking.com needs a
+fresh export URL, and the two December Vrbo decisions now read `cancelled`
+rather than approved.
+
+---
+
+## 1. Current status and completed milestones
+
+| Area | State |
+|---|---|
+| macOS app | built, signed, installed at `/Applications/VacationRentalCalendar.app` |
+| Cloud integration | **working** — the app reads live status/availability from AWS staging via the bundled `vrc` helper |
+| Real feeds | **Airbnb and Vrbo connected and importing** (4 and 3 events). Booking.com disconnected — needs a new export URL (§13) |
+| AWS staging | **deployed** in account …1110, us-east-1; cluster + 5 Lambdas + API Gateway + 3 buckets + 4 secrets |
+| Tests | **370 tests**, passing on macOS (1229 assertions; 1248 with the PostgreSQL group live). 369/369 verified on Linux at `02f6df6` — the one newer test is pure Swift with no platform surface |
+| Cross-platform parity | byte-identical digest `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` |
+| Staging smoke tests | **ALL COMPLETE: A1–A5, B1–B9, and Phase C C1–C5.** See §5 and §12 |
+| Outbound publishing | **off** — code gate, function env and database setting all verified `false` 2026-11-09; Terraform precondition not re-checked (§4) |
+| Scheduled imports | **disabled** (both EventBridge schedules DISABLED) |
+
+Completed milestones, newest first:
+1. **Phase C complete, and B7/B8 complete — the staging validation programme is
+   finished.** Phase C re-run against a second temporary cluster
+   (`vrc-staging-pitr2`) with the corrected `aws rds enable-http-endpoint` call:
+   **27 checks, 0 failures**, covering recovery consistency against the source,
+   migrations 10/11, the generated columns, triggers, both exclusion
+   constraints, the allow-list function on all six `BlockKind`s, a guard that
+   actually refuses, and the source cluster untouched. B7 and B8 then ran
+   against that disposable cluster through the deployed artifact under the
+   Lambda Runtime Interface Emulator: **14 checks, 0 failures**. Temporary
+   resources deleted and cleanup verified by inventory. §12 has the detail,
+   including a credential asymmetry worth following up.
+2. **Linux verification, and three faults it exposed in `build-lambda.sh`**
+   (commit `02f6df6`). All **369 tests now pass on Linux**, parity digest
+   identical to macOS. Getting there required fixing the script: it never
+   copied `Migrations/` into the container, so a test that reads those files
+   failed for want of a file — the "1 of 350 failed, not reproducible, likely a
+   timing flake" note in earlier handoffs was this, and it was fully
+   deterministic. It also printed `ok` for a failing suite, and its gates ran
+   inside a piped subshell with no `set -e`, so **a DIVERGED parity digest
+   would have printed a failure and shipped anyway** — contradicting CLAUDE.md's
+   claim that this script refuses to deploy on divergence. All three fixed; the
+   shell semantics were reproduced directly rather than assumed.
+3. **B9 complete — outbound publication is off at all four layers, each
+   verified.** Layer 3, the Terraform `precondition`, was the one still
+   outstanding; all six unsafe configurations are now shown to be rejected
+   plan-only with a non-zero exit (§5).
+4. **Destructive-test isolation, enforced in code** (commit `096d0ba`). The fix
+   for the 2026-11-09 truncation: `DestructiveTestIsolation` refuses any target
+   that does not prove itself disposable, on four independent grounds, failing
+   closed on each. It lives inside the only function that deletes rows, so there
+   is no path to the DELETEs that skips it. 17 tests, 57 assertions, including
+   the one that matters — pointed at the real `vrc-staging-main` with full
+   consent, the suite refuses and staging's row counts do not move. Full detail
+   at the top of this file.
+5. **Staging test litter removed** (no commit — a database operation). The two
+   leftover `channel='race'` holds and their property were deleted by explicit
+   primary key after confirming every dependent row count was zero. Staging now
+   reports exactly the two documented demo intervals. See §4.
+6. **Smoke test B6 — concurrency over the Data API** (commit `7e9a99a`). Two
+   `RentalStore`s on independent transports race to claim the same nights on one
+   property; the `no_overlapping_live_holds` exclusion constraint is the only
+   arbiter. Exactly one is accepted, the loser's refusal must name that
+   constraint, and exactly one live row survives. A paired non-overlapping case
+   (checkout-day adjacency, 06-01→05 then 06-05→09) is the control — without it
+   a constraint that refused *every* hold would also report "one winner".
+   Verified by falsification: dropping the constraint on a local cluster fails
+   all four assertions, including `expected 1, got 2` live holds — a real double
+   booking. Passed against local PostgreSQL 17.10 **and** live Aurora over the
+   RDS Data API (10/10, 29 assertions in the group). Parity digest unchanged.
+7. **Daterange Data API fix** (found by B5 against real Aurora) — `SELECT *` on
+   tables with generated `daterange` columns 400s over the RDS Data API;
+   replaced with explicit column lists. Lambdas redeployed.
+8. **GUI keychain fix via helper delegation** — the SwiftUI app could not read
+   the AWS credential (macOS pins each keychain item to the creating binary's
+   code hash; the GUI and `vrc` are different code objects). The GUI now calls
+   the bundled `vrc cloud check --json` helper, which returns only sanitized
+   JSON. See [docs/KEYCHAIN.md](docs/KEYCHAIN.md).
+9. **Cloud integration in the Mac app** — Cloud pane, AWS status-bar indicator,
+   Refresh from AWS, build-provenance tab.
+10. **Staging deployed and validated** (A1–A5, B1–B5).
+11. **Minimal AWS backend** — DataStore over the RDS Data API, 5 Lambda handlers,
+   restricted DB role, Postgres schema generated from the SQLite migrator.
+
+---
+
+## 2. Architecture (one paragraph per piece)
+
+- **SwiftUI Mac app** (`Sources/VacationRentalCalendar`) — the only UI. Reads a
+  local SQLite database for the unified calendar, review queue, availability
+  decisions, and feeds. For cloud status it shells out to the bundled `vrc`
+  helper; it never talks to AWS directly.
+- **VRCCore** (`Sources/VRCCore`) — all business logic, no UI. Shared verbatim
+  by the app, the CLI, and the Lambdas. The cancellation-block protection, the
+  export allow-list, the classifier, and both database backends live here.
+- **`vrc` CLI / helper** (`Sources/vrc`) — headless control surface and the
+  app's authorized cloud helper. Reads credentials from the Keychain, signs
+  SigV4 requests, returns sanitized JSON.
+- **AWS Lambda** (`Sources/VRCLambda` + `Sources/vrc-lambda-*`) — five handlers
+  (fetch, process, publish, api, sweeper), `provided.al2023`, arm64, Swift
+  runtime bundled. They run the same VRCCore.
+- **API Gateway** — HTTP API with `AWS_IAM` authorization; requests are
+  SigV4-signed. No Cognito.
+- **Aurora PostgreSQL** — Serverless v2, 16.15, min 0 ACU, 300s auto-pause,
+  reached over the **RDS Data API** (SQL over HTTPS) so the Lambdas stay out of
+  a VPC and need no NAT gateway.
+- **Secrets Manager** — DB master and runtime credentials, source feed URLs,
+  outbound feed tokens. Nothing secret is in SQLite, Git, logs, or Terraform
+  state.
+
+---
+
+## 3. Git, PR, and installed version
+
+| | Value |
+|---|---|
+| Branch | `backend/aws-backend` |
+| HEAD | `096d0ba` (Make it impossible to truncate a database that is not disposable) |
+| PR | **#10 OPEN** (not draft): "Backend implementation: DataStore, five handlers, restricted role" — **do not merge without review** |
+| Installed Mac app | commit `217f668`, build 1, clean tree, built 2026-11-09 17:05Z |
+
+**Why the installed app is five commits behind HEAD**, and why that is fine:
+
+| Commit | Touches | Affects the Mac app? |
+|---|---|---|
+| `096d0ba` destructive-test isolation | a new `VRCCore` type used only by the test suite, plus tests | no — nothing in the app or the Lambdas calls it |
+| `76425c9` handoff rewrite | `HANDOFF.md` only | no |
+| `7e9a99a` B6 concurrency tests | `Sources/VRCTestSuite` only | no |
+| `f672cf9` handoff rewrite | `HANDOFF.md` only | no |
+| `08c3bc1` daterange Data API fix | the Lambda/Data-API path and tests | no — the app uses local SQLite, where `SELECT *` is fine |
+
+The **deployed Lambdas** already carry the `08c3bc1` fix (redeployed). No shipped
+app behaviour has changed since `217f668`. Rebuilding would change the helper's
+code hash and orphan its Keychain credential (see §8), so the installed build was
+deliberately left where it is. To bring it to HEAD later, rebuild and then run the
+migration in §8.
+
+The installed build's provenance is readable in the app: **Settings → This
+build**, or from the bundle:
+```bash
+/usr/libexec/PlistBuddy -c "Print :VRCGitCommit" /Applications/VacationRentalCalendar.app/Contents/Info.plist
+```
+
+---
+
+## 4. AWS staging resources (account …1110, us-east-1)
+
+| Resource | Identifier |
+|---|---|
+| Aurora cluster | `vrc-staging-main` (Aurora PostgreSQL 16.15, Serverless v2, min 0 ACU, 300s auto-pause) |
+| API endpoint | `https://a7fubx2osf.execute-api.us-east-1.amazonaws.com` |
+| Lambdas | `vrc-staging-{fetch,process,publish,api,sweeper}` |
+| Buckets | `vrc-staging-{feeds,raw,snapshots}-f79de5f0` |
+| Secrets | `vrc-staging/{database/master, database/runtime, sources/feed-urls, outbound/feed-tokens}` |
+| IAM client user | `vrc-staging-mac-client` (one active access key; id not recorded here) |
+| EventBridge schedules | `vrc-staging-hold-sweeper` **DISABLED**, `vrc-staging-import` **DISABLED** |
+
+**Safety invariants — all re-verified against the live account 2026-11-09:**
+
+| Invariant | Verified how | State |
+|---|---|---|
+| Both EventBridge schedules disabled | `aws scheduler get-schedule` | `DISABLED`, `DISABLED` |
+| Outbound off, layer 1 (code) | `OutboundSyncGate.isEnabled` in `Sources/VRCCore/Logic/ExportPolicy.swift:133` | `false` |
+| Outbound off, layer 2 (function env) | `aws lambda get-function-configuration` on api and publish | `false`, `false` |
+| Outbound off, layer 3 (Terraform precondition) | **not re-verified this round** | assumed unchanged |
+| Outbound off, layer 4 (database) | `SELECT value FROM app_settings WHERE key='outbound_sync_enabled'` | `false` |
+| Nothing published | `feed_publications` = 0, `published_feed_entries` = 0 | nothing published anywhere |
+| Production untouched | no call made to them | PriyankaHomes tables, both hosted zones, production DynamoDB untouched |
+
+`app_settings.feed_publication_scope` is `approved_manual_blocks_only`.
+
+### Staging database contents, verified 2026-11-09 after clean-up
+
+| Table | Rows | Note |
+|---|---|---|
+| `properties` | 1 | `Staging Demo — 39 G Street`, id 112 |
+| `reservations` | 1 | id 67, `direct`, `demo-res-1`, confirmed, 2027-07-01→07-08 |
+| `holds` | 1 | id 71, `direct`, `demo-hold-1`, 2027-09-01→09-04, expires 2099 |
+| `availability_audit` | 41 | append-only and untouched; the runtime role cannot delete from it, by design |
+| `events`, `classifications`, `availability_decisions`, `platform_listings`, `sync_runs`, `feed_publications`, `published_feed_entries`, `idempotency_keys` | 0 | emptied by the B6 run; the seed script restores none of these |
+
+`vrc cloud check` reports exactly these two intervals, `health: healthy`.
+
+**The test litter is gone.** The two `channel='race'` holds (ids 69 and 70) and
+their property (`No race — 39 G Street`, id 111) were deleted by **explicit
+primary key**, not by predicate, after confirming each row individually: both
+holds had `reservation_id IS NULL`, and property 111 had 0 reservations, 0
+decisions, 0 conflicts and 0 listings, so nothing depended on either. The demo
+rows and all 41 audit rows were verified present afterwards.
+
+Staging's 2 synthetic approved decisions and its Airbnb `platform_listings` row
+were destroyed by the B6 run and are **not** restored by the seed script. Nothing
+depends on them; re-create them only if a future test needs them. This is why
+`approvedDecisions` reads 0 where earlier notes said 2.
+
+### Connection verification (read-only)
+
+```bash
+# The exact call the GUI makes; sanitized JSON, no secrets.
+/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc cloud check --json
+# Expected: ok:true, and the two demo intervals
+#   (2027-07-01→07-08 reservation, 2027-09-01→09-04 hold).
+# Verified 2026-11-09 after clean-up: exactly these two, health healthy.
+# approvedDecisions reads 0, not 2 — see the note below.
+```
+
+The cluster auto-pauses after 5 minutes idle; the first call after a pause can
+take 15–30s while Aurora resumes, and may briefly report "Could not reach." Retry.
+
+The demo intervals are **synthetic staging data** (one confirmed reservation,
+one active hold) created by `Scripts/seed-staging-demo.sql`. They were destroyed
+by the B6 run on 2026-11-09 and **restored** the same day by re-applying that
+script via the master secret — 5 statements, 3 inserts, both of its DELETEs
+matching 0 rows on the cleared cluster:
+```bash
+# apply Scripts/seed-staging-demo.sql via the master secret (see §9 helper)
+```
+The script is idempotent on the property name and scoped to `channel = 'direct'`,
+so it is safe to re-run and cannot touch anything else.
+
+---
+
+## 5. Test results and parity
+
+```bash
+swift run vrc-test                      # 369 tests / 1223 assertions — all pass (macOS)
+swift run vrc-parity --digest           # b3398471…c604f5
+./Scripts/build-lambda.sh               # also runs the suite inside Linux; parity must match
+```
+- macOS: **all 369 pass**. Two assertion counts are both correct: **1223** for a
+  plain `swift run vrc-test`, where the PostgreSQL group skips, and **1242** with
+  that group live (see the gate below).
+- Linux: **all 369 pass**, 1223 assertions, in `swift:6.3.3-amazonlinux2023` —
+  verified at commit `02f6df6`. The container has no PostgreSQL, so the group
+  skips and the count matches the macOS no-Postgres figure exactly.
+- Parity digest **identical on macOS and Linux**, confirmed in the same run.
+- Parity digest **unchanged**: `b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5`.
+  B6 is test-only, so parity could not move; it was re-checked anyway.
+
+### Staging smoke tests (docs/STAGING-DEPLOYMENT.md §6)
+
+| Test | Status |
+|---|---|
+| A1–A5 (bring-up, migrate, deploy) | ✅ done |
+| B1 unsigned event → 401, Aurora stays paused | ✅ |
+| B2 unsigned HTTPS → 403 at the gateway | ✅ |
+| B3 SigV4-signed from the Mac → 200 | ✅ |
+| B4 sweeper by hand → holdsReleased:0, no reservation touched | ✅ (prior run) |
+| **B5 Data API transactions: Swift suite vs cluster** | ✅ **8/8 against live Aurora** |
+| **B6 concurrency: overlapping holds, one winner** | ✅ **passed on local PostgreSQL 17.10 and live Aurora** (group now 10/10, 29 assertions) |
+| **B7 `POST /decisions` twice, one idempotency key** | ✅ **passed** against the deployed artifact on a disposable cluster |
+| **B8 kill mid-write → client reports UNKNOWN** | ✅ **passed**, including reconciliation without duplication |
+| **B9 publication still impossible** | ✅ **all four layers verified** — see the §4 table |
+| Phase C PITR into a temporary cluster, then delete | 🟨 **C1 and C4 pass, C2/C3 blocked, C5 done** — see §12 |
+
+### B9 layer 3, verified plan-only 2026-11-09
+
+`terraform plan` with each unsafe value, against the saved staging configuration.
+Nothing was applied.
+
+| Variable forced | Exit | Rejected by |
+|---|---|---|
+| `outbound_enabled=true` | **1** | `precondition` — "REFUSED: outbound_enabled must be false in staging" |
+| `create_dns=true` | **1** | `precondition` |
+| `create_cdn=true` | **1** | `precondition` |
+| `allow_priyankahomes_read=true` | **1** | `precondition` |
+| `region=eu-west-1` | **1** | `precondition` |
+| `seconds_until_auto_pause=60` | **1** | **variable validation**, not the precondition — a different layer, equally non-zero |
+| *control:* the real `staging.tfvars` | **0** | nothing — "No changes" |
+
+A plan file **is** written on the error path, which looks alarming and is not:
+`terraform show -json` reports `errored: true, applyable: false, complete: false`
+on it, versus `errored: false, complete: true` for the control. Terraform writes
+an errored plan for inspection and `apply` refuses it.
+
+### How B7 and B8 were finally run
+
+Both needed the **deployed API** against a **disposable** database. Three routes
+existed; two are permanently closed and the third is what was used.
+
+1. **Point the existing staging API at the disposable cluster** — forbidden, and
+   it would not work anyway: `vrc-staging-lambda-api`'s policy scopes
+   `rds-data:*` to `vrc-staging-main` alone, as does every other `vrc-*` role.
+2. **Deploy a temporary API Lambda** — a Lambda needs an execution role, and
+   creating an IAM role was refused by the session's permission policy.
+3. **Run the deployed artifact locally** ✅ — the arm64 `bootstrap` from
+   `.build/lambda/api.zip`, the same package built and parity-checked this
+   round, under the AWS Lambda Runtime Interface Emulator that the official
+   `provided:al2023` image ships at `/usr/local/bin/aws-lambda-rie`. Same
+   binary, same `ApiHandler`, same `DecisionRoutes`, same idempotency
+   transaction, same Data API transport — hosted locally instead of in AWS.
+
+**What route 3 does not cover, stated plainly:** API Gateway's `AWS_IAM`
+authorization layer (B2 and B3 cover that against the real gateway) and AWS's
+own Lambda hosting. The IAM principal is supplied in the synthetic event, as the
+gateway would supply it. So B7/B8 prove the handler's behaviour, not the
+gateway's.
+
+Two practical notes for re-running:
+- `idempotency_keys` cannot be deleted by the runtime role, so each run needs a
+  fresh `publicationUID` **and fresh nights**. `DecisionRoutes` correctly refuses
+  a block overlapping an existing approved decision for the same destination, so
+  reusing fixed dates makes the second run `409` against its own predecessor —
+  that is the route working, not failing. The harness derives its night windows
+  from the clock for this reason.
+- A successful first submission answers **201 Created**, not 200.
+
+**B7 and B8 were not begun.** Both need writes to the deployed staging API —
+B7 posts a decision twice, B8 interrupts a real write mid-flight — and the
+session that completed B6 was not permitted to make them. Note for whoever picks
+B7 up: `idempotency_keys` is deliberately not DELETE-able by the runtime role, so
+every run leaves its key behind permanently. Use a **fresh `publicationUID` per
+run** (the key is derived from the decision) or the second run will collide with
+the first run's key and prove nothing.
+
+Much of what B7 and B8 assert is already covered at unit level against fakes —
+see `DecisionRouteTests` ("the same key twice records one decision") and
+`CloudSyncClientTests` ("a dropped connection on a write is uncertain", "a
+persistently uncertain write reports NOT applied"). What B7/B8 add is the same
+properties **against the deployed system**. `vrc-verify-sigv4 --mac-api <url>`
+already exercises part of B8's shape end to end.
+
+**To run B5/B6 against a cluster** (credentials read from the AWS CLI config into
+the process env, never printed). This truncates the target, so the guard will
+refuse unless the cluster is disposable, named disposable, consented to, and
+marked — `vrc-staging-main` is refused outright and cannot be argued with. The
+ARN below is therefore a placeholder for a throwaway cluster, not staging:
+```bash
+VRC_CLUSTER_ARN="arn:aws:rds:us-east-1:589744711110:cluster:vrc-staging-main" \
+VRC_DB_SECRET_ARN="$(aws secretsmanager describe-secret --secret-id vrc-staging/database/runtime --query ARN --output text)" \
+VRC_DB_NAME=vrc VRC_ACTOR=owner AWS_REGION=us-east-1 \
+AWS_ACCESS_KEY_ID="$(aws configure get aws_access_key_id)" \
+AWS_SECRET_ACCESS_KEY="$(aws configure get aws_secret_access_key)" \
+swift run vrc-test "PostgreSQL integration"
+```
+The suite clears far more than it restores: `reservations`, `holds`,
+`properties`, `events`, `classifications`, `availability_decisions`,
+`platform_listings` and `sync_runs` all go, while
+`Scripts/seed-staging-demo.sql` puts back only the property, one reservation and
+one hold. On a disposable cluster that does not matter, which is the point — and
+the guard now makes a disposable cluster the only thing it can be.
+
+---
+
+## 6. Known bugs fixed, and outstanding limitations
+
+**Fixed this round (all committed):**
+- **GUI could not read the AWS credential.** Root cause: macOS login-keychain
+  items are readable only by the exact code object that created them; the GUI
+  and `vrc` are different binaries. Fixed by helper delegation. docs/KEYCHAIN.md.
+- **`SELECT *` 400s over the RDS Data API** when a table has a generated
+  `daterange` column ("unsupported data type DATERANGE"). The local psql
+  stand-in hid it. Fixed with explicit column lists in `EventRepository` and
+  `AvailabilityRepository`. This was a live bug — the API Lambda's `status()`
+  broke once `events` had rows.
+- **Boolean decoding over the Data API** comes back as 1/0, not `t`/`f` — the
+  integration test now accepts both.
+- **`availability_audit` accumulates** on a shared cluster (append-only to the
+  runtime role); the audit comparison is now scoped to the current run.
+
+**Outstanding limitations / not done:**
+- **B7, B8 and Phase C not started; B9 is 3 of 4 layers.** B6 is done (§5).
+- ~~The integration suite truncates whatever database it is pointed at, and has
+  no isolation guard.~~ **Fixed in `096d0ba`** — see the top of this file.
+- ~~Two litter holds remain in staging.~~ **Removed**, verified row by row (§4).
+- The guard's deny-list is a substring list in Swift
+  (`DestructiveTestIsolation.protectedFragments`). If a future cluster is named
+  something protected-but-unlisted, add it there. The allow-list requirement
+  means an unlisted name is refused by default, so the failure mode of
+  forgetting is a refusal, not a deletion.
+- No real feeds import yet (the feed-diff experiment and the schedule decision
+  are pending — see §10).
+- The `vrc_runtime` role cannot `DELETE` from `events`/`availability_audit` (by
+  design). The integration suite's own cleanup therefore can't clear those;
+  clean with the **master** secret when a true blank slate is needed.
+- A rebuilt `vrc` helper loses Keychain access and needs the §8 migration once.
+- The "1 of 350 failed" line seen during one `build-lambda` run was **not
+  reproducible** — a clean container run passes all 350. Likely a timing flake;
+  worth a second look if it recurs.
+
+---
+
+## 7. Build, test, install, verify — exact commands
+
+```bash
+# Tests
+swift run vrc-test                         # all
+swift run vrc-test "Cloud"                 # one group
+swift run vrc-parity --digest              # parity digest
+
+# Build + sign + install the Mac app (preserves local DB and Keychain)
+./Scripts/build-app.sh --install
+# After an install that rebuilt the vrc helper, re-own its credential (see §8).
+
+# Verify the installed build
+/usr/libexec/PlistBuddy -c "Print :VRCGitCommit" /Applications/VacationRentalCalendar.app/Contents/Info.plist
+/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc status        # local data
+/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc cloud check   # live AWS
+/Applications/VacationRentalCalendar.app/Contents/MacOS/VacationRentalCalendar --self-check-cloud  # GUI path, headless
+
+# Rebuild + redeploy the Lambdas (Docker required; parity gated)
+./Scripts/build-lambda.sh --deploy
+
+# Local PostgreSQL integration tests — the SAFE way to run the suite.
+# Disposable cluster, no AWS, nothing shared. Prefer this always.
+#
+# Two details the old recipe got wrong, both found on 2026-11-09:
+#   * the role MUST be vrctest — PsqlTransport hardcodes `-U vrctest`
+#   * a long data-dir path overflows the 103-byte UNIX socket limit, so
+#     disable the socket and let the tests connect over TCP
+PGDIR=/tmp/pg                      # any short path
+export PATH="/opt/homebrew/opt/postgresql@17/bin:$PATH"
+initdb -D "$PGDIR" -U vrctest
+pg_ctl -D "$PGDIR" -o "-p 54407 -c unix_socket_directories=" -l "$PGDIR/pg.log" start
+createdb -h 127.0.0.1 -p 54407 -U vrctest vrc
+psql -h 127.0.0.1 -p 54407 -U vrctest -d vrc -f Migrations/postgres/010_repository_schema.sql
+psql -h 127.0.0.1 -p 54407 -U vrctest -d vrc -f Migrations/postgres/011_safety.sql
+
+# Mark it disposable, or the guard refuses — this is the sandbox saying
+# "my rows may be deleted", and it is required on every target.
+psql -h 127.0.0.1 -p 54407 -U vrctest -d vrc \
+  -c "INSERT INTO app_settings (key, value) VALUES ('disposable_database','true') \
+      ON CONFLICT (key) DO UPDATE SET value='true';"
+
+VRC_DESTRUCTIVE_TESTS=i-understand-this-truncates \
+VRC_PG_PORT=54407 swift run vrc-test "PostgreSQL integration"
+pg_ctl -D "$PGDIR" stop            # and throw the cluster away
+```
+
+Forget either the variable or the marker and the group **fails loudly** rather
+than skipping — the refusal names exactly what is missing and what to do. That
+is deliberate: a silent skip would let someone believe these tests had run.
+
+---
+
+## 8. Keychain credential recovery and migration
+
+**The rule:** a macOS login-keychain item is readable only by the binary code
+hash that created it. Rebuilding the `vrc` helper changes that hash, so the
+helper loses access to the AWS credential it stored, and the Cloud pane shows
+"cannot read its AWS credential." This is macOS behaviour, not a bug.
+
+**Recovery — preserves the IAM key, no rotation:**
+```bash
+./Scripts/migrate-cloud-credential.sh
+```
+It reads the existing secret with your approval (a macOS "Always Allow" prompt —
+there may be two), hands it to the new helper in memory (never to disk or a
+log), and calls no AWS API. `build-app.sh --install` runs it automatically after
+an install that needs it (skip with `VRC_SKIP_KEYCHAIN_MIGRATION=1`).
+
+**Important for a non-interactive/automation session:** `security find-generic-password -w`
+blocks on a GUI prompt that an automated shell can't click — run the migration
+in a real Terminal, or let the owner click. Don't loop it; each call re-prompts.
+
+**Feed URLs** (Airbnb/Vrbo/Booking.com) follow the same rule. If they read as
+unreadable after a rebuild, re-enter with `vrc set-url --listing <id>` (the URL
+is read with echo off and never printed). Current references (names only):
+`airbnb-1759472334611502986-v3`, `vrbo-5550554-v3`, `booking-17482435`.
+
+---
+
+## 9. Preserved application data (re-verified 2026-11-09, after the B6 round)
+
+**This is the local SQLite data, and it is intact.** It is a different database
+from the staging cluster, was never a target of the integration suite, and the
+truncation described at the top of this file did not touch it. Re-read through
+`sqlite3 .backup` after all of this round's work:
+
+| Item | Value |
+|---|---|
+| Events | **7** |
+| Classifications | **7** |
+| Vrbo decisions | **2 rows, both `cancelled` as of 2026-11-10** — see §14. Previously approved-and-unpublished |
+| — Decision 1 | Vrbo block **2026-12-10 → 2026-12-17**, UID `vrc-812d19781e654081a164c12d307b07b4` |
+| — Decision 2 | Vrbo block **2026-12-19 → 2026-12-20**, UID `vrc-a5a1dbf505da412e87a71d6a78481547` |
+| December 17–18 | **no Vrbo block decision** — those nights stay sellable (verified: 0 blocks cover them) |
+| Published decisions | **0** — nothing published anywhere |
+| Credential references | preserved in Keychain (names in §8) |
+| AWS IAM credentials | preserved; **not rotated** |
+
+All four counts, both publication UIDs and the December 17–18 exclusion were
+confirmed again at commit `7e9a99a` — `0` decisions cover either night.
+
+- **Local SQLite:** `~/Library/Application Support/VacationRentalCalendar/VacationRentalCalendar.sqlite`
+- **Backup taken this session:** a `.backup` copy is in the session scratchpad
+  (`handoff-db-backup-*.sqlite`). For a durable backup, re-run:
+  ```bash
+  sqlite3 "$HOME/Library/Application Support/VacationRentalCalendar/VacationRentalCalendar.sqlite" ".backup '<dest>.sqlite'"
+  ```
+  Always use `.backup`/`VACUUM INTO`, never a plain file copy (misses the WAL).
+
+Helper to run SQL on the staging cluster (master role; never against production):
+```bash
+ARN="arn:aws:rds:us-east-1:589744711110:cluster:vrc-staging-main"
+MASTER="$(aws secretsmanager describe-secret --secret-id vrc-staging/database/master --query ARN --output text)"
+aws rds-data execute-statement --resource-arn "$ARN" --secret-arn "$MASTER" --database vrc --sql "SELECT 1"
+```
+
+---
+
+## 10. AWS operating costs
+
+Staging, idle-dominant (from the validated plan in docs/STAGING-DEPLOYMENT.md §5.2):
+- **≈ $2.12 / month** running, **≈ $1.88 / month** idle.
+- Aurora Serverless v2 at min 0 ACU with 300s auto-pause is the main driver; it
+  bills near zero while paused. The Data API avoids a NAT gateway (~$32/mo
+  saved). Buckets, Lambda, and API Gateway are within or near free tier at this
+  volume.
+- The hosted outbound feed, when/if enabled, is a separate ~$10/year (a domain)
+  — see docs/HOSTING-PROPOSAL.md. Not deployed.
+
+Teardown (reversible, staging only): `./Scripts/staging-teardown.sh --destroy`.
+
+---
+
+## 11. Remaining work before production readiness
+
+Ordered. **Each of these is a new task.** Staging validation is complete; the
+next milestone is real read-only Airbnb and Vrbo imports (item 2).
+
+1. **Finish staging validation.** Done: ~~B6~~, ~~isolation guard~~, ~~staging
+   litter~~, ~~B9 (all four layers)~~, ~~Linux suite~~, ~~Phase C C1/C4/C5~~.
+
+   **Nothing is left. A1–A5, B1–B9 and Phase C C1–C5 all pass** (§5, §12). The
+   validation programme that this project has been working through since the
+   backend was built is finished.
+
+   The only follow-up it produced is a question rather than a task: the
+   Linux + static-credentials asymmetry in §12, which has a workaround, does not
+   affect production, and has no explanation yet.
+2. **Prepare real imports (read-only) — BLOCKED ON THE OWNER, see §13.** The
+   feed URLs were checked on 2026-11-10 and **none of the three feeds can be
+   fetched**: Airbnb and Vrbo need their URLs re-entered (the cdhash trap, which
+   macOS will not prompt about), and Booking.com needs a brand-new export URL
+   because the platform invalidated the old token. Two `vrc set-url` commands in
+   a real Terminal unblock Airbnb and Vrbo. Only then: run the live feed-diff to
+   measure the change-detection hit rate (decides the ~$5.76 vs ~$19.95/mo
+   import cadence) and store the source URLs in `vrc-staging/sources/feed-urls`,
+   which currently holds no value at all.
+3. **Reconcile** imported observations with the 7 local events and 7
+   classifications, preserving the distinction between confirmed booking,
+   cancellation penalty, owner block, and unknown — **never** auto-classifying
+   an ambiguous event as a confirmed booking.
+4. **Enable schedules (Phase D), owner-approved:** hold sweeper first, observe;
+   then the import schedule, observe 48h. Nothing published.
+5. **Only later, and only as a reviewed code change:** outbound publication
+   (`OutboundSyncGate.isEnabled`) — never a UI toggle.
+6. Bring the installed Mac app to HEAD (rebuild + §8 migration) when convenient.
+
+**Do not** enable any schedule, enable outbound, publish any decision, change
+GitHub visibility (it is intentionally public — secrets stay private), or touch
+PriyankaHomes / production DynamoDB / Google Calendar / DNS, without explicit
+owner approval.
+
+---
+
+## 12. Phase C and B7/B8 — complete, 2026-11-10
+
+Run under explicit owner authorization for a temporary, isolated recovery
+cluster. **All temporary resources were deleted and the cleanup verified by
+inventory; nothing from the drill remains.**
+
+### Phase C: 27 checks, 0 failures
+
+| # | Test | Result |
+|---|---|---|
+| C1 | restore → a second, independent cluster | ✅ `vrc-staging-pitr2`, own endpoint, own writer, no shared instance |
+| C2 | migrations `10, 11` on the restored cluster | ✅ `schema_migrations` reports both |
+| C3 | the safety machinery present **and refusing** | ✅ 19 base tables, 6 generated columns, 2 triggers, `no_double_booking` + `no_overlapping_live_holds`, the allow-list function correct on all six `BlockKind`s, and an overlapping hold genuinely refused leaving no row behind |
+| C4 | the source cluster untouched | ✅ identical counts and settings before and after |
+| C5 | delete the temporary cluster | ✅ writer and cluster both deleted, verified by inventory |
+
+**Recovery consistency** was checked table by table against the live source —
+`properties`, `reservations`, `holds`, `availability_audit`, `events`,
+`classifications`, `availability_decisions` all matched — and both synthetic
+intervals survived byte-for-byte: `demo-res-1` confirmed `[2027-07-01,2027-07-08)`
+and `demo-hold-1` `[2027-09-01,2027-09-04)`.
+
+**The fix that made C2/C3 possible** was the one-line correction from the
+previous round: `aws rds enable-http-endpoint --resource-arn <cluster ARN>`,
+which returned `HttpEndpointEnabled: true` immediately and made the restored
+cluster queryable. `modify-db-cluster --enable-http-endpoint` is Serverless **v1**
+only and silently does nothing on a v2 or provisioned cluster. Confirmed in
+practice this round, not just from documentation.
+
+### B7 and B8: 14 checks, 0 failures
+
+Against the disposable cluster, through the deployed artifact under the Runtime
+Interface Emulator (see §5 for what that does and does not cover).
+
+**B7 — the same decision twice under one idempotency key.** First submission
+`201 Created`, echoing the submitted `publicationUID`, with `published=false`.
+Second submission `alreadyApplied=true` with the same UID. The database holds
+**exactly one** decision and **exactly one** idempotency key.
+
+**B8 — an interrupted write.** The function was killed 0.4s into the write; the
+caller got no answer at all (`curl rc=52`, empty body) — a genuinely uncertain
+outcome, which is the state that must never become a duplicate. No decision
+existed at that moment. Reconciliation then retried under the same key the way
+`CloudSyncClient` does, and this is the part worth reading: it received `503`
+four times — the service correctly reporting *uncertain* rather than claiming
+"not applied", which would have invited a resubmit — and then `201`. The final
+state is **exactly one** decision, with nothing else covering those nights, and
+`GET /decisions/{uid}` answers `200` with an explicit `found=true`.
+
+### An asymmetry worth following up
+
+The deployed artifact **could not authenticate to the Data API from inside the
+Linux container using static long-term credentials.** Every call returned
+HTTP 403, *"The security token included in the request is invalid"* — AWS saying
+it does not recognise the access key. The same keys work from macOS through the
+same `URLSessionDataAPITransport` (that is how B5/B6 ran), and the values were
+confirmed to arrive in the container intact (`AKIA…`, 20 and 40 characters,
+correct region and ARNs), with no clock skew and no injected `AWS_SESSION_TOKEN`.
+Supplying **temporary credentials with a session token** — `aws sts
+get-session-token` — made it work immediately.
+
+So the untested combination was **Linux + static keys + no session token**.
+Deployed Lambda always has a session token, so production is unaffected and
+nothing here is evidence of a production fault. But this is a symptom with a
+workaround, **not a diagnosis**: the mechanism is unexplained, and the signer's
+behaviour when `sessionToken` is nil on corelibs deserves a look. It is the same
+class of macOS/Linux divergence CLAUDE.md already records twice.
+
+### Resources created, cost, and cleanup
+
+| Resource | Identifier | State |
+|---|---|---|
+| Cluster | `vrc-staging-pitr2` | **deleted** |
+| Instance | `vrc-staging-pitr2-writer`, `db.serverless` | **deleted** |
+| IAM / networking / DNS | none created — the existing `vrc-staging-db` subnet group and `sg-060063071c2073cdd` were reused | n/a |
+| Local Docker containers | `vrc-pitr-api-local`, `probe-api` | removed |
+
+Cost at rates read from the **AWS Pricing API**: Serverless v2 **$0.12 per
+ACU-hour**, storage **$0.10 per GB-month**, I/O **$0.20 per million**. The
+cluster lived roughly 35 minutes with one low-ACU writer and 1 GB of storage, so
+the incremental charge is **well under the $0.50 budget — on the order of
+$0.05–$0.15**. Computed from verified rates and measured lifetimes; Cost
+Explorer lags about a day and had published nothing for the period.
+
+---
+
+## 13. Real feeds — Airbnb and Vrbo are LIVE. Only Booking.com is outstanding.
+
+**Updated 2026-11-10 01:3x.** An earlier revision of this section said all three
+feeds were blocked. That is no longer true: the owner re-entered the Airbnb and
+Vrbo URLs through the app's Feeds pane, and both now import real observations.
+The Booking.com half of the section still stands.
+
+The real-import milestone cannot start until the owner acts. Nothing here is a
+code problem, and nothing is fixable from an automated session.
+
+### Where each feed stands
+
+| Listing | State | Real observations |
+|---|---|---|
+| **Airbnb** — 39 G Street | ✅ `Connected` | **4 events, 4 in feed** |
+| **Vrbo** — 39 G Street (5550554) | ✅ `Connected` | **3 events, 3 in feed** |
+| **Booking.com** — Southie Beach House (17482435) | 🟥 `Disconnected by the platform` | 0 — needs a **brand-new export URL** |
+
+So the 7 active local events **are real imported observations**, not fixtures:
+4 from Airbnb and 3 from Vrbo, with feed counts matching exactly.
+
+### The one thing to know about entering feed URLs
+
+**Enter them in the app, under Feeds — not through the `vrc` CLI.** After the
+re-entry, `vrc keychain` *still* reports all three feed items unreadable
+(`OSStatus -25293`), while Airbnb and Vrbo import perfectly. That is not a
+contradiction: the GUI created the new items, and the GUI is a **different code
+object** from the `vrc` helper, so each can only read what it created. The
+Keychain references bumped `airbnb-…-v3` → `-v4` and `vrbo-…-v3` → `-v4`, which
+is `set-url` writing a fresh entry and leaving the old one untouched, exactly as
+designed.
+
+This is the same split documented in [docs/KEYCHAIN.md](docs/KEYCHAIN.md) for
+the AWS credential, just in the other direction: there, the GUI had to delegate
+to `vrc`; here, `vrc` cannot see what the GUI owns.
+
+### The cdhash trap, for reference — this is what Airbnb and Vrbo were in
+
+`vrc keychain` on the installed build (`217f668`) reported:
+
+```
+FAIL Airbnb — 39 G Street [airbnb-1759472334611502986-v3] — refused (OSStatus -25293)
+FAIL Booking.com — … [booking-17482435]                   — refused (OSStatus -25293)
+FAIL Vrbo — 39 G Street (5550554) [vrbo-5550554-v3]       — refused (OSStatus -25293)
+ok   AWS access key id   — readable
+ok   AWS secret access key — readable
+```
+
+The AWS pair is readable because it was re-owned by this build during the
+keychain migration (§8). The three feed items never were, so their access list
+still names an older, ad-hoc-signed build by its code hash. **macOS does not
+prompt in this situation — it refuses silently.** There is no dialog to approve
+and no migration to run; re-entry is the only fix, and the app says so itself.
+
+**Booking.com is a different and worse problem.** It is not a Keychain issue:
+the platform returned **400 Invalid Token** because the calendar connection the
+export URL belonged to was deleted. Re-entering the old URL would achieve
+nothing. It is marked **needing reconnection** and requires generating a fresh
+export URL in the Booking.com extranet first. The staging API already carries
+`VRC_DISCONNECTED_SOURCES=booking_com`, so the service agrees.
+
+### A trap in the diagnostics themselves
+
+`vrc doctor` prints `ok   feed URL stored for Airbnb …` for all three. That is
+**presence of the Keychain reference, not readability**, and reading it as
+"feeds are fine" is a mistake waiting to happen. `vrc keychain` is the command
+that answers whether this build can actually read them; `vrc connection`
+explains why not and what to do.
+
+### There is no second copy of these URLs
+
+`vrc-staging/sources/feed-urls` in Secrets Manager answers
+`ResourceNotFoundException` — the secret exists but holds no value. So AWS is not
+an alternative source, and a cloud-side import is blocked for the same reason.
+
+### How Airbnb and Vrbo were unblocked — and how Booking.com will be
+
+Through the app's **Feeds** pane (the route that worked). The CLI equivalent,
+for reference, must run in a **real Terminal** — `set-url` refuses to save when
+stdin is not a TTY, demands `https`/`webcal`, redacts the URL, and fetches and
+parses it before saving, leaving any existing entry untouched on failure
+(`--dry-run` verifies without saving):
+
+```bash
+/Applications/VacationRentalCalendar.app/Contents/MacOS/vrc set-url --listing 3   # Booking.com
+```
+
+But prefer the Feeds pane, for the code-object reason above.
+
+`set-url` reads the URL from stdin with echo cleared, verifies it before saving,
+and never puts it in argv, shell history, `ps`, or a log. It writes a fresh
+Keychain entry owned by the current build and leaves the old one untouched —
+nothing is deleted and no credential is regenerated. Then
+`vrc keychain` should report all three readable, and `vrc import` becomes possible.
+
+**Never pass a feed URL as a command-line argument.** It is a bearer credential.
+
+### Local data, as it stands with Airbnb and Vrbo imported
+
+| | |
+|---|---|
+| Events | **7 active** — Airbnb 4, Vrbo 3, Booking.com 0 |
+| Classifications | Maintenance block 2 events (834 nights), Cancellation block 5 events (43 nights) |
+| Confirmed reservations | **none** — worth knowing before reconciliation, since none of the 7 is a booking |
+| Needs review | 0 |
+| Double bookings | 0 · other overlaps 4 |
+| Vrbo decisions | 2 rows, both now **`cancelled`**, never published — see §14 |
+| December 17–18 2026 | **free of any Vrbo block decision** |
+
+### The Mac display is already built
+
+Audited against the six distinctions wanted for real observations; all are
+already present, so no UI work is pending on this milestone:
+
+| Wanted | Where |
+|---|---|
+| Airbnb vs Vrbo observations | `Theme.swift` — per-platform colour and SF Symbol per `RentalPlatform` |
+| Confirmed reservation vs unknown block | `Theme.swift` colours every `BlockKind` separately; `EventDetailPanel` treats `confirmedReservation` specially |
+| Local vs AWS records | local calendar panes vs the Cloud pane, which labels each interval `source · basis` |
+| Conflicts requiring review | `ConflictsView`, `ReviewView`, and a review queue in `vrc status` |
+| Last successful refresh | Cloud pane renders `status.lastSuccessfulImport` (currently `never`) |
+| Duplicate-free refresh | covered by `RequiredScenarioTests` — "re-importing a feed creates no duplicates" |
+
+---
+
+## 14. Why the two Vrbo decisions read `cancelled` — investigated 2026-11-10
+
+Both decisions were **approved and unpublished** for a day, then both became
+`cancelled` within the same second. Nothing was deleted: both rows survive, both
+publication UIDs are intact, and the full audit trail explains it.
+
+### When
+
+| Decision | Created (draft) | Approved | Cancelled |
+|---|---|---|---|
+| 1 — Vrbo block Dec 10→17 2026 (7 nights) | 2026-11-09 03:33:38 | 2026-11-09 03:37:09 | **2026-11-10 01:09:14** |
+| 2 — Vrbo block Dec 19→20 2026 (1 night) | 2026-11-09 03:33:38 | 2026-11-09 03:37:09 | **2026-11-10 01:09:14** |
+
+The two audit histories are **identical in shape and to the second** — created
+together, advanced `draft → validated → awaiting_approval → approved` together,
+cancelled together, both with the detail `Pending changes cleared.` and actor
+`owner`. That is one action affecting both, not two separate decisions.
+
+### How
+
+A single click on the button labelled **"Cancel all"**, in the availability
+editor's *"Waiting for you"* section
+([AvailabilityEditor.swift:177](Sources/VacationRentalCalendar/Availability/AvailabilityEditor.swift#L177)).
+It calls `AppState.cancelAllPending()` →
+`AvailabilityManager.cancelPending(propertyID:)`, which cancels **every** decision
+whose status `isPending`.
+
+### Why it swept up approved work
+
+`AvailabilityStatus.isPending` returns true for `.draft`, `.validated`,
+`.awaitingApproval` **and `.approved`**
+([AvailabilityDecision.swift:112](Sources/VRCCore/Availability/AvailabilityDecision.swift#L112)).
+Its own doc comment gives the intent: *"Still open, so it counts as a pending
+operation during **conflict checks**."*
+
+That predicate was written to answer **"must this block an overlapping
+decision?"** — and an approved-but-unpublished decision certainly must.
+`cancelPending` reuses it to answer a different question: **"may this be thrown
+away?"** Those are not the same question, and conflating them means a button
+called "Cancel all", sitting under a heading that reads "Waiting for you",
+silently discards approved work. An approved decision is arguably no longer
+*waiting for you* at all — it is waiting for publication.
+
+**This is a design observation, not a fault anyone introduced carelessly, and it
+has not been changed.** Altering the semantics of an availability control is a
+reviewed decision, not a cleanup, and the owner has asked not to reactivate or
+publish these decisions without approval.
+
+What *was* added is a characterisation test,
+`"cancel pending also discards APPROVED decisions, not just drafts"`, which pins
+the current behaviour so it cannot stay invisible. The pre-existing test
+`"cancel pending clears everything open"` only ever submitted drafts, so it never
+covered this path. The new test was verified to be sensitive: excluding
+`.approved` from `cancelPending`'s filter makes it fail on exactly the two
+assertions that matter, and the source was reverted afterwards.
+
+### What survived, and what the owner still has to decide
+
+Nothing was lost but the approval itself:
+
+- both decision rows exist, with `publication_uid` `vrc-812d1978…` and
+  `vrc-a5a1dbf5…` **verbatim** — which matters, because a changed UID would make
+  a platform see a delete plus a create instead of an update;
+- `feed_publications` is **0** — neither was ever published anywhere;
+- the audit trail is complete at 10 entries and names the cause;
+- December 17–18 2026 remain free of any Vrbo block decision.
+
+**Open question for the owner:** whether that "Cancel all" click was deliberate.
+If the two December blocks are still wanted, they must be re-approved
+deliberately — the statuses are terminal (`cancelled` is in `isTerminal`), so
+this means new decisions or an explicit reinstatement, and **neither has been
+done**. CLAUDE.md lists these two under "Data that must survive"; the rows and
+UIDs survive, their *approved* status does not, and that note should be reworded
+once the owner says which state is intended.
+
+---
+
+## 15. Booking.com outbound feed — inspection and proposal (2026-11-10)
+
+**Nothing here is built or deployed.** This is the inspection asked for before
+proposing components, and the finding is that most of it already exists.
+
+### What already works, with no new code
+
+Proved today by running the existing CLI, not by reading it:
+
+```
+vrc feed   --property 1 --to booking_com --raw
+vrc export --property 1 --to booking_com --write booking.ics
+```
+
+produces a **valid, empty** Booking.com feed — 297 bytes, 0 `VEVENT`s — and
+names all seven held-back events with a reason each. Served over local HTTP and
+parsed with an independent (non-Swift) parser it checks out: CRLF line endings,
+`BEGIN`/`VERSION`/`PRODID`/`END` present, every line ≤ 75 octets, no
+`ATTENDEE`/`ORGANIZER`/`CONTACT`/`DESCRIPTION`, `Content-Type: text/calendar`.
+
+| Requirement | Where it already lives |
+|---|---|
+| Per-destination filtering | `CalendarFeedGenerator` matches `decision.destination == destination` — a Vrbo approval is **already** not a Booking.com approval |
+| Only approved blocks | `FeedPublicationScope.approvedManualBlocksOnly`, already the stored `app_settings` value |
+| No cancellation blocks / unknowns | `ExportPolicy` allow-list; today it holds back 5 cancellation blocks and 1 unapproved maintenance block |
+| No guest information | `summaryForSource` emits only "Reserved" / "Not available" |
+| Stable UIDs | `stableUID(forSourceKey:destination:)`, salted per destination so platforms cannot correlate feeds |
+| Checkout-exclusive dates | `ICalWriter` writes `DTSTART;VALUE=DATE` / `DTEND;VALUE=DATE` |
+| Empty feed ≠ permission to reopen | `FeedPublicationSafety` classifies *why* a feed shrank, and treats a lost or stale inbound feed as a reason **not** to reopen |
+| Token rotation | `feed_tokens` has `version` + `retired_at` (currently empty) |
+| Circular-import protection | see below — two layers, one of which does not depend on Booking.com's behaviour |
+
+### What is genuinely missing
+
+1. **No HTTPS surface.** `vrc-staging-feeds-f79de5f0` exists but is empty and
+   fully private (all four public-access blocks on, no bucket policy).
+2. **No token issued.** `feed_tokens` is empty.
+3. **Publication is unwired on purpose.** `vrc-lambda-publish` returns
+   `"the gate is open but live publication is not yet wired, by design"`.
+4. **`OutboundSyncGate.isEnabled = false`** — a reviewed code change, never a
+   toggle.
+5. **Zero Booking.com decisions exist**, so today's feed is *legitimately*
+   empty. That is the correct starting point, not a defect.
+
+### Circular imports — the part worth reading
+
+The generator drops any inbound event whose UID carries `vrc-` or our UID
+domain. **That guard only works if Booking.com preserves our UID when it
+re-exports** — and it probably does not: Booking.com relabels everything
+`CLOSED - Not available` (docs/PLATFORM-SYNC-RESEARCH.md calls it the worst
+case).
+
+The protection that actually holds is the second one: Booking.com's `CLOSED` is
+classified **unknown**, and unknown is not in the export allow-list. So a block
+of ours returning through Booking.com's export can never be re-published, no
+matter what UID it carries. The UID guard is a useful first line; the
+classifier is the one that does not depend on a platform behaving well.
+
+### Hosting — comparison
+
+| Option | New infra | Monthly cost | Verdict |
+|---|---|---|---|
+| **A. Small dedicated public bucket, one prefix** | 1 S3 bucket + policy | **≈ $0.00** | **Recommended** |
+| B. Make the existing feeds bucket public | none, but disables its public-access blocks | ≈ $0.00 | Rejected — widens the blast radius of the bucket the publish Lambda writes to |
+| C. Unauthenticated API Gateway route | 1 route + Lambda | ≈ $0.00 | Workable fallback |
+| D. CloudFront + custom domain | distribution + DNS | ~$10/yr domain + CF | Rejected — explicitly to be avoided |
+| E. S3 presigned URL | none | $0 | **Not viable** — presigned URLs expire; Booking.com needs a durable URL |
+
+Booking.com re-reads roughly every 2 hours → ~360 GET/month. At S3's
+$0.0004/1,000 GET that is **$0.00014/month**, plus a few KB of storage and
+transfer. Effectively free either way.
+
+**"Can we serve public HTTPS without exposing the authenticated API?"** Yes —
+and option A does it by not touching the API at all. The API keeps its single
+`ANY /{proxy+}` route on `AWS_IAM`; the feed lives on a different service with
+its own certificate. Option C would also work (a more specific route wins over
+the catch-all proxy, so the IAM surface stays protected) but puts an
+unauthenticated door on the authenticated API, which is a worse shape for the
+same price.
+
+**When the Mac is off:** the feed is a static object, so S3 keeps serving it
+regardless. It simply stops being *updated*, and stale-in-the-blocking-direction
+is the safe failure: existing blocks keep blocking and nothing reopens by
+itself, which is exactly what `FeedPublicationSafety` is built to preserve.
+
+### Security
+
+The URL **is** the credential — a bearer token in a query-free path. 128 bits of
+randomness makes it unguessable; it must never appear in Git, logs, `ps` or a
+command line, which is why it belongs in the Keychain/`feed_tokens` path like
+every other feed URL. Rotation is: write the new key, update Booking.com, delete
+the old object, mark the old row `retired_at`. Revocation is deleting the object.
+
+The feed leaks only *dates we chose to publish* — no names, no prices, no
+contact details. Worst case on disclosure is that someone learns which nights
+39 G Street is blocked on Booking.com.
+
+### Proposed activation order, after approval
+
+1. Record a Booking.com `AvailabilityDecision`, approve it deliberately.
+2. `vrc feed --property 1 --to booking_com --raw` and read the audit text.
+3. Create the public bucket + prefix-scoped policy (Terraform, plan first).
+4. Issue a token into `feed_tokens`; publish the object.
+5. Fetch the public URL from outside AWS; confirm `text/calendar` and content.
+6. Only then paste the URL into Booking.com, and only then consider the gate.
+
+Steps 1–2 need no infrastructure and can be done today. Nothing past step 2
+happens without explicit approval, and `OutboundSyncGate` stays `false`
+throughout — note that publishing a *file* and opening the *gate* are separate
+decisions.
+
+---
+
+## 16. Booking.com feed — hosting decision and local verification (2026-11-10)
+
+**Nothing is deployed. No bucket was made public, no endpoint created, the gate
+is still `false`.**
+
+### Recommendation: a Lambda Function URL in front of the PRIVATE feeds bucket
+
+This replaces the "small public bucket" suggested in §15. Having checked the
+options properly, a public bucket is the wrong trade.
+
+```
+publish Lambda  ──writes──▶  s3://vrc-staging-feeds-…/ical/<token>.ics   (PRIVATE)
+Booking.com  ──GET──▶  https://<id>.lambda-url.us-east-1.on.aws/ical/<token>.ics
+                        └─ feed Lambda: compares token, streams the object
+```
+
+| | Public S3 object | **Lambda Function URL** | API Gateway route |
+|---|---|---|---|
+| Booking.com fetches without IAM | yes | **yes** | yes |
+| Bucket stays fully private | **no** | **yes** | yes |
+| Touches the authenticated API | no | **no** | **yes** — adds an unauthenticated route to the API that today has exactly one, `ANY /{proxy+}` on `AWS_IAM` |
+| Wrong token | 403/404 from S3 | **404 from our code** | 404 |
+| Revocation | delete/rename object | **delete one row; instant** | delete route or row |
+| Who fetched it | S3 access logging is **off by default** | **CloudWatch, free** | CloudWatch |
+| Rate limiting | none | reserved concurrency | throttles |
+| Extra cost | $0.00014/mo | **≈$0.00** (360 invocations) | ≈$0.0004/mo |
+
+Lambda Function URLs are available in this account (the API answers
+`ResourceNotFoundException`, i.e. supported, none configured). S3 GET pricing
+read from the Pricing API: `$0.0000004` per request — 360/month is
+**$0.00014**. Either option is free in practice; the difference is entirely
+about blast radius.
+
+It also reuses what exists: `Scripts/build-lambda.sh` already builds and
+packages handlers, and the private `vrc-staging-feeds-f79de5f0` bucket is
+already created and empty. No DNS, no CloudFront, no NAT, no servers.
+
+**Naming precaution:** Booking.com's own guidance describes a valid calendar
+link as containing `/ical/` or ending `.ics`. Whether that is *enforced* or
+merely advisory is unverified, so the path is shaped `…/ical/<token>.ics` —
+free insurance against a validator rejecting the URL.
+
+### An obscure URL is NOT authentication
+
+Stated plainly because it is easy to pretend otherwise:
+
+1. **It is a bearer capability, not an identity check.** Anyone holding the URL
+   reads the feed, forever, until it is rotated. There is no "who".
+2. **URLs leak** — browser history, referrer headers, proxy logs, support
+   tickets, screenshots, and Booking.com's own internal storage.
+3. **The bucket name is guessable; only the key is secret.** 128 bits of
+   randomness is not brute-forceable, but the entire security rests on that key
+   staying secret.
+4. **`s3:ListBucket` must never be public.** If it were, the "secret" key would
+   be enumerable and the whole scheme collapses. Grant `s3:GetObject` only —
+   this is the single most important line in any policy. With the Function URL
+   design the question does not arise, because nothing is public.
+5. **A public bucket policy requires disabling `BlockPublicPolicy` and
+   `RestrictPublicBuckets`**, leaving a standing misconfiguration risk for
+   anything later written there. Avoided entirely here.
+6. **No audit by default.** S3 server access logging is off unless enabled and
+   paid for; a Function URL logs every request to CloudWatch for nothing.
+
+What limits the damage is the payload, not the URL: the feed carries approved
+blocked dates and nothing else — no names, prices, or contact details. Worst
+case on disclosure is that someone learns which nights are blocked.
+
+### Verified locally today, with synthetic data only
+
+Three new tests in the `Feeds` group, plus an HTTP subscriber check. **No live
+Booking.com decision was created or approved** — the owner's instruction was
+explicit, and the generator was exercised on in-memory fixtures instead.
+
+A simulated subscriber fetched the generator's real output over HTTP and got:
+
+```
+BEGIN:VEVENT
+UID:5c9a63a5…@vacationrentalcalendar.local
+DTSTART;VALUE=DATE:20280901
+DTEND;VALUE=DATE:20280905
+SUMMARY:Not available
+END:VEVENT
+```
+
+One event — the Booking.com approval — and **nothing else**: the Airbnb
+cancellation block, the unknown block, an event bearing our own `vrc-` marker,
+a **Vrbo-approved** block, and an unapproved Booking.com draft were all held
+back. `Content-Type: text/calendar`, CRLF endings, every line ≤ 75 octets, no
+`ATTENDEE`/`DESCRIPTION`/guest text. The empty-feed case is also a valid
+calendar with zero `VEVENT`s.
+
+**A test that was wrong first, and what it taught.** The UID-stability test
+initially failed, and the product was right: `publicationUID` defaults to a
+*newly generated* value per `AvailabilityDecision` object, so building a fresh
+decision for each generation produced a new UID. Stability is a property of the
+decision being **stored and re-read**, not of the generator — the same point
+CLAUDE.md makes from the other side ("migrated verbatim, never regenerated").
+The test now reuses one stored decision and additionally asserts that two
+different decisions never collide.
+
+### What was already covered, and needed no new tests
+
+`Publication safety` already holds 19 tests covering exactly requirement 2: an
+unexplained empty feed is refused, a failed import never shrinks a feed, a stale
+or never-imported calendar refuses any removal, a removal over a confirmed
+reservation is explained rather than hidden, a failed upload leaves the previous
+feed serving, and token rotation issues a new key with no key material reaching
+the database.
+
+### Rollback
+
+Nothing to roll back yet. Once deployed: delete the Function URL config (the
+feed stops resolving immediately), delete the `ical/` object, mark the
+`feed_tokens` row `retired_at`. The private bucket, the management API and the
+Mac application are untouched by all three.
+
+---
+
+## 17. The read-only calendar endpoint — DEPLOYED to staging (2026-11-10)
+
+**Approved and applied.** Not connected to Booking.com; that needs separate
+approval. Outbound publishing and both schedules remain off throughout.
+
+### What exists now
+
+| Resource | Identifier |
+|---|---|
+| Lambda | `vrc-staging-feed` — arm64, 256 MB, 10s timeout |
+| Function URL | `https://om62jzjcqr6viusnmg7fgthvda0yaqra.lambda-url.us-east-1.on.aws/` |
+| IAM role | `vrc-staging-lambda-feed` |
+| Log group | `/aws/lambda/vrc-staging-feed`, 14-day retention |
+| Object served | `s3://vrc-staging-feeds-f79de5f0/ical/booking-v1.ics` — **private** |
+| Grant table | `vrc-staging/outbound/feed-tokens` — `sha256(token) → object key` |
+
+The token itself is **not** in Git, Terraform state, the database, or any log.
+Only its SHA-256 digest is stored, and the digest cannot be replayed as a URL.
+
+### Why a separate Lambda
+
+`PublishHandler` can write to S3 and invalidate a CloudFront distribution. This
+endpoint is the only thing in the stack reachable without AWS credentials, so it
+gets its own handler with the smallest possible job and a role that can do
+nothing else:
+
+```
+s3:GetObject              on vrc-staging-feeds-f79de5f0/ical/*   ← NOT ListBucket
+secretsmanager:GetSecret  on vrc-staging/outbound/feed-tokens
+logs:CreateLogStream/Put  on its own log group
+```
+
+`ListBucket` is deliberately absent: if an outsider could list the bucket the
+object keys would be enumerable, and the design rests on them staying unknown.
+The function's environment carries **no** `VRC_CLUSTER_ARN`,
+`VRC_DB_SECRET_ARN` or `VRC_DB_NAME` — it has no business knowing the database
+exists, and its role could not reach it if it did.
+
+### The two independent secrets
+
+The **token** in the URL and the **S3 object key** are unrelated. Listing the
+bucket would not yield usable URLs; a leaked URL would not reveal where the
+object lives. Only the digest is stored at runtime, so compromising the grant
+table yields nothing replayable.
+
+### Behaviour, all unit-tested in `Feed endpoint` (12 tests)
+
+- `GET` and `HEAD` only; every writing method is `405`.
+- Wrong token, revoked token and malformed path are **all a plain `404`** —
+  distinguishing them makes the endpoint an oracle, and a `410` would confirm a
+  token had once been real.
+- Revocation is the grant disappearing from the secret. There is no "retired"
+  flag anyone can forget to check.
+- `Cache-Control: no-store`, so revocation bites immediately. A cacheable
+  response would let an intermediary keep serving a withdrawn calendar, which is
+  the one failure this endpoint must not have.
+- Errors never surface: a missing object, an unreadable secret and absent
+  credentials all return the same `404`.
+
+### Plan review, before applying
+
+Account `589744711110`, region `us-east-1`. The plan was **5 creates and 61
+no-ops** — nothing existing changed — and `terraform show -json` confirmed no S3
+public-access or bucket-policy change anywhere. The bucket's four public-access
+blocks are still `true` and it still has no policy.
+
+### Live verification — all ten checks pass (2026-11-10)
+
+| # | Test | Result |
+|---|---|---|
+| 1 | Valid token | **200**, `Content-Type: text/calendar; charset=utf-8` |
+| 2 | Empty calendar | **0 `VEVENT`s**, well-formed `VCALENDAR` |
+| 3 | `HEAD` | **200**, headers only, **0 bytes** of body |
+| 4 | Invalid / malformed paths (`/`, `/ical/`, no extension, `.txt`, short token) | **404** every time |
+| 5 | Revoked token | **404**; restored → **200**, no caching in between |
+| 6 | `POST` / `PUT` / `PATCH` / `DELETE` | **405** |
+| 7 | Direct unauthenticated S3 GET of the object | **403** |
+| 8 | Management API, unsigned `GET /status` | **403** — IAM still enforced |
+| 9 | Publication / decisions in staging | `publications=0 published_entries=0 decisions=0` |
+| 10 | Token, credentials or calendar body in CloudWatch | **0 occurrences** |
+
+`Cache-Control: no-store, max-age=0` confirmed on the wire, which is what makes
+check 5 immediate.
+
+### Two faults found by deploying, not by reading
+
+**1. The bucket is SSE-KMS.** `s3:GetObject` alone is not enough; S3 must also
+decrypt on the role's behalf. Added `kms:Decrypt` on the one key the bucket
+uses, conditioned `kms:ViaService = s3.us-east-1.amazonaws.com` so the role can
+decrypt **only through S3** and cannot use the key for anything else.
+
+**2. `S3ObjectStore` never signed `X-Amz-Security-Token` — a real product bug.**
+The signer covers `host`, `x-amz-content-sha256` and `x-amz-date` unless extra
+headers are named. S3 rejects any `x-amz-*` header it receives that the
+signature does not cover, and answers a flat `403` with nothing useful. Secrets
+Manager tolerates the same omission, which is exactly why it survived: **nothing
+else in this project reads or writes S3 at runtime**, so the feed endpoint's
+first real S3 call was also the first opportunity to fail. In Lambda the
+credentials are always temporary, so the fault was unconditional there —
+`PublishHandler`'s writes would have failed the same way the moment publication
+was wired.
+
+Fixed at all four call sites (`get`, `put`, `putIfAbsent`, and CloudFront
+invalidation, which has the same requirement), guarded as
+`sessionToken == nil ? [] : [...]` so long-term credentials sign exactly what
+they signed before. Six regression tests in the `Signing` group cover it,
+including a characterisation of the unsigned-token trap and a check that two
+different session tokens never share a signature.
+
+Diagnosis took three attempts. The first two were guesses; the third added
+server-side `stderr` notes — CloudWatch only, never the response, never the
+token — which named the failure immediately:
+`object read failed: GET ical/booking-v1.ics returned 403`. Those notes are
+kept, because a silently-404ing endpoint is otherwise undiagnosable.
+
+### One thing the repository does not record
+
+`staging.tfvars` is gitignored (`*.tfvars`), so **`create_feed_endpoint = true`
+exists only on this machine**. The variable defaults to `false` in the tracked
+`variables.tf`, which is the safe default — but anyone reproducing this
+environment must set it explicitly, and a `terraform apply` from a fresh clone
+would otherwise plan to destroy the endpoint.
+
+### Rollback
+
+`create_feed_endpoint = false` in `staging.tfvars`, then apply. The URL stops
+resolving and the five resources go; nothing else is touched. To revoke without
+removing infrastructure, delete the entry from the grant secret — effective on
+the next request, because nothing is cached. Both were exercised: revocation was
+tested live and restored.
+
+### Cost
+
+Unmeasurable in practice. Booking.com would poll every ~2 hours — about 360
+invocations a month at 256 MB and well under a second each, which is inside the
+Lambda free tier; S3 GETs are `$0.0000004` each (**$0.00014/month**); the object
+is 297 bytes. The only standing cost is the CloudWatch log group, capped at
+14-day retention. Call it **well under $0.01/month**, against the staging
+environment's existing ~$2.
+
+---
+
+## 18. Credential durability and the scanner exemption (2026-11-10)
+
+### Why feeds keep disconnecting after an update
+
+`SecTrustedApplicationCreateFromPath` **pins the binary's code hash** when an
+item is written. A rebuild changes that hash, so access is lost even when the
+certificate and designated requirement are byte-identical, and macOS refuses
+without prompting. **A stable designated requirement does not preserve Keychain
+access** — the codebase claimed it did in three places, that claim was believed,
+and nobody checked a live read. Full analysis in [docs/KEYCHAIN.md](docs/KEYCHAIN.md).
+
+### Implemented: Option C, authorized migration
+
+`Scripts/migrate-cloud-credential.sh` now migrates **feed URLs as well as the
+AWS key**. Per listing it asks macOS for permission, pipes the value to the new
+helper, and verifies readability afterwards.
+
+- The URL travels only through a pipe — never disk, log, argv or shell history.
+- Old entries are preserved; nothing deleted, nothing rotated.
+- Unreadable items are reported as **needing re-entry**, never as migrated
+  (exit 2), so a caller can tell the difference.
+- `vrc set-url --stdin` exists solely for this path. It skips the interactive
+  confirmation and keeps every other check — https only, fetched and parsed
+  before saving, never printed.
+
+### Corrected false claims
+
+| Where | Was | Now |
+|---|---|---|
+| `build-app.sh` | "Keychain approvals will survive rebuilds" | states the code-hash pinning and points at the migration |
+| `build-app.sh` | "Keychain permissions will stick" | "designated requirement unchanged since the last build" |
+| `CodeSignatureInfo.Kind.survivesRebuild` | name asserted the falsehood | `identityIsStable` — what it always measured |
+| `vrc doctor` | reported a Keychain *reference* existing | now also checks **this build can actually READ** each credential |
+
+`build-app.sh --install` performs a **real read** after installing and names the
+migration when items are unreadable. Stored connection status is never treated
+as evidence.
+
+### Documented, not built
+
+**Option B**, a stable credential helper built once and never rebuilt, and
+**Option A**, the Data Protection Keychain with an access group. B's weakness is
+that "never rebuilt" is a promise the build system cannot enforce, and its blast
+radius is larger when it does break. A is the only real fix but needs a verified
+Apple Developer Team ID, and whether a self-signed certificate can carry a usable
+access group is **untested** — it should be tested before anyone relies on it.
+
+### The scanner exemption, and two bugs the tests caught
+
+One exact-match exemption was added for AWS's published SigV4 documentation
+example key — a value that was never a credential, appearing in
+`SigningTests.swift` (blob in `4f42fca`) and in `f0267a9`'s commit message. It
+is **one exact 20-character token removed by literal substitution**: not a
+suffix rule, not a pattern relaxation, not a file allowlist. The scanner's own
+source never contains the token contiguously, so it cannot flag itself.
+
+`Scripts/test-check-no-secrets.sh` proves the gate still holds — 11 cases, each
+building a throwaway repository and asserting the real script's verdict. It
+immediately caught two genuine faults:
+
+1. **The exemption blanked the check on binary input.** macOS `sed` aborts with
+   `illegal byte sequence` on history blobs and emits nothing, which handed back
+   empty content and silently disabled the AWS-key scan entirely. Fixed with
+   `LC_ALL=C` **and** a fail-closed guard: if filtering empties non-empty input,
+   the *unfiltered* content is scanned. A false positive is recoverable; a false
+   negative is not.
+2. **The private-key pattern had never worked.** `scan()` passed the pattern to
+   `grep` without `--`, so `-----BEGIN …` was parsed as options and matched
+   nothing — for as long as that pattern has existed. Fixed.
+
+Neither was the exemption's intended risk, and neither would have been found
+without the tests.
+
+### Remaining manual action
+
+Airbnb and Vrbo feed URLs were re-entered by the owner (references now `-v5`),
+so no migration is outstanding today. The migration path exists for the **next**
+rebuild, and `build-app.sh` will now say so instead of claiming success.
+
+## 19. The empty feed was not valid iCalendar (2026-11-10)
+
+Booking.com property `17482435` holds a connection named `loda` at
+**Activating**. Diagnosing that turned up a defect in our own output that had
+nothing to do with Booking.com's opinion of it.
+
+### The defect
+
+RFC 5545 §3.4 defines a calendar's body as:
+
+```
+icalbody  = calprops component
+component = 1*(eventc / todoc / journalc / freebusyc / timezonec / iana-comp / x-comp)
+```
+
+`1*` means **one or more**. A `VCALENDAR` carrying calendar properties and no
+components does not satisfy the grammar. The feed served for Booking.com was
+exactly that — 297 bytes, and zero `VEVENT`, `VTODO`, `VJOURNAL`, `VFREEBUSY`
+and `VTIMEZONE` — because the destination has nothing approved for sharing.
+
+Two independent parsers confirm it, and the contrast is the evidence:
+
+| | old object (297 B) | new object (641 B) |
+|---|---|---|
+| Python `icalendar` 7.3.0 — components | `[]` → **violation** | `['VTIMEZONE','STANDARD','DAYLIGHT']` |
+| Mozilla `ical.js` 2.2.1 — components | `[]` → **violation** | `[vtimezone]` |
+
+Note that both parsers *accept* the empty document without raising: real-world
+parsers are lenient here, so this is a conformance defect, **not proof that
+Booking.com rejected it.** Their validation is not observable from here. The
+point of fixing it is that a feed which fails the generic standard had to be
+ruled out before asking Booking.com anything about their side.
+
+### The fix, and why it is not a VEVENT
+
+`ICalWriter.makeCalendar` now emits a `VTIMEZONE` for `America/New_York` when,
+and only when, there are no entries.
+
+A placeholder `VEVENT` would satisfy the same grammar. It must not be used: an
+outbound feed's events **are** its statement of unavailability, so inventing
+one would withdraw a night nobody approved — the single failure this project
+exists to prevent. A timezone definition asserts nothing about availability, so
+the feed still means what it meant before: no blocks to report.
+
+The definition is a hard-coded constant, not read from the host's timezone
+database, because cross-platform output parity is a release gate and the bytes
+a subscriber receives must not depend on which machine generated them.
+
+Conformance details that are easy to get wrong, and are tested:
+
+* each observance carries `DTSTART`, `TZOFFSETFROM`, `TZOFFSETTO` — all three
+  REQUIRED by §3.6.5, asserted per-observance so one carrying two copies
+  cannot pass for two;
+* the `DTSTART`s are **floating local times** — no `Z`, no `TZID` parameter —
+  which §3.6.5 requires, because the offsets are what define the zone;
+* the offsets are the post-2007 US rules (DST from the second Sunday in March
+  to the first Sunday in November), and both parsers resolve them to the same
+  values as the IANA tzdb either side of both boundaries.
+
+### What the tests lock down
+
+Twelve tests in `Empty calendar`. Six are the new behaviour; **six exist to
+catch this change breaking something else**:
+
+* a populated calendar is asserted **byte-for-byte** against its pre-change
+  output, so the feeds Airbnb and Vrbo already read cannot be silently rewritten;
+* the app's own parser reads **zero events** from the empty feed — whatever we
+  added must not be interpretable as unavailability downstream;
+* the timezone's `RRULE` raises **no parser warning**: that warning exists to
+  flag recurring *events* for human review, and a recurrence rule in a
+  `VTIMEZONE` is ordinary;
+* no `SUMMARY`, `ATTENDEE`, `ORGANIZER` or `DESCRIPTION` — no guest data;
+* CRLF endings and ≤75-octet folding;
+* identical bytes across two regenerations at different times.
+
+Each assertion was falsified by breaking the implementation eight ways — UTC
+`DTSTART`, a `TZID` parameter, a dropped observance, a missing `TZOFFSETTO`,
+wrong offsets, no `TZID`, unconditional insertion, and a placeholder `VEVENT`.
+All eight were caught.
+
+Suite: **407 tests** (was 395). Parity digest **unchanged** at
+`b3398471b1ee56f477d9a1244b16449e8827df1616aa5fca365ef3db96c604f5` — both
+parity fixtures have events, so the new branch is not reached there.
+
+### The staging object
+
+Only the existing object was replaced. No new token, no new URL, no change to
+the Lambda, IAM, Terraform or the schedules; outbound publishing is still
+disabled.
+
+| | |
+|---|---|
+| Object | `s3://vrc-staging-feeds-f79de5f0/ical/booking-v1.ics` |
+| Replaced at | 2026-11-10 15:50:34Z |
+| New version | `3b_MFyK4vg5NRzcFam69wo0y1Sexyp2b` — 641 B |
+| **Previous version, for rollback** | `olC8_F0WJBV5cSONHFhyGc1A17_Mct9W` — 297 B |
+| Content type | `text/calendar; charset=utf-8` (unchanged) |
+| Encryption | `aws:kms`, same key (unchanged) |
+
+Bucket versioning is **enabled**, so rollback is
+`aws s3api copy-object` from the previous version id above.
+
+The difference between the two objects is the seventeen-line `VTIMEZONE` and
+**nothing else** — verified by diff, and the served bytes are byte-identical to
+what the writer produces locally.
+
+Re-verified after the replacement: HTTPS `200`, `641` bytes,
+`text/calendar; charset=utf-8`, `cache-control: no-store`; invalid token still
+`404`; unauthenticated direct S3 still `403`; all four public-access blocks
+still `true`.
+
+### What the logs do and do not show
+
+`vrc-staging-feed` logs no source IP and no user agent — deliberately, since
+the endpoint discloses nothing — and Function URL access logging is not
+enabled. **Attribution of any fetch to Booking.com is therefore impossible
+from our side.** A served `200` is not evidence a platform read or accepted the
+feed, which is the standing rule in `CLAUDE.md`.
+
+Between 15:12 and 15:34 the endpoint served fourteen valid GETs. I was running
+verification commands throughout that window and cannot separate mine from a
+third party's. The two fetches at 15:19:52Z and 15:20:33Z were previously
+flagged as possibly Booking.com's; they remain unattributable.
+
+One thing worth noting is what is *absent*: an activated Booking.com
+subscription polls roughly every two hours, and across the whole log window
+there is no served request standing alone in time, away from my own activity.
+That is weak evidence against Booking.com having begun polling. It is not
+proof — the window is short.
+
+### Next diagnostic step
+
+Enable one of the two things that would make attribution provable instead of
+circumstantial, both of which are deploys and neither of which is authorized
+yet:
+
+1. log the request's user agent in the feed handler (a code change), or
+2. enable Lambda Function URL access logging (a Terraform change).
+
+Until one exists, "did Booking.com fetch it?" cannot be answered, only guessed
+at. If `loda` is still Activating after a full two-hour poll interval past
+15:50Z, the remaining step is Booking.com support. A message is drafted below;
+it carries neither the token nor the URL.
+
+> **Subject: Calendar connection stuck on "Activating" — property 17482435**
+>
+> Property 17482435 has a calendar connection named **loda** that has shown
+> the status **Activating** since it was created, and has not progressed to
+> Okay, Import only, or Export only.
+>
+> 1. **Import side.** I supplied an iCalendar URL for Booking.com to import.
+>    My server's logs show requests that were authenticated and served
+>    successfully, returning HTTP 200 with
+>    `Content-Type: text/calendar; charset=utf-8`. I cannot tell from my side
+>    whether those requests came from Booking.com. Could you confirm whether
+>    Booking.com has fetched the URL for this connection, and if so whether
+>    the calendar was accepted or rejected — and if rejected, the reason?
+>
+> 2. **Export side.** I would also like Booking.com's own export (iCal) URL
+>    for this property, so the connection works in both directions. The
+>    **loda** connection no longer offers a "Complete setup" option — only
+>    "Remove" — so I cannot reach the export step without creating a second
+>    connection, which I would prefer not to do. Where can I retrieve the
+>    export URL for an existing connection?
+>
+> One detail that may be relevant: the calendar I am publishing contains **no
+> events**, because this property has no blocked dates to report. If
+> Booking.com requires at least one event before a connection activates,
+> please say so and I will account for it.
+
+### A correction
+
+An earlier diagnosis in this session reported "9 non-ASCII bytes" in the feed.
+That was wrong: it came from `grep -c`, which counts matching *lines*, with a
+mangled pattern. The feed contains exactly **one** non-ASCII character — the
+`→` in `X-WR-CALNAME`, three bytes of valid UTF-8 — which is legal and is not a
+problem.
+
+### The secret scanner has been red since §18, and was reported green
+
+`Scripts/check-no-secrets.sh` fails, and did so at `d262eda` too. The cause is
+`Scripts/test-check-no-secrets.sh`, added in that commit: it wrote five
+fixtures out literally — an Airbnb URL, a Vrbo URL, a Booking.com URL, a
+private-key header and a guest name — and the scanner correctly finds them.
+
+This is the same mistake as the AKIA fixture one commit earlier, in the same
+file: those values are assembled from fragments precisely so the file cannot
+report itself, and the lesson was applied to one fixture and not the other
+five.
+
+All five are now assembled the same way, each split so neither half matches the
+pattern alone. The strings handed to the scanner are unchanged, so the tests
+still prove it catches them — all 11 pass.
+
+**None of them is a credential**: the hex runs are `0123456789…`, the key block
+contains no key, and "Dana" is not a guest. Nothing needs rotating.
+
+That fixes the **working tree** scan, which is the half that prevents new
+leaks. The literal fixtures remain in commit `d262eda`, which is already on the
+public remote, so the **history** scan still reports all five and the script
+still exits 1. Clearing that needs a history rewrite and a force-push, which is
+not authorized. The options, for a decision:
+
+1. leave it, and accept a permanently red gate — the outcome the AWS-key
+   exemption exists specifically to avoid;
+2. extend the exact-match exemption to these five synthetic values — consistent
+   with the precedent, but the §18 authorization was explicitly for the AWS
+   documentation key *only*;
+3. rewrite history and force-push — clean, and the branch is unmerged, but it
+   rewrites commits already published.
+
+## 20. The Booking.com connection, end to end (2026-11-10)
+
+Booking.com, Airbnb and Vrbo are all connected and verified as of 17:02:30Z.
+Getting there took most of a day and turned up **two bugs in this app**, one
+undocumented behaviour in Booking.com's Extranet, and one piece of Airbnb
+behaviour that is easy to mistake for a bug here. This section is the whole
+story, because almost none of it is recoverable from the diff.
+
+### Where it started
+
+Property `17482435` had a calendar connection named `loda` stuck on
+**Activating**. The obvious reading — "Booking.com is rejecting our feed" —
+was wrong, and chasing it cost hours.
+
+### Thing 1: our feed was not valid iCalendar (real, fixed, not the cause)
+
+Covered in §19. The short version: a `VCALENDAR` with zero components
+violates RFC 5545 §3.4, and that is what we served for a destination with
+nothing approved. Fixed with a `VTIMEZONE` rather than a placeholder `VEVENT`,
+because an outbound feed's events *are* its statement of unavailability.
+
+**It was worth fixing and it was not what blocked Booking.com.** Keep those
+separate. The fix is justified by the standard, not by the outcome.
+
+### Thing 2: "Activating" does not mean what it looks like
+
+Booking.com's own legend:
+
+> **Activating** — We are activating your calendar connection, waiting to
+> connect to the other end for the first time.
+
+"The other end connecting" means **us fetching Booking.com's export URL** —
+not Booking.com fetching ours. The status flipped to **OK** within seconds of
+the first `curl` of their export link, and not before.
+
+So a connection sits at *Activating* forever until something pulls their
+calendar. All five historical connections (`loda`, `ll`, `hy`, and two named
+`VacationRentalCalendar`) had never been fetched by anything, because their
+export URL had never been given to this app.
+
+### Thing 3: the wizard's hidden gate
+
+On the export step, **"Done" stays disabled until you click "Copy link".**
+
+That single detail explains every stuck connection. The setup was always
+abandoned at that screen, so Booking.com never recorded the connection as
+finished. Two further traps around it:
+
+* **"Complete setup" appears only on older rows.** The most recently created
+  connection shows **Remove** instead. That is why `loda` looked unrecoverable
+  — the link existed, just not on the row being looked at.
+* Once a connection reaches **OK**, the export URL is **no longer shown
+  anywhere**. Capture it during setup or create a new connection to see it
+  again.
+
+Also worth knowing: Booking.com **auto-fills the calendar name from the pasted
+URL's host**, so the name field silently became
+`om62jzjcqr6…on.awsVacationRentalCalendar`. Clear it before submitting.
+
+### Thing 4: Airbnb does not re-export imported blocks
+
+A separate report — "Airbnb is not refreshing", Dec 1–7 blocked on Airbnb but
+missing from our calendar — turned out not to be a refresh problem at all. The
+app was fetching Airbnb successfully **8 times in 10 minutes**, and Airbnb's
+export genuinely did not contain those nights.
+
+Airbnb had a connected calendar named "book" importing from Booking.com. A
+platform does not re-export blocks that arrived from an imported calendar —
+otherwise two platforms syncing each other would loop forever. So those nights
+were blocked in Airbnb's UI and absent from Airbnb's `.ics` simultaneously,
+by design.
+
+Confirmed by fetching Airbnb's export directly: 4 VEVENTs, 921 bytes, no
+December dates other than 17–19.
+
+**The diagnostic rule:** a block visible in a platform's UI but missing from
+its iCal export is almost always either an imported block or an availability
+*rule* (advance notice, preparation time, trip length). Neither exports.
+Before suspecting this app, fetch the platform's export directly and count the
+`VEVENT`s.
+
+That direct Airbnb ↔ Booking.com link has since been removed, which is the
+topology this project wants: one hub, not platforms syncing behind its back.
+
+### Bug 1 — a new URL did not revive a revoked feed
+
+Commit `1af0adc`. `FeedConnectionState.revoked` has
+`shouldAttemptImport == false`, which is correct. But the latch has to be
+released when the owner supplies a **different** URL: the platform's verdict
+was about the old token.
+
+`ListingRepository.update` released it only for `credentialUnreadable`. So
+Airbnb and Vrbo recovered whenever re-entered after a rebuild, and Booking.com
+could never recover at all. The symptom was precise and misleading: the
+Keychain item's `mdat` showed the paste had saved, the app reported
+"disconnected by the platform" one second later, and `sync_runs` recorded **no
+HTTP status and zero events seen** — because nothing was ever sent.
+
+The app's own banner said *"It will not be retried until you supply a new
+one."* It did not implement that.
+
+Now expressed as a rule over `shouldAttemptImport`, with `disconnectedByOwner`
+excluded: typing a URL is not the same as asking for a feed to be switched
+back on.
+
+### Bug 2 — the credential reference was not versioned for a revoked feed
+
+**Fixed.** `ListingRepository` gated reference versioning on the same single
+state:
+
+```swift
+if listing.connectionState == .credentialUnreadable,
+   credentials.exists(reference: reference) { … }
+```
+
+Pasting a new URL while the listing is `revoked` therefore writes **into the
+existing Keychain item**, inheriting an access list that names an older build.
+The write succeeds — writing and reading are separately authorised — and the
+next import fails as `credential_unreadable`.
+
+Observable consequence: the first paste appears to fail, and the owner has to
+paste a second time. That is exactly what happened today; the ref only became
+`booking-17482435-v2` on the second attempt.
+
+The fix is the same `isClearedByANewURL` rule already added for Bug 1 — one
+rule, both places, so the two cannot drift apart again.
+
+Five further tests, and three of them exist to bound the change rather than
+prove it: a `connected`, `failing` or `unknown` listing keeps its reference so
+the owner's Keychain grant is not thrown away; `disconnectedByOwner` keeps its
+reference too; and the superseded entry is left in place holding its old
+value, never deleted, so a wrong new URL is recoverable. Versioning also
+increments (`-v5` → `-v6`) rather than stacking suffixes.
+
+All five failed against the old implementation, including one that showed the
+precise harm: the old reference's stored value was *overwritten in place*.
+
+### A trap that nearly produced a false green
+
+`ListingRepository.insert` **does not persist `connection_state`** — it only
+ever moves through `setConnectionState`, so every change leaves an audit row.
+The first version of the Bug 1 tests passed `connectionState:` to the
+initialiser, which silently did nothing. The "revoked" fixture was never
+revoked, and the headline test **passed against the unfixed code**.
+
+If you write a test involving connection state, set it with
+`setConnectionState` and read the listing back.
+
+### Verified final state
+
+| Direction | Evidence |
+|---|---|
+| Airbnb → app | HTTP 200, 4 events |
+| Vrbo → app | HTTP 200, 3 events |
+| Booking.com → app | HTTP 200, 2 events, 17:02:30Z, ref `booking-17482435-v2` |
+| app → Booking.com | our endpoint served Booking.com at 16:43:15Z, 2s after submit |
+| Booking.com connection | **OK**, Last exported "Just now" |
+
+Booking.com exports two events, both `CLOSED - Not available`
+(2026-11-10→12-01 and 2027-04-01→2028-05-10). Both classify as
+`unknownUnavailable` and sit in the review queue; neither propagates to Airbnb
+or Vrbo. **That is correct.** Booking.com labels reservations and owner blocks
+identically, and this app does not guess.
+
+Suite: **412 tests**. Parity digest unchanged, macOS and Linux identical.
+
+### Open items
+
+1. **"Decide what to export"** is still *Booked and closed dates*. Switching it
+   to *Booked dates only* would make everything we receive unambiguously a real
+   reservation. Owner's decision; it affects all connections.
+2. **The secret scanner's history scan is still red** (see §19) from the
+   synthetic fixtures in `d262eda`, already on the public remote. Working-tree
+   scan is clean.
+3. The app surfaces no last-fetch time and **discards parser warnings**
+   entirely — `ImportService` collects them and only the CLI prints them. That
+   is why "is it broken or is there nothing new?" was unanswerable from the UI
+   and needed a database query to settle.
+
+### Verified connected — all three platforms (2026-11-10 17:02Z)
+
+Confirmed by real fetches recorded in `sync_runs`, not by stored status:
+
+| Platform | HTTP | Events | Credential reference |
+|---|---|---|---|
+| Airbnb | **200** | **4** | `airbnb-1759472334611502986-v5` |
+| Vrbo | **200** | **3** | `vrbo-5550554-v5` |
+| Booking.com | **200** | **2** | `booking-17482435-v2` |
+
+And outbound: Booking.com's connection shows **OK**, "Last exported: Just
+now", having fetched our Lambda feed at 16:43:15Z — two seconds after the
+import form was submitted.
+
+Booking.com's two events are both `CLOSED - Not available`, classified
+`unknownUnavailable`, sitting in the review queue. Neither propagates. That is
+the designed behaviour, not an incomplete import.
+
+Suite after both fixes: **417 tests**, 1396 assertions. Parity digest
+`b3398471…` **identical on macOS and Linux**. Scanner behaviour tests 11/11;
+working-tree scan clean, history scan still red per §19.
+
+`OutboundSyncGate.isEnabled` remains `false` (`ExportPolicy.swift:133`), and
+`vrc-staging-import` and `vrc-staging-hold-sweeper` both remain `DISABLED`.
+The Mac app has **not** been rebuilt, so both fixes reach it at the next build;
+today's recovery came from the database and from re-entering the URL.
+
+## 21. Multi-property Phase 1, and App Store readiness (2026-11-10)
+
+Branch `feature/multi-property`, commit `63e7d86` onward. PR #10 stays open.
+
+### What the inspection found
+
+The schema was **already mostly multi-property**: `platform_listings` carries
+`property_id`, events hang off a listing, classifications key off
+`event_key` (which includes the listing id), and `ConflictDetector` groups by
+property before comparing anything — so two properties blocked over identical
+dates were never mistaken for a double booking. That is now pinned by tests
+instead of being a happy accident.
+
+Three things were genuinely missing, and one of them was a latent data-safety
+bug.
+
+1. **`properties.time_zone` was a dead column.** Added in migration 10, never
+   present in the `Property` model or repository, so the thing it exists for —
+   counting a property's nights in its own zone — was not possible.
+2. **No way to retire a property** without deleting it and its history.
+3. **Credential references collided across properties.** They were derived
+   from the platform and the listing LABEL alone, so two properties whose
+   listings were both called "Airbnb" produced `airbnb-airbnb` for both: one
+   Keychain item backing two feeds, where revoking one would silently break
+   the other. References are now scoped by property id, and a partial unique
+   index on `credential_ref` makes the collision unstorable.
+
+Existing references are never recomputed, so 39 G Street's three live
+credentials are untouched.
+
+### Migration 13
+
+* `properties.archived_at` — archiving is never deletion. `active()` hides it;
+  `all()`, its observations, decisions and audit rows stay put. Reversible.
+* A partial unique index on `platform_listings(credential_ref)`, excluding the
+  empty string so database-stored URLs are unaffected.
+
+Postgres schema regenerated per the house rule; the diff is one column. **The
+unique index is not in the generated Postgres schema** — the generator emits
+tables only — which is acceptable while credentials live in Secrets Manager
+rather than the cloud database, but it is a known asymmetry.
+
+### Tests
+
+Ten, across three synthetic properties each with two listings blocked over the
+same dates — the arrangement that exposes cross-property bleeding if it
+exists. No event leakage, no cross-property conflicts, no decision reaching
+another property's feed, a revoked feed isolated to its property, review-queue
+filtering, credential uniqueness, archive round trips, and a repeatable
+migration.
+
+Suite at 437. Parity digest unchanged and identical on macOS and Linux.
+
+### Still to do in Phase 1
+
+Property management UI (create, edit, archive), the portfolio dashboard, and
+the read-only portfolio calendar. The data model and migration underneath them
+are done and tested.
+
+### App Store readiness
+
+Full audit in [docs/APP-STORE-READINESS.md](docs/APP-STORE-READINESS.md). The
+short version: ten blockers, of which four are one piece of work — App Sandbox
+has never been enabled, and enabling it breaks the legacy Keychain ACL scheme,
+relocates the database into a container, and puts the nested `vrc` CLI in
+App Review's path.
+
+That work is worth doing **whether or not the App Store ever happens**: the
+data protection keychain removes the code-hash pinning that is the single
+largest source of day-to-day breakage in this project.
+
+Recommended sequence is direct distribution first (Developer ID + notarization,
+no sandbox), then the sandbox/Keychain rewrite, then the store. Multi-tenant
+AWS is last and should not start before there are paying customers.
+
+## 22. Phase 1 UI, backup tooling, and the scanner baseline (2026-11-10)
+
+Branch `feature/multi-property`, PR #11. Commits `779e7bd`, `627909a`,
+`22a6d24`. PR #10 and the other nine remain open.
+
+### The secret scanner is green again
+
+Not by skipping the fixture file. `Scripts/secret-history-baseline.txt` records
+the **SHA-256 of each known matched string**; those exact five values are
+accepted in history and nothing else is.
+
+A path exemption was considered and rejected: it would blind the history scan
+to a real credential committed to that path later. With the baseline, a new
+finding — any file, any pattern, including a **different value of the same
+shape** — hashes differently and still fails. The baseline applies to history
+only; a baselined value sitting in the working tree is a live leak and is
+still rejected. Four tests assert exactly those properties.
+
+Two bugs surfaced while building it, both mine and both worth recording:
+
+* **`grep -o` prints "Binary file matches" on binary input instead of the
+  matches.** The first collector therefore returned nothing and produced a
+  baseline containing a single hash — of grep's own message. `-a` fixes it.
+  The same trap had already bitten this script once, via `sed`.
+* **The scanner hashes the matched SUBSTRING, not the line.** A baseline entry
+  computed from a full URL including its scheme never matches anything, and
+  fails silently rather than loudly.
+
+### Backup and restore
+
+`Scripts/backup-before-install.sh`, with `--verify` and `--restore`.
+
+Database captured via `sqlite3 .backup`, never a file copy. **No credential
+value is ever written to a backup** — only Keychain account names, read with
+`security find-generic-password` *without* `-w`, so it touches attributes only
+and cannot prompt, block or read secret material. The verifier greps its own
+output for feed-URL shapes and refuses to call the backup safe if it finds
+one. Restore sets the current database aside first, so restoring is itself
+reversible.
+
+Ten tests wreck a throwaway database the way a bad migration would, restore
+it, and check the rows and publication UIDs came back.
+
+A real backup of the live data was taken and verified today.
+
+### Phase 1 UI
+
+A **Portfolio** section: add, edit and archive properties, and a read-only
+roll-up per property — connections, observations, review queue, conflicts,
+next arrival. `RentalStore.portfolio()` computes it in VRCCore so it can be
+tested; the view renders and adds nothing. Every figure is counted per
+property; none is derived from a global total.
+
+Time zone is editable for the first time. Archiving asks first, says plainly
+that nothing is deleted, and the selection can never rest on an archived
+property.
+
+### What is automated, and what still needs eyes
+
+This matters more than usual here, because there is no XCUITest on this
+machine — Command Line Tools only — so **no UI automation is possible at all**.
+What follows is the honest split.
+
+**Automated** (`Portfolio` and `Presentation` groups):
+
+| Behaviour | Asserted as |
+|---|---|
+| Multi-week bars are continuous | only the first segment `isStart`, only the last `isEnd`, middles open both sides |
+| Month-boundary continuity | a 2026-12-28 → 2027-01-06 bar does not restart |
+| Checkout-exclusive | 1st–5th occupies four columns, not five |
+| Back-to-back stays | share one lane rather than stacking |
+| Overlapping platforms | three overlapping events keep three lanes and three identities |
+| Booking.com `CLOSED` | classified `unknownUnavailable`, needs review, never exported, **still drawn** |
+| Lane stacking and overflow | pre-existing `Presentation` tests |
+| Per-property isolation | portfolio counts, review filtering, no cross-property conflicts |
+| Portfolio month strip | one continuous bar per event, clipped and flagged at month edges |
+
+**Still requires visual inspection** — none of this can be asserted here:
+
+* whether platforms are actually **distinguishable by colour**, and in dark mode
+* whether a multi-week bar *looks* continuous — the layout says it spans the
+  rows, but the 1.5pt insets and 3pt width reduction are a visual judgement
+* truncation of long property names and listing labels in the sidebar and cards
+* that the new **Portfolio** section appears, is reachable, and navigates
+* the add/edit sheet at its fixed 430pt width, and the time-zone picker
+* confirmation dialogs reading sensibly in situ (archive, withdraw approval)
+* window resizing and small-width layout
+* that the live 9 observations render where expected across November–December
+* the portfolio strip at narrow widths, where 28–31 day columns get thin
+
+### The portfolio calendar
+
+A month strip per property, every property on one screen. A strip rather than
+a repeated seven-column grid, because the comparison a portfolio exists for is
+BETWEEN properties on the same date, and a week grid stacked per property
+makes exactly that comparison impossible. Read-only: no selection that changes
+state, no range dragging, no control that could alter availability.
+
+Its geometry is `CalendarLayout.monthStrip`, not view code. The first version
+computed lanes and clipping inside SwiftUI; that is precisely what this
+codebase avoids, and it moved to VRCCore before being committed so it could be
+tested and could not drift from the week grid. Four tests cover continuous
+month-long bars, clipping at both ends for an event that overruns the month,
+checkout-exclusive lane sharing, and events outside the month producing
+nothing.
+
+### Readiness for a controlled installation
+
+Ready, with these preconditions:
+
+1. **Take a backup first** — `./Scripts/backup-before-install.sh`. Verified
+   today against the live database.
+2. **Migration 13 will apply on first launch** of a new build. It is additive
+   (`archived_at`, one index) and tested as repeatable, but it has **not** been
+   run against live data. The live database is still at **v12**.
+3. The credential-reference change does **not** rewrite existing references —
+   `persistURL` keeps what a listing already has — so the three live
+   credentials are untouched. New listings get property-scoped references.
+4. Rebuilding changes the app's code hash, which **will** orphan the Keychain
+   items again. Expect to re-enter all three feed URLs after installing, or
+   run `Scripts/migrate-cloud-credential.sh` first. This is the known
+   `SecTrustedApplicationCreateFromPath` problem and is only removed by the
+   sandbox work in the App Store audit.
+
+Nothing has been installed, no migration run against live data, no AWS
+resource touched, outbound publishing still disabled.
+
+## 23. Two defects the installation exposed (2026-11-10)
+
+Commit `55a78ad`. Both were found by installing the build and using it, not by
+reading the code — and neither would have been found by the test suite as it
+stood.
+
+### The app could not read credentials its own bundled CLI could
+
+Symptom: after installing, all three feeds showed "In Keychain" and "the saved
+URL cannot be read", and the portfolio said 0/3 connected — eleven minutes
+after the bundled helper had fetched all three with HTTP 200.
+
+**Not stale UI.** `sync_runs` records real attempts: success with HTTP 200 at
+18:11 from `Contents/MacOS/vrc`, and `credential_unreadable` at 18:22 from
+`Contents/MacOS/VacationRentalCalendar`. Within the hour the helper could not
+read them either.
+
+**Cause.** `FeedCredentialStore.save` updates in place when an item exists —
+deliberately, so a working entry keeps the access list the owner approved.
+`migrate-cloud-credential.sh` ran while the listings were `connected`, so
+`isClearedByANewURL` was false, nothing versioned, and the update path
+preserved an access list naming the **previous build's binaries**. The new
+ones held only the transient grant from the migration's own prompts; once that
+lapsed, both were locked out.
+
+Preserving the grant is right for an ordinary save and exactly wrong for a
+re-home, whose entire premise is that the code objects have changed.
+
+**Fix.** `ListingRepository.update(_:rehomeCredential:)` forces a fresh
+reference regardless of connection state; `vrc set-url --rehome` exposes it
+and the migration script passes it. The old entry is left in place — nothing
+deleted, no URL regenerated.
+
+**The misleading message was right.** `build-app.sh` printed "migrated; the
+helper still cannot read it" for all three and then summarised "need manual
+re-entry: 0". The per-line warning was accurate and the summary was wrong.
+
+### `vrc doctor` reported unreadable credentials as readable
+
+`(try? credentials.url(ref)) == nil` is a **double optional**: nil only when
+the read THREW. A reference pointing at nothing came back `.some(nil)` and was
+counted as readable. That is why doctor said "all readable" at 18:09 while the
+migration was warning otherwise.
+
+Replaced with `RentalStore.unreadableCredentials()`, which flattens it, covers
+dangling references, ignores listings whose URL lives in the database column,
+and is tested.
+
+### Nine conflicts on a property with nothing booked
+
+Every observation at 39 G Street is a `cancellationBlock` — nights Airbnb
+closed after a host cancellation, which this app exists to keep on sale — and
+they overlap each other constantly. The detector reported nine conflicts and
+the portfolio flagged "needs attention".
+
+A conflict has to be actionable. If **neither** side claims the property is
+unavailable, nothing is colliding. Pairs where neither side satisfies
+`describesGenuineUnavailability` are now skipped — the same allow-list that
+decides what may be exported, so a new `BlockKind` is governed here too rather
+than forgotten. One side is enough: a confirmed reservation under dates
+another platform cancelled still surfaces.
+
+Left alone, a real double booking would have been the tenth row in a list of
+nine false ones.
+
+Verified read-only against the live database: **conflicts 9 → 0**, with the 9
+observations, 10 classifications, 2 decisions, 2 publication UIDs and 10 audit
+rows untouched, and all twelve Keychain entries present.
+
+### Outstanding: the live credentials are still unreadable
+
+The fix is in the source. The **installed** build (`82cc52b`) predates it and
+has no `--rehome`, so repairing the live credentials needs a reinstall
+followed by `./Scripts/migrate-cloud-credential.sh`, which reads the existing
+values with one macOS prompt each and writes them to fresh references
+(`-v6`). **No URL needs re-entering** — the values are still in the Keychain
+and the migration moves them.
+
+Until then the app shows all three feeds disconnected. Imports are not
+retried in that state, so nothing is being fetched and nothing is at risk.
+
+## 24. Targeted Booking.com recovery (2026-11-10)
+
+Installed build `ee39d8d`. Backup `Backups/20261110T183929Z`, verified, retained.
+
+### Outcome
+
+| Platform | Reference | Result |
+|---|---|---|
+| Airbnb | `airbnb-1759472334611502986-v6` | HTTP 200, 4 events |
+| Vrbo | `vrbo-5550554-v6` | HTTP 200, 3 events |
+| Booking.com | `booking-17482435-v3` | HTTP 200, 2 events |
+
+Proven independently for both code objects: the installed CLI at 18:47, and
+**the GUI's own imports at 18:49:54 after a full quit and relaunch**. Every
+earlier Keychain entry is still present; nothing was deleted or rotated.
+
+Data unchanged throughout: 9 observations, 10 classifications, 2 decisions, 2
+publication UIDs, 10 audit rows, schema 13. Conflicts **0** — the fix in §23
+holds against live data.
+
+### Why the first attempt failed
+
+The full migration raised six prompts for three credentials. Three were for
+Test Cottage, a synthetic property whose listings had never had a URL stored,
+so those reads could only fail — and the one real failure was lost in the
+noise.
+
+Fixed in `bf71ccc`: presence is now checked with
+`security find-generic-password` **without** `-w`, which reads attributes only
+and never prompts, so a listing with nothing behind its reference is skipped
+silently. `--listing`, `--platform` and `--feeds-only` make a targeted
+recovery cost exactly one prompt. The recovery above used
+`--feeds-only --platform booking_com` and raised precisely one.
+
+Two further bugs abandoned the feed migration entirely: an unreadable AWS
+credential exited before the feed loop, and a readable one `exit 0`d. They are
+separate credentials and neither should skip the other.
+
+### A message that is still wrong
+
+The script printed "migrated; the helper still cannot read it — re-entry may
+be required" for a credential that had migrated perfectly. Its verification
+greps `vrc keychain` output in a way that does not match. **Cosmetic, but it
+has now cried wolf twice** — the first time it was right and was disbelieved,
+this time it was wrong. Worth fixing before it is trusted either way.
+
+### Known: `doctor` reports 3 unreadable
+
+They are the three **Test Cottage** placeholders — references created before
+the fix, with nothing behind them. The three real credentials all report `ok`.
+Clearing those three references would silence it, but they are synthetic
+records and were left alone deliberately.
+
+## 25. Making the credential diagnostics honest (2026-11-10)
+
+Commit `c9750c4`. Two messages that misled, in opposite directions, on the
+same day.
+
+### `vrc keychain` does not exist
+
+The migration script verified its own work with:
+
+```bash
+"$HELPER" keychain 2>/dev/null | grep -F "${platform}" | grep -q "^  ok"
+```
+
+There is no `keychain` subcommand. The command failed, the grep never matched,
+and **every successful migration was reported as a failure**. The same dead
+call sat behind the "already readable by this build" shortcut, which is why
+that count was always zero and every credential was re-homed whether it needed
+it or not.
+
+That message was right this morning and disbelieved; wrong this evening about
+a migration that worked. A verification nobody can trust is worse than none.
+
+It now checks what happened: `set-url` fetches and parses the feed before
+storing it, so its exit status already proves the URL works. What remained was
+confirming a new entry landed — the database names the reference and
+`security` confirms it **without** `-w`, attributes only, no prompt. When the
+reference changes the message says so, and says the old entry is kept.
+
+The "already readable" shortcut was removed rather than repaired: testing
+readability means attempting a read, which is the very prompt the script
+exists to avoid raising unnecessarily.
+
+### Three outcomes, not two
+
+Test Cottage has three listings and no calendar URLs. `vrc doctor` reported
+all three as credentials it could not read — three apparent failures on a
+property that was never set up, and a permanently red gate. That is precisely
+how a genuinely unreadable credential stops being noticed.
+
+`RentalStore.credentialHealth()` now returns `notConfigured`, `readable` or
+`unreadable`, keyed on whether a Keychain **item** exists. `exists` reads
+attributes only, never prompts, never blocks.
+
+This **reverses a behaviour added earlier the same day**: a dangling reference
+was counted as unreadable. There is no credential there to be unreadable, and
+saying otherwise hid the real ones.
+
+### Tests
+
+Nine for credential health, including a mixed portfolio of three readable and
+three unconfigured — 39 G Street and Test Cottage as they actually stand — and
+`UnreadableFeedCredentialStore`, whose items exist but refuse to be read, so
+the case that matters keeps failing loudly. Four for the script's messages,
+asserting both that success is reported as success and that the discredited
+text is gone.
+
+**468 tests.** Parity identical on macOS and Linux. Scanner clean. Script
+suites: migration 14/14, scanner 15/15, backup 10/10.
+
+### Not done, deliberately
+
+No rebuild, no reinstall, and **no live Keychain credential was read** — the
+fixes are verified by unit tests rather than by prompting again. The installed
+build therefore still prints the old messages until it is next rebuilt; the
+three live references, nine observations, ten classifications, two decisions,
+two publication UIDs and ten audit rows are untouched.
+
+## 26. Distribution phase — architecture, Keychain replacement, readiness (2026-11-10)
+
+Branch `feature/distribution`. Nothing rebuilt, nothing installed, no live
+credential or database touched.
+
+### The Keychain replacement exists and is tested
+
+`KeychainPolicy` → `KeychainItemSpec` → `DataProtectionFeedCredentialStore`,
+plus `CredentialMigration`. **26 tests.** Isolated: not wired into the app.
+
+Policy is deliberately separate from the `kSec*` plumbing, so the rules —
+data protection keychain, access group, accessibility class, never
+synchronised, never an ACL — are asserted on every platform including Linux,
+and the Security translation is checked once where it can run.
+
+The access group is the whole idea: a file-keychain ACL identifies code by its
+designated requirement, which here has meant the code hash, so every rebuild
+orphans every credential. An access group belongs to the signing **team**, so
+the app and its helper share one and rebuilding changes nothing. It is also
+the only scheme a sandboxed build can use, which makes this the same work as
+the App Store move rather than a separate project.
+
+`CredentialMigration` plans before it writes — every credential incident here
+came from a write whose effect nobody checked. Four outcomes per reference,
+`alreadyPresent` so it is repeatable, `sourceUnreadable` named rather than
+guessed at, and `notConfigured` kept distinct from broken. Applying it reads
+the copy back before counting it migrated, never deletes a source entry, and
+its description carries a 12-character digest rather than the value.
+
+**Blocking dependency, unchanged:** an Apple Developer Program membership.
+Without a Team ID `KeychainPolicy.isUsable` is false and the store refuses to
+write rather than creating ungrouped items only the creating binary can read —
+which would be the original bug wearing a new name.
+
+### The `vrc keychain` bug had a third instance
+
+`Scripts/build-app.sh` also grepped `vrc keychain`, a subcommand that has
+never existed. It failed silently, grep counted zero, and the installer
+reported **"all stored credentials are readable by this build"** after every
+install regardless of the truth.
+
+That is worse than the migration script's version, because it would have
+shipped as part of the install flow. All three call sites now use `vrc doctor`.
+
+### Documents
+
+* [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) — the audit as facts, the two
+  distribution paths and what actually differs, the five-stage sequence, the
+  Keychain design, and the commercial packaging plan including the free-tier
+  gate and an upgrade flow that is deliberately inert.
+* [docs/APP-STORE-READINESS.md](docs/APP-STORE-READINESS.md) — addendum
+  revising blocker 2 from "untested" to implemented, and noting that container
+  relocation is now the larger half of the sandbox move.
+
+### The sequencing argument
+
+Developer ID first, unsandboxed; then the Keychain migration under Developer
+ID where rollback is a DMG and the blast radius is one machine; then sandbox
+and the container move; then the store; then billing.
+
+Every stage is shippable and each de-risks the next. **Nothing in stages 1–3
+is wasted if the App Store never happens** — the Keychain work alone removes
+the single largest source of day-to-day breakage in this project.
+
+### Not done
+
+No membership purchased, no entitlements added, no sandbox enabled, no
+container migration written, no StoreKit, nothing submitted. PRs #10 and #11
+remain open and unmerged.
+
+## 27. The Refresh button that did nothing (2026-11-10)
+
+### The report
+
+The owner clicked Refresh on Airbnb, then on Vrbo, then on Booking.com, under
+Settings → Calendar feeds. Only Airbnb imported. They were explicit: *don't
+assume I clicked incorrectly.* They were right not to.
+
+### What the evidence said
+
+`sync_runs` held exactly one row after the `f74bbb7` install — run 290, listing
+2, 22:08:46 → 22:08:56, HTTP 200, 7 events. For listings 1 and 3 there was no
+success, **no failure, and no `listing_connection_events` row**. That last part
+is what settles it: every exit path in `ImportService.importFeed` ends in
+`try? syncRuns.record(run)`, including the disconnected and
+unreadable-credential paths. No row at all means the function was never entered.
+
+So the click was lost before the import path. The only gate between the button
+and `AppState.refresh(listing:)` was the view's own modifier:
+
+```swift
+.disabled(!hasCredential || state.isRefreshing)
+```
+
+Both branches were checked rather than assumed:
+
+* `hasCredential` was **true** for all three. All three Keychain items were
+  present — verified with an attribute-only lookup, which reads no secret and
+  therefore cannot prompt or be refused by an ACL.
+* The UI was **not** frozen. `ImportService` is a nonisolated `Sendable` struct,
+  so `await importFeed` suspends off the main actor; a sample of the running
+  process showed the main thread idle in the event loop with no Keychain or
+  import frames.
+
+That leaves `state.isRefreshing`: one app-wide flag, set for the whole of one
+feed's import. Airbnb's import held it for **ten seconds** — the owner's
+Keychain prompt was inside that window — and for those ten seconds every
+per-feed Refresh button in the application rendered disabled. SwiftUI discards
+clicks on a disabled control silently. No import, no record, no message.
+
+### The shape of the fault
+
+It is the same shape as the 4-second Keychain deadline in §23 and the
+unconditional `tombstoneMissing` in §23: **a safety mechanism that fails
+silently.** The flag existed to stop two imports running at once, which is a
+real requirement — the Keychain is a shared resource and an abandoned read
+poisons every later call in the process. What was wrong was the remedy:
+refusing the work instead of deferring it, and refusing it invisibly.
+
+### The fix
+
+[`FeedRefreshQueue`](Sources/VRCCore/Logic/FeedRefreshQueue.swift) replaces the
+flag. Two rules:
+
+1. **One feed refreshing never disables another.** `isBusy` and `state(of:)`
+   are asked about a specific listing, so only that row goes quiet.
+2. **A request is never dropped.** Imports stay strictly serial, but a request
+   that cannot start now is *queued* and run in turn. Every outcome —
+   `startNow`, `queued`, `alreadyPending` — carries an `ownerMessage`, because a
+   click with no visible answer is indistinguishable from the dead button this
+   replaced, even when coalescing it was the right thing to do.
+
+[`FeedRefreshEligibility`](Sources/VRCCore/Logic/FeedRefreshEligibility.swift)
+is the second half. A feed can wait in the queue for as long as the imports
+ahead of it take, and in that time the owner can archive a property or
+disconnect a feed. Eligibility is therefore re-checked **at the moment a queued
+feed's turn comes**, not when it was clicked; a refusal is reported and the feed
+released, never left showing "Queued" for ever.
+
+In the view, each row now shows its own `ProgressView` and reads
+`Refresh` / `Refreshing…` / `Queued` — three distinct labels, where the old
+button said "Refresh" whether it was working, waiting or dead. The status bar
+shows the live message instead of a fixed "Reading calendars…" string, which
+would otherwise hide the acknowledgement for as long as any feed was importing.
+
+The app-wide flag survives only as a computed `hasWorkInFlight`, used by the
+window's progress indicator and the two "Refresh all" controls — never by a
+per-feed control. A test asserts `FeedsView` contains no `state.isRefreshing`,
+so the mistake cannot come back unnoticed.
+
+### What is tested, and what cannot be
+
+39 tests across `RefreshQueue`, `RefreshEligibility` and
+`RefreshQueue multi-property`: rapid repeated clicks importing exactly once,
+three feeds running once each in click order, a failing feed not blocking the
+ones behind it, six feeds over two properties, a mixed property importing its
+three configured feeds and skipping its three unconfigured ones, and a property
+archived mid-queue skipping only its own feeds.
+
+**The ten-line loop in `AppState` is not unit-tested.** This project has
+Command Line Tools only, so there is no way to host the SwiftUI target in a
+test. The loop is therefore built entirely out of the primitives above —
+`request`, `finish`, `nextRunnable` — and the test harness drives those same
+shipped primitives rather than reimplementing their logic. Two source-level
+assertions cover what is left: that the queue lives on `AppState` and not in a
+view, and that `importFeed` stays non-throwing, because a `throws` there would
+unwind the serial loop on the first failure and silently abandon everything
+queued behind it — the exact class of loss this type exists to end.
+
+### Not done
+
+**The fix is not installed.** The owner's instruction was to finish it without
+reinstalling, so the running application is still `f74bbb7` and still has the
+dead button. Until it is rebuilt, the way to refresh two feeds is to click one,
+**wait for its row to finish**, then click the next — or to use Refresh all,
+which imports every feed in one pass.
+
+Also unchanged by design: `performBulkRefresh` still passes every listing to
+`importFeed`, so an unconfigured feed keeps producing its `skipped` run and its
+audit trail. Eligibility filtering applies to *queued* requests, which is what
+can go stale while waiting.
+
+### Two corrections to the earlier record
+
+* The `19:04:14` last-sync shown for Vrbo and Booking.com is a value **I**
+  wrote by hand during the install rehearsal — an integer epoch exactly three
+  hours before the 22:04:14Z launch. It is not evidence of a failed sync.
+* The two publication UIDs live on `availability_decisions.publication_uid`,
+  not in `feed_publications`, which is empty. An earlier count of "0 UIDs" was
+  a query against the wrong table.
+
+## 28. Imports now refuse what is out of service (2026-11-10)
+
+### The gap §27 left open
+
+`FeedRefreshQueue` re-checked a **queued** feed when its turn came, but that
+only protected requests travelling through the queue. A "Refresh all" pass
+walked the listing list it had captured when the pass began and handed every
+one of those listings to `importFeed`, so a property archived during the pass
+still had its calendars fetched. The per-feed path had the same hole from the
+other direction: the queue carries a `PlatformListing` **value**, captured when
+the owner clicked, so a request made before archiving could be honoured after
+it.
+
+### Where the check went, and why there
+
+Into `ImportService.importFeed`, as the first thing it does — before the
+connection-state check, before the credential is resolved, before anything is
+fetched.
+
+That is the single door every import in the system goes through: the app's
+per-feed refresh, the queue drain, the bulk pass, and the `vrc` CLI all end up
+here. `ImportService` is constructed in exactly one place
+(`RentalStore.makeImportService`), so adding `PropertyRepository` to it reaches
+every caller at once and leaves no path that can forget to ask. Putting the
+rule in the callers instead would have meant the same decision written three
+times, with the bulk pass and the queue drain free to drift apart.
+
+It also closes the race that a caller cannot. The property is read from the
+database **at the moment of the import**, not at the moment of the request, so
+a stale listing value cannot get an archived property imported.
+
+The rule itself is `FeedRefreshEligibility.propertyStatus`, shared with the
+queue's own check, so there is one definition of "out of service" rather than
+two kept in step by hand.
+
+### The audit trail, and the thing that must never happen
+
+A refusal writes an explicit `.skipped` run with a plain reason — "The property
+is archived." — plus a `recordSync` summary, so the history shows the refusal
+rather than an unexplained gap. That is the lesson of §27: a silent gap is what
+made the dead Refresh button so hard to find.
+
+**A refusal withdraws nothing.** The check returns before any reconciliation,
+so `eventsTombstoned` is 0, `eventsSeen` is 0, no observation is tombstoned and
+no classification is touched. Four tests assert this directly, including the
+worst case — archiving *every* property in the portfolio, which must not read
+as "every feed is now empty". This is the same failure mode as the
+unconditional `tombstoneMissing` of §23, and it is the one that costs real
+money: a night left on sale by mistake is recoverable, a night silently
+withdrawn is lost revenue nobody notices.
+
+Unarchiving restores importing with nothing to re-enter: the refusal reflects
+current state and is not a latch.
+
+### What the queue now defers
+
+`takeNextQueuedListing` refuses only a listing that **no longer exists** — a
+property delete cascades to its listings, so a queued id can outlive its row,
+and there is nothing left to import or even to record a run against. Everything
+else goes to `ImportService`, archived and disconnected feeds included, so that
+every refusal reaches the history through one path. Refusing them in the queue
+as well would be the same decision taken twice in two places, with only one of
+them leaving a trace.
+
+The bulk pass likewise still offers every listing and now reports "N skipped"
+in its summary line.
+
+### Verified
+
+* **557 tests**, 1824 assertions. Ten new in `Archived import`: a recorded skip
+  for an archived property; nothing withdrawn; unarchiving restores importing;
+  a property archived *after* the listing value was captured still refused;
+  disconnected and unconfigured feeds refused, recorded, withdrawing nothing;
+  Refresh all across two properties importing one and skipping the other; and
+  archiving the whole portfolio withdrawing nothing at all.
+* **Parity identical on both platforms**, `b3398471…c604f5`, unchanged — the
+  cloud handlers do not use `ImportService`, so no business-rule output moved.
+* **Secret scanner clean**, with its five baselined historical findings.
+
+One test was corrected rather than kept: the "orphaned listing" case asserted a
+state the schema makes impossible. `platform_listings.property_id` is
+`REFERENCES properties(id) ON DELETE CASCADE`, so the insert is refused and a
+delete takes the listings with it. The test now asserts that guarantee, and
+says why the defensive `property == nil` branch still exists.
+
+### Not done
+
+No rebuild, no reinstall — the running application is still `f74bbb7`, with
+neither §27's queue nor this check. No credential read or migrated, no Keychain
+change, no availability change, no AWS deployment; outbound publishing and both
+schedules remain disabled.
+
+## 29. A backup disconnected two calendars (2026-11-10)
+
+### What happened
+
+23:02:51 — `Scripts/backup-before-install.sh` ran, ahead of an approved
+installation. Its step 3 asked whether six credentials were readable, and the
+shared helper answered that question the "supported" way: by launching
+`/Applications/VacationRentalCalendar.app/Contents/MacOS/VacationRentalCalendar
+--credential-health`, which reads every credential **value** in process.
+Reading a value requires Keychain authorization.
+
+23:05:17 — the running app's hourly auto-refresh fired, mid-backup. Two code
+objects now wanted authorization for the same items in the same second:
+
+| run | listing | outcome | detail |
+|---|---|---|---|
+| 291 | 2 airbnb | disconnected | Keychain read failed (OSStatus **−128**) |
+| 292 | 3 booking_com | **success, HTTP 200, 2 events** | — |
+| 293 | 1 vrbo | disconnected | Keychain read failed (OSStatus **−128**) |
+
+`ImportService` filed −128 under "this credential cannot be read" and latched
+`credentialUnreadable`, which `shouldAttemptImport` refuses. **Airbnb and Vrbo
+stopped importing permanently because of a condition that lasted one second.**
+Booking.com, read at the same instant, returned HTTP 200 — which is the proof
+that nothing was wrong with the Keychain or with any credential.
+
+A backup — an operation whose whole purpose is to be safe to run — broke two
+live calendars.
+
+### Two defects, and the same old shape
+
+**−128 was treated as a verdict.** `errSecUserCanceled` is returned both when
+a person dismisses the dialog and when macOS cannot present one, and the
+Security framework offers nothing to tell those apart. It is a statement about
+the moment, not about the stored value. The import path asked only "was it a
+timeout?", so every other transient failure fell through to "dead credential".
+That is the four-second deadline of §23 one layer over: **a transient condition
+recorded as a settled fact.**
+
+**A health check read secrets.** The helper's own header claimed "Nothing here
+reads a secret value", and that was false whenever the app was installed.
+
+### The fixes
+
+[`KeychainFailure`](Sources/VRCCore/Platform/KeychainFailure.swift) classifies
+every status code in one place:
+
+| code | classification | retryable |
+|---|---|---|
+| −128 `errSecUserCanceled` | `authorizationCancelled` | **yes** |
+| −25308 / −25315 interaction unavailable | `interactionUnavailable` | **yes** |
+| −25293 `errSecAuthFailed` | `accessDenied` | no — re-enter the URL |
+| −25300 not found | `itemNotFound` | no |
+| anything else | `other` | no, conservatively |
+
+An unrecognised code stays non-retryable on purpose: it might be one where the
+read blocks, and a blocked read poisons every later Keychain call in the
+process. Only the cases argued for are relaxed. The codes are spelled
+numerically rather than via `errSec*` so the type compiles on Linux and the
+parity build sees the same rules.
+
+`ImportService` now asks `FeedCredentialError.isRetryableCredentialFailure`
+instead of "was it a timeout?", so a retryable failure leaves the feed
+`failing` — which is still fetched — and only a settled refusal becomes
+`credentialUnreadable`.
+
+On the distinction the brief asked for: where the platform is ambiguous this
+code says so rather than guessing. `isSettledRefusal` is deliberately **not**
+the inverse of `isRetryable`; −128 is neither retried-as-fine nor presented to
+the owner as a verdict.
+
+[`AuthorizationCooloffFeedCredentialStore`](Sources/VRCCore/Platform/AuthorizationCooloffFeedCredentialStore.swift)
+answers the obvious follow-on risk: retryable must not mean "ask again
+immediately", or one dismissed dialog becomes a dialog per feed per pass, every
+hour. After an authorization-related failure it holds off on that one reference
+for ten minutes — a fixed window, not a growing backoff, whose only job is to
+collapse a burst into one. It is outermost in the store chain so a suppressed
+read returns without even entering the deadline machinery. Presence checks are
+never held off, because they read attributes and cannot prompt. A settled
+refusal is passed straight through, since delaying it only postpones the
+message the owner needs. An explicit refresh clears it — a prompt is tolerable
+when the owner just asked for one and is not tolerable on a timer.
+
+`Scripts/credential-health.sh` was rewritten to four absolute rules: never
+execute the app or the helper, never pass `-w` to `security`, only ever ask
+whether an item exists, and never substitute a weaker check silently. Its
+vocabulary changed from `readable` to **`present`** accordingly — presence is
+all attributes can prove. Where the installed build would use the data
+protection Keychain, which no command-line tool can inspect, it reports
+**`unverified`** and says so in the manifest. An unverifiable answer beats a
+confident wrong one: reporting six live credentials as absent looks like data
+loss, and reporting them readable by reading them is the bug itself.
+
+`Scripts/build-app.sh` now refuses its post-install readability probe while the
+app is running, for the same reason.
+
+### The test that would have caught it
+
+[`Scripts/test-credential-health.sh`](Scripts/test-credential-health.sh) is not
+a grep. It points the scripts at a **decoy** bundle whose executable records
+that it ran, takes a real backup against a throwaway copy of the database, and
+asserts the decoy was never executed, that no connection state changed, that
+every reference was still recorded, and that no feed URL reached the backup.
+Verified to fail against the old helper: asked for one credential's status, the
+old code executed `--credential-health`; the new code executes nothing.
+
+### Verified
+
+* **574 Swift tests**, 1869 assertions (17 new in `Keychain cancellation`).
+* Shell suites: credential-health 13/13, backup-restore 10/10, scanner 15/15,
+  migrate-credentials 14/14, profile-inspector 7/7.
+* Parity `b3398471…c604f5`, identical on macOS and Linux, unchanged.
+* Secret scanner clean, five baselined historical findings.
+
+### Still broken, and deliberately not touched
+
+**Listings 1 (vrbo) and 2 (airbnb) remain `credential_unreadable` in the live
+database.** The code fix prevents the latch forming again; it does not undo one
+already written. Recovery is proposed in the report and awaits separate
+approval. The database was not restored and no connection history was
+overwritten — the verified 23:02:51 backup, taken before the damage, is kept
+as it is.
+
+Nothing was installed. The running application is still `f74bbb7`, which
+contains neither this fix nor §27's queue nor §28's out-of-service check.
+
+## 30. Rehearsal isolation, enforced rather than assumed (2026-11-10)
+
+### The mistake this closes
+
+Rehearsing the connection-state recovery of §29, I "isolated" it by pointing
+`HOME` at a temporary directory and copying the database there. On macOS
+`FileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)` does
+**not** consult `HOME`, so `vrc` opened the real database and performed the
+change on production. Two live feeds moved from `credentialUnreadable` to
+`failing` without approval.
+
+The rehearsal's own before/after comparison showed nothing, because it was
+reading the copy — the wrong file. That is the part worth dwelling on: the
+check that was supposed to catch this was looking somewhere the write never
+went.
+
+**An environment variable is not isolation.** Isolation is only established by
+resolving the path that will actually be opened and proving it is not the live
+one.
+
+### The guard
+
+`RehearsalIsolation` already existed, for publication rehearsals, and was close
+— but it compared `standardizedFileURL` paths as strings. Three ways to name
+the live database got past that, each now closed:
+
+1. **Symlinks** are resolved. `/tmp` is a symlink to `/private/tmp`, so a
+   scratch file has two spellings — and far worse, a link inside a temporary
+   directory can point straight at production.
+2. **`.` and `..`** are collapsed, so traversal cannot walk back into the
+   support directory from somewhere that looked safe.
+3. **Case is folded for comparison.** APFS is case-insensitive by default, so
+   two spellings differing only in case are one file. Case is *not* folded in
+   the message, because a refusal must quote the path the caller actually gave.
+
+Also refused: the support directory itself, anything inside it (the WAL and
+shared-memory files hold recent writes; the backups live there too), and the
+directory beside an injected production path. `:memory:` is the one
+unconditionally safe answer. The stance is `DestructiveTestIsolation`'s: **fail
+closed** — the question is "has this proved itself disposable?", never "is
+there a reason to worry?".
+
+`RehearsalMode` is separate and answers a different question: not "is this path
+safe?" but "may I fall back to the default path at all?" In a rehearsal the
+answer is no, because the default path *is* production. So forgetting to pass
+a database is a refusal instead of a write to the real one.
+
+### Where it is enforced
+
+* **`vrc`** gains `--database <path>`, verified before the file is opened, and
+  honours `VRC_REHEARSAL`. Every invocation now prints the resolved database
+  path on stderr — the single line that would have made this mistake obvious
+  in a glance rather than after the write.
+* **`Fixtures.temporaryDatabasePath()`** verifies the path it is about to hand
+  out and `fatalError`s rather than return one that is not isolated. Every
+  file-backed Swift test comes through there, so that is the chokepoint.
+* **`backup-before-install.sh`** resolves its support directory with `pwd -P`
+  and refuses in rehearsal mode if it is the live one. `VRC_SUPPORT_DIR` being
+  set is not proof of anything — it can be set to the live directory.
+* **The shell suites** — backup/restore, credential migration, credential
+  health — now export `VRC_REHEARSAL`, so a forgotten redirection in any of
+  them is a refusal.
+* **Publication rehearsals** already went through `RehearsalIsolation` and
+  inherit every improvement above.
+
+### The tests that do the dangerous thing on purpose
+
+`Scripts/test-rehearsal-isolation.sh` aims state-changing commands straight at
+the live database and requires a refusal: the exact `vrc connection` command
+that caused the incident, a symlink to the live database, traversal into the
+support directory, the write-ahead log, and a missing `--database` in rehearsal
+mode. It then proves the guard is still *usable* — a disposable copy is
+accepted and the change lands there — and ends with a **tripwire**: the live
+database is checksummed before and after, with its connection states and
+history row count, and the suite fails loudly if a single byte moved.
+
+15 shell cases, 15 Swift cases. The Swift ones are classification-only against
+the real path, so nothing opens or writes it.
+
+### Verified
+
+* **589 Swift tests**, 1899 assertions.
+* Shell: rehearsal-isolation 15/15, credential-health 15/15, backup-restore
+  10/10, scanner 15/15, migrate-credentials 14/14, profile-inspector 7/7.
+* Parity `b3398471…c604f5`, identical macOS and Linux, unchanged.
+* Scanner clean, five baselined historical findings.
+* Tripwire: live database unchanged — listings 1 and 2 `failing`, 3
+  `connected`, 59 connection events, max sync run 293.
+
+### Deliberately not done
+
+**The two connection-state entries from §29 are preserved exactly, including
+their incorrect `actor owner` labels.** They were written by my command, not by
+the owner. Correcting them needs an append-only entry and separate approval;
+nothing has been reversed or rewritten.
+
+No credential was read or modified, no reservation touched, nothing installed,
+no AWS change, outbound publishing still disabled.
+
+## 31. Why every refresh asks for Keychain permission (2026-11-10)
+
+### The cause: ACL partitions are keyed by code hash
+
+The read-governing ACL entry on each credential carries a second gate besides
+the trusted-application list — a **partition list**, which macOS 10.12
+introduced. Access requires passing *both*. Decoding ours:
+
+```
+<key>Partitions</key>
+<array>
+  <string>cdhash:8395a6989f0bccc6edf0f655cb0e2ba2629c4cd2</string>
+  <string>cdhash:d3e1d4dafb2d08975e6f306584255a344e55057b</string>
+  <string>cdhash:e7e564505e8105cc0953c734147cdbe3d23cf32f</string>
+</array>
+```
+
+Every entry is a **`cdhash:`** — the hash of one specific binary. Matching the
+hashes against the bundles still on disk tells the whole story:
+
+| cdhash | build |
+|---|---|
+| `d3e1d4da…` | the app in `Backups/20261110T195724Z` |
+| `b5a12598…` | the app in `Backups/20261110T215716Z` (`908c588`) |
+| `e842748d…` | `f74bbb7` |
+| `092784bf…` | **`86c31a9`, installed now — in no partition list** |
+| `8395a698…`, `e7e56450…` | builds no longer on disk |
+
+Each partition list is a graveyard of per-build hashes, one added per "Always
+Allow" click. **Always Allow does persist — but only for the exact binary that
+asked.** A rebuild changes the code hash, so the grant it earned stops
+matching and macOS asks again. We have rebuilt many times today; each rebuild
+invalidated every grant earned before it.
+
+The trusted-application half is fine, incidentally: it names
+`/Applications/VacationRentalCalendar.app` and the helper, matched by
+designated requirement, which is stable. It is the partition list that breaks.
+
+Why `cdhash:` and not `teamid:`? Because the app is signed with a **self-signed
+certificate that carries no team identifier**. macOS has nothing stable to
+attribute the code to, so it falls back to the hash. A build signed with the
+Apple Developer ID certificate gets `teamid:26JLFSV9YS`, which does not change
+when the binary does.
+
+### What this independently confirms
+
+It also explains §29 better than I did at the time. Under `f74bbb7`
+(`e842748d…`), Booking.com's partition list **contained** that hash — and
+Booking.com was the feed that kept returning HTTP 200. Airbnb's and Vrbo's did
+not, so their reads required authorization, it was cancelled, and −128 came
+back. I attributed that to contention with my backup's concurrent read. The
+contention was real but secondary: **the prompt was required regardless.**
+
+The new build proved it live at 23:50, two minutes after installation:
+
+```
+294  listing 2  failure  OSStatus -128  tombstoned 0  failing -> failing
+295  listing 1  failure  OSStatus -128  tombstoned 0  failing -> failing
+```
+
+Which is the §29 fix working exactly as intended — retryable, nothing
+withdrawn, no latch — on top of a prompt that should never have been needed.
+
+### Which credentials prompt
+
+**Both, and a third case.** All under service `com.vacationrentalcalendar.feed-url`:
+
+| secret | partition list | can the app read it? |
+|---|---|---|
+| 3 feed URLs (`…-v6`, `…-v3`) | `cdhash:` × 3–4 | only the exact listed builds |
+| `aws-access-key-id`, `aws-secret-access-key` | `cdhash:` × 3 | same, plus `/usr/bin/security` is trusted |
+| `feed-key-1-booking_com-v1` | `apple-tool:` | **no — only `/usr/bin/security`** |
+
+So a full cycle can ask up to five times. The outbound feed token is worse than
+stale: the application has never been on its access list at all.
+
+### The inventory problem a migration would have walked into
+
+Auditing the Keychain found 18 items, six of them active — and **only three
+have a database row**:
+
+* the three feed URLs are referenced by `platform_listings.credential_ref`
+* `aws-access-key-id` and `aws-secret-access-key` appear in no table
+* `feed-key-1-booking_com-v1` appears nowhere — `feed_tokens` is **empty**
+
+A migration enumerating listings, which is the obvious way to write one, would
+have carried three secrets and silently left three behind: the cloud service
+losing its credentials, and an outbound token that **cannot be reproduced**
+because Booking.com is already subscribed to the URL containing it.
+
+`CredentialInventory` encodes the rule — **enumerate the source, not the
+database.** The Keychain is the authority on what exists; the database only
+says what is referenced. Anything present is migrated, including the 12
+superseded entries that a rollback reads, and anything referenced but absent
+is a stop condition. The three Test Cottage listings reference names that were
+never stored, so the live inventory is currently **not** safe to migrate until
+that is resolved.
+
+### What is already proven, on this machine, today
+
+`Scripts/test-keychain-integration.sh` — **23/23**, with disposable
+credentials, a disposable database and real Developer ID signing plus the
+embedded provisioning profile:
+
+* **B. Ten repeated rebuilds, no prompts.** Ten distinct code hashes all read
+  the same data-protection item, slowest read 0.25s. This is the fix, measured:
+  the thing that breaks every rebuild today does not break at all there.
+* A. survives a rebuild · C. two differently named bundles share access via the
+  access group · D. a fresh process after the writer exited · E. under full CPU
+  load, 0.05s, far inside the 20s deadline · F. in-place application update ·
+  G. migration with a disposable database · H. rollback, and re-migration after
+  a rollback.
+
+### Not done
+
+No live credential read, migrated or modified. No reinstall. No connection
+state altered. The two incorrect `actor owner` entries still stand.
+
+## 32. Preparing the Developer ID and data protection transition (2026-11-10)
+
+### The inventory fix
+
+`CredentialInventory` treated the three Test Cottage placeholder references as
+missing secrets, which made the entire live inventory unmigratable over three
+listings that have never been set up. The distinction is now strict and
+evidenced:
+
+* **unconfigured** — a listing carrying a reference name nothing was ever
+  stored under. Normal. Nothing to find, nothing to lose, not a blocker.
+* **configured but missing** — a listing that *did* have a credential whose
+  Keychain item is gone. A real secret lost. **Still a stop condition.**
+
+`wasConfigured` decides, from evidence rather than from the reference string —
+which proves nothing, since every listing is created with one. Evidence is: a
+URL in the database, an import that actually succeeded, or a connection state
+only reachable after a credential existed (`FeedConnectionState.impliesStoredCredential`:
+connected, failing, revoked, disconnectedByOwner, credentialUnreadable).
+`unknown` and `notConfigured` are where a listing starts and so prove nothing.
+
+Anything **present** in the Keychain travels regardless of classification: a
+placeholder with a value is a secret, not a placeholder, so classification can
+never be the reason something is left behind.
+
+The live inventory is now **safe to migrate**: 3 configured, 3 unconfigured, 18
+items to carry, 0 blockers.
+
+### Verified: Developer ID + profile + data protection, in the real bundle
+
+`dist-developer-id/VacationRentalCalendar.app`, built and signed but **not
+installed**:
+
+```
+Authority=Developer ID Application: hitesh tara (26JLFSV9YS)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+team-signed true · running-team 26JLFSV9YS · data-protection true
+access-group 26JLFSV9YS.com.vacationrentalcalendar.shared
+```
+
+The embedded entitlement carries the resolved access group and the
+provisioning profile is embedded before signing.
+
+**The designated requirement changes**, and this matters:
+
+| build | designated requirement |
+|---|---|
+| installed (local cert) | `identifier "…app" and certificate root = H"5828da64…"` |
+| Developer ID | `identifier "…app" and anchor apple generic and … certificate leaf[subject.OU] = "26JLFSV9YS"` |
+
+The new one is anchored to Apple and the team OU, so it survives rebuilds *and*
+certificate renewal. But it does **not** satisfy the old one, so the legacy
+items' trusted-application entries — recorded against the local-cert
+requirement — will not match the Developer ID build. Combined with the
+`cdhash:` partitions of §31, that means **the first read of each legacy secret
+under the new identity will require authorization.** That is unavoidable: only
+the owner can unlock those items for a new code identity. It happens once.
+
+### The outbound token needs its own path
+
+`feed-key-1-booking_com-v1` trusts only `/usr/bin/security`, partition
+`apple-tool:`. The app has never been able to read it, and unlike a feed URL it
+cannot be re-entered — Booking.com is already subscribed to the URL containing
+it, so re-issuing means handing the platform a new URL.
+
+`SecretImport` plus the app's new `--import-secret <reference>` mode handle it.
+The value arrives on **stdin only** — never an argument, because a command line
+is visible in `ps` and recorded in shell history. Nothing is echoed; only a
+12-character digest is printed. An empty or whitespace-only value is **refused
+rather than written**, so a cancelled upstream read cannot destroy a credential
+by overwriting it with nothing. The write is verified by reading it back and
+comparing digests, and the legacy entry is never read, altered or deleted.
+
+### Rehearsed, with disposable credentials only
+
+`Migration rehearsal`, 12 cases over an 18-reference set shaped like the live
+one (3 feed URLs, 2 AWS keys, 1 outbound token, 12 superseded entries), every
+value an obvious fake:
+
+* all 18 migrate in one run; all four secret classes arrive, not just the feeds
+* the legacy store is byte-identical afterwards — migration **copies**
+* a partial failure (`-34018` on three references) is counted per reference,
+  loses nothing, and the sources stay readable
+* retrying after a partial failure completes the set and leaves the already
+  migrated ones alone
+* running twice migrates nothing the second time
+* a reference with nothing behind it is `notConfigured`, not a failure
+* an unreadable source is named for re-entry, never copied as an empty value
+* rollback removes the copies and leaves every legacy secret; the layered store
+  then serves from legacy again
+* no reference name changes anywhere, so no platform URL changes
+* a plan is printable and contains no value
+
+Plus `test-keychain-integration.sh` **23/23** on real hardware, including
+**ten rebuilds with no prompts** — the measured proof that the §31 cause is
+gone.
+
+### The live migration plan
+
+Prerequisites: notarytool profile `vrc-notary` does not exist yet (only needed
+to notarize). Nothing below is approved.
+
+1. **Quit the app.** Verify no process and no helper.
+2. **Backup** with `Scripts/backup-before-install.sh` (0.5s, attributes only,
+   executes nothing). Verify `integrity_check ok`, row counts, no feed URL.
+3. **Record the inventory** — 18 items, 6 active, 0 blockers. **Stop if the
+   count is not 18 or any configured reference is missing.**
+4. **Install the Developer ID build** from `dist-developer-id/`. Expect the
+   designated requirement to change; this is a deliberate identity change, not
+   a mismatch to stop on.
+5. **Launch and confirm** `team-signed true`, `data-protection true`, access
+   group `26JLFSV9YS.com.vacationrentalcalendar.shared`.
+6. **Migrate.** Expect **up to six one-time Keychain prompts** — one per
+   secret, because the new identity is not yet on any legacy ACL. Approve each.
+   **Stop** if a prompt is refused, if any step reports `sourceUnreadable`, or
+   if `-34018` appears (entitlement not authorized).
+7. **The outbound token**, which the app cannot read, via
+   `security … -w | VacationRentalCalendar --import-secret feed-key-1-booking_com-v1`.
+   One prompt, piped, never printed. **Stop** if the digest does not verify.
+8. **Verify no prompts.** Refresh all three feeds — expect HTTP 200 with
+   Airbnb 7, Vrbo 3, Booking.com 2, and **no dialog**. Then quit, relaunch,
+   refresh again — still no dialog.
+9. **Prove the class of bug is gone:** rebuild, reinstall, refresh. No prompt.
+   This is the step that distinguishes this from every previous fix.
+10. **Confirm preservation** — 18 Keychain items still present, all 6 active
+    readable, January reservation, classifications, decisions, both UIDs, audit
+    history, and connection states unchanged.
+
+**Rollback**, verified in rehearsal: delete the data-protection copies. The
+layered store falls through to the legacy entries, which were never touched,
+and refreshes continue exactly as before. Reinstall the local-cert build from
+`Backups/20261110T234504Z` to return the previous identity. No credential is
+re-entered, nothing is rotated, and the Booking.com feed URL never changes.
+
+### Not done
+
+No live credential read, migrated or modified. No reinstall — the running app
+is still `86c31a9`. No connection state altered. The Developer ID bundle exists
+only in `dist-developer-id/`.
+
+## 33. The consolidated migration runbook (2026-11-11)
+
+[docs/MIGRATION-RUNBOOK.md](docs/MIGRATION-RUNBOOK.md) — twelve steps, each
+with explicit stop conditions, plus a verified rollback. Awaiting approval;
+nothing in it has been executed.
+
+### Three gaps the runbook exposed
+
+Writing it as *executable* steps rather than prose turned up two missing
+pieces and one stale artefact.
+
+**`CredentialMigration` had no production caller at all.** It was fully tested
+and wired to nothing, so there was no command to run the migration with.
+`--migrate-credentials` now exists on the main application — the only code
+object that can use the data protection Keychain, since the entitlement cannot
+be carried by a bare executable, which rules out the `vrc` helper.
+
+**The completeness gate was not runnable.** `MigrationCompleteness` existed but
+nothing surfaced it, so step 8 had nothing to call. `--migration-status` now
+reports it without migrating.
+
+**The Developer ID bundle predated the dark-wake fix.** It was built at
+19:10 on 2026-11-10; the `-25320` classification landed in `acc0a2a` the next
+morning. The earlier preflight therefore passed against a build that would have
+latched all three feeds again on the next Power Nap. Rebuilt: CFBundleVersion
+96, CDHash `50eb2e030765dbb8ad5afed0d41a1212d2df1f90`, clean tree at `acc0a2a`.
+The fix is verified **present in the signed binary by its own strings** —
+`nowhere to show the request`, `known verdict about the saved URL`,
+`MIGRATION INCOMPLETE` — and absent from the installed build, rather than
+inferred from the commit date.
+
+### Exercised against the real Keychain, without reading anything
+
+`--migration-status` enumerated all 18 legacy items attributes-only, checked the
+destination, reported `not migrated — using the legacy Keychain` with 18
+outstanding, and exited 1. **No authorization dialog**, confirmed against
+`SecurityAgent`, `authd` and `coreauthd` logs.
+
+`KeychainFeedCredentialStore.allReferences()` does the enumeration with
+`kSecReturnAttributes` and no `kSecReturnData`, so it reads no value and cannot
+prompt. It is inside `#if canImport(Security)`, so Linux never compiles it.
+
+### Attribution, corrected in advance
+
+Step 9's connection-state recovery uses
+`--actor assistant-on-owner-approval`, not `owner`. The two rows at
+`2026-11-10 23:30:14` carry `actor owner` incorrectly — they were my command,
+not the owner's. They are left exactly as written; correcting them needs its own
+append-only entry and separate approval.
+
+### Verification, and one gap in it
+
+635 Swift tests, 2179 assertions · preflight `READY`, 0 blockers, re-run against
+the rebuilt bundle · scanner clean · **macOS parity `b3398471…c604f5`,
+unchanged**.
+
+**Linux parity is UNVERIFIED for `f5d4553`.** Docker lost DNS, so
+`libsqlite3-dev` could not be installed and the Linux build failed with
+`could not build C module 'CSQLite'`. The commit message for `f5d4553` claims
+both platforms agree; that claim was not earned and this section is the
+correction. The structural argument is that the only `VRCCore` change is
+`allReferences()`, which sits inside `canImport(Security)` and so is not
+compiled on Linux at all — but an argument is not a measurement. **Re-run
+`Scripts/check-parity.sh` before any deploy.**
+
+## 34. Runbook corrections, and two bugs they turned up (2026-11-11)
+
+Four requested adjustments to [docs/MIGRATION-RUNBOOK.md](docs/MIGRATION-RUNBOOK.md),
+plus a guard on the migration command itself. Still unexecuted.
+
+### Order — already right, now enforced
+
+The runbook already ran quit → backup → inspect → install. Rather than restate
+it, the rule is now **mechanical**: `Scripts/install-developer-id.sh` refuses to
+copy anything unless no copy is running, a verified backup exists holding
+**both** the database and the bundle being replaced (matched by CDHash, so a
+stale backup is refused), and the preflight passes. Checked with the GUI up, it
+stops at the first gate.
+
+"Never install before backup" matters because an install replaces the only copy
+of the bundle a rollback needs.
+
+### Rollback deletes nothing
+
+Previously step 1 of rollback was "delete the data protection copies". It no
+longer deletes anything — **all 18 legacy items and every data-protection copy
+survive.**
+
+It needs no deletion because of how the store is selected:
+`CredentialStoreSelection.shouldUseDataProtection` is true only for code signed
+by team `26JLFSV9YS`, so reinstalling the local-certificate build makes the app
+select the **legacy store alone**. The copies left in the data protection
+Keychain are inert, not in the way — and deleting them would destroy the work
+for no benefit and force it to be redone.
+
+Rollback assets verified usable today: the preserved bundle passes
+`codesign --verify --deep --strict`, its designated requirement matches what is
+installed, and the backup database passes `integrity_check` with 12 events, 13
+classifications, 2 decisions, 2 UIDs, 10 audit rows and the January reservation
+present.
+
+### The rebuild test is now separate
+
+Rebuilding and reinstalling immediately after a migration would change two
+things at once and leave no clean state to roll back to. The live migration now
+ends at step 11 (quit, relaunch, refresh, no prompt). The different-code-hash
+test is its own section, to be run after the migration has been stable through
+at least one overnight Power Nap.
+
+### Linux parity — verified
+
+`b3398471…c604f5`, identical on both platforms. The earlier failure was Docker
+Desktop losing name resolution in containers: `apt-get` could not reach
+`ports.ubuntu.com`, `libsqlite3-dev` was never installed, and the build died
+with `could not build C module 'CSQLite'`, which reads like a source fault and
+is not one. `Scripts/check-parity.sh` now passes `--dns 1.1.1.1`, so it is
+fixed rather than diagnosed again.
+
+### Two bugs found by testing the guard instead of trusting it
+
+The migration command must not launch a window or start background imports. The
+mode runs in `init()` and exits before any scene body is built, so the
+`@StateObject` holding `AppState` — and its refresh timer — is never created.
+That part held. But a running copy's timer is the real hazard, so the writing
+modes now refuse outright if another instance is running (exit 7).
+
+**The guard did not work when written.** It used
+`NSRunningApplication.runningApplications(withBundleIdentifier:)`, which
+answered "nothing is running" from a command-line invocation — it needs a
+window-server connection the process does not have — so it passed silently with
+the GUI up, which is precisely what it exists to prevent. It now uses `libproc`
+and compares resolved executable names, which sees every process however this
+one was launched. Retested with the GUI running: refused, pid named.
+
+**And the failed test wrote a real item.** Because the guard passed, the probe
+went on to store `rehearsal-guard-probe` in the live data protection Keychain,
+and there was no supported way to remove it. `--delete-rehearsal-secret` now
+exists and **refuses any reference not beginning with `rehearsal-`**, so it
+cannot reach a production credential however it is invoked. The stray item is
+deleted; confirmed absent.
+
+### Verified
+
+635 Swift tests, 2179 assertions · keychain integration 23/23 · isolation
+15/15 · credential-health 15/15 · backup-restore 10/10 · migration 14/14 ·
+preflight `READY` · parity identical on macOS and Linux · scanner clean.
+
+Nothing installed, migrated or cleared. No live credential value read.

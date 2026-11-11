@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(Security)
 import Security
+#endif
 
 /// A platform iCal export URL is a credential, not a setting.
 ///
@@ -28,17 +30,68 @@ public enum FeedCredentialError: Error, LocalizedError {
     case keychainFailure(OSStatus, String)
     case timedOut
     case notFound(reference: String)
+    /// We declined to attempt the read, because a recent attempt had its
+    /// authorization cancelled and asking again would only produce another
+    /// dialog. Our own decision, not the platform's answer — so it is always
+    /// retryable and must never be read as evidence about the credential.
+    case authorizationSuppressed(retryAt: Date)
+
+    /// How this failure should be recorded: something a later refresh could
+    /// get past, or a settled fact about the credential.
+    ///
+    /// The single place that question is answered. It used to be asked inline
+    /// in `ImportService` as "was it a timeout?", which meant every other
+    /// transient failure — a cancelled authorization above all — was filed as
+    /// a dead credential and never retried.
+    public var isRetryableCredentialFailure: Bool {
+        switch self {
+        case .timedOut, .authorizationSuppressed: return true
+        case .keychainFailure(let status, _): return KeychainFailure.of(status).isRetryable
+        case .notFound: return false
+        }
+    }
+
+    /// The classification, where there is a status code to classify.
+    public var keychainFailure: KeychainFailure? {
+        if case .keychainFailure(let status, _) = self { return KeychainFailure.of(status) }
+        return nil
+    }
+
+    /// One line for the feed row.
+    public var shortSummary: String {
+        switch self {
+        case .timedOut:
+            return "The Keychain did not answer in time — will try again"
+        case .authorizationSuppressed:
+            return "Not asking for Keychain permission again yet — will try again"
+        case .keychainFailure(let status, _):
+            return KeychainFailure.of(status).shortSummary
+        case .notFound:
+            return "No calendar URL configured."
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
         case .keychainFailure(let status, let operation):
-            return "Keychain \(operation) failed (OSStatus \(status))."
+            let failure = KeychainFailure.of(status)
+            return "Keychain \(operation) failed (OSStatus \(status)). \(failure.explanation)"
+        case .authorizationSuppressed(let retryAt):
+            return "The Keychain authorization was cancelled a moment ago, so this read "
+                + "was not attempted again — repeating it would only raise another "
+                + "dialog. It will be tried again after "
+                + "\(retryAt.formatted(date: .omitted, time: .shortened))."
         case .notFound(let reference):
             return "No feed URL is stored under \"\(reference)\"."
         case .timedOut:
-            return "The Keychain did not answer in time. macOS is probably waiting for you to "
-                + "approve access — look for a \"Vacation Rental Calendar wants to use your "
-                + "confidential information\" prompt and choose Always Allow."
+            return "This feed URL cannot be read, and macOS will not offer to fix it.\n\n"
+                + "The Keychain item's access list names an older build of this app by its "
+                + "code hash. The app has since been signed with a certificate, so its hash "
+                + "changed and no longer matches. macOS does not prompt in this situation — it "
+                + "simply refuses — so there is no dialog to approve.\n\n"
+                + "Fix it by entering the URL again under Feeds. It is saved under a fresh "
+                + "Keychain entry owned by the current app, and the old entry is left untouched. "
+                + "Nothing is deleted and no credential is regenerated."
         }
     }
 }
@@ -61,6 +114,7 @@ public enum FeedCredentialError: Error, LocalizedError {
 ///    hash, which changes on every rebuild, so every rebuild asks again. Signed
 ///    with a real or self-signed certificate, the requirement is tied to the
 ///    certificate instead and survives rebuilds. See `Scripts/setup-signing.sh`.
+#if canImport(Security)
 public struct KeychainFeedCredentialStore: FeedCredentialStore {
     public let service: String
     /// Extra executables added to each new item's ACL, so one grant covers both
@@ -165,6 +219,32 @@ public struct KeychainFeedCredentialStore: FeedCredentialStore {
         }
     }
 
+    /// Every reference stored under this service, by name.
+    ///
+    /// Attributes only — `kSecReturnAttributes` without `kSecReturnData` — so
+    /// it reads no value, requests no authorization and cannot prompt.
+    ///
+    /// The migration enumerates THIS rather than the database, because the
+    /// Keychain is the authority on what exists: of the six live secrets only
+    /// three are referenced by any table, and a listings-driven migration
+    /// would silently leave the AWS keys and the Booking.com outbound token
+    /// behind.
+    public func allReferences() -> [String] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let items = result as? [[String: Any]] else { return [] }
+        return items
+            .compactMap { $0[kSecAttrAccount as String] as? String }
+            .filter { !$0.isEmpty }
+            .sorted()
+    }
+
     /// Whether an item exists, without reading its contents. Checking presence
     /// does not need ACL approval, so this never prompts and is safe to call
     /// while drawing the UI.
@@ -184,7 +264,15 @@ public struct CodeSignatureInfo: Sendable {
         case adHoc
         case certificate
 
-        public var survivesRebuild: Bool { self == .certificate }
+        /// Whether the code's *identity* is stable across rebuilds.
+        ///
+        /// NOT whether Keychain access survives one. It does not: items are
+        /// written with `SecTrustedApplicationCreateFromPath`, which pins the
+        /// binary's code hash at the moment of writing, so a rebuild loses
+        /// access even when the certificate and designated requirement are
+        /// byte-identical. Conflating the two caused a real outage — an app
+        /// update silently disconnected every platform feed.
+        public var identityIsStable: Bool { self == .certificate }
     }
 
     public var kind: Kind
@@ -243,6 +331,7 @@ public struct CodeSignatureInfo: Sendable {
         return CodeSignatureInfo(kind: .certificate, identifier: identifier, authority: authority)
     }
 }
+#endif // canImport(Security)
 
 // MARK: - In memory (tests)
 
@@ -283,7 +372,15 @@ public final class DeadlineFeedCredentialStore: FeedCredentialStore, @unchecked 
     private let wrapped: FeedCredentialStore
     private let timeout: TimeInterval
 
-    public init(wrapping wrapped: FeedCredentialStore, timeout: TimeInterval = 4) {
+    /// The bound exists so an abandoned authorisation prompt cannot freeze the
+    /// app forever. Four seconds was too tight: on a busy machine an ordinary
+    /// read exceeded it, and the timeout was misread as a broken credential,
+    /// which silently disconnected three working feeds for an hour. Twenty
+    /// still prevents a frozen app and no longer trips on load.
+    public static let defaultTimeout: TimeInterval = 20
+
+    public init(wrapping wrapped: FeedCredentialStore,
+                timeout: TimeInterval = DeadlineFeedCredentialStore.defaultTimeout) {
         self.wrapped = wrapped
         self.timeout = timeout
     }
@@ -340,5 +437,89 @@ private final class ResultBox<T>: @unchecked Sendable {
     var value: Result<T, Error>? {
         lock.lock(); defer { lock.unlock() }
         return stored
+    }
+}
+
+
+/// A credential store whose items EXIST but cannot be read.
+///
+/// Models the situation this project keeps hitting: a Keychain item whose
+/// access list names a build that no longer exists, so `exists` succeeds and
+/// the read fails. Test-only, and in VRCCore rather than the test target so
+/// the Linux build compiles it too.
+public final class UnreadableFeedCredentialStore: FeedCredentialStore, @unchecked Sendable {
+    private let present: Set<String>
+    public init(presentReferences: [String]) { self.present = Set(presentReferences) }
+
+    public var storageDescription: String { "unreadable (test only)" }
+    public func save(url: String, reference: String) throws {}
+    public func delete(reference: String) throws {}
+    public func exists(reference: String) -> Bool { present.contains(reference) }
+
+    public func url(reference: String) throws -> String? {
+        guard present.contains(reference) else { return nil }
+        throw FeedCredentialError.keychainFailure(-25293, "read")
+    }
+}
+
+
+/// A credential store whose reads never return in time.
+///
+/// Models the real failure of 2026-11-10: the machine was busy, a Keychain
+/// read exceeded `DeadlineFeedCredentialStore`'s limit, and the timeout was
+/// classified as "this build cannot read its credentials" — a latched state
+/// that stops all further attempts. Three working feeds went silent and a
+/// genuine Airbnb reservation went unseen for an hour.
+///
+/// Test-only, and in VRCCore rather than the test target so Linux compiles it.
+public final class TimingOutFeedCredentialStore: FeedCredentialStore, @unchecked Sendable {
+    public init() {}
+    public var storageDescription: String { "times out (test only)" }
+    public func save(url: String, reference: String) throws {}
+    public func delete(reference: String) throws {}
+    public func exists(reference: String) -> Bool { true }
+    public func url(reference: String) throws -> String? {
+        throw FeedCredentialError.timedOut
+    }
+}
+
+
+/// A credential store that fails a fixed number of times, then works.
+///
+/// Models the transient conditions the app must ride out rather than latch
+/// on: a busy machine, a Keychain call during wake-from-sleep, a first read
+/// after a long idle period. Test-only, and in VRCCore so Linux compiles it.
+public final class FlakyFeedCredentialStore: FeedCredentialStore, @unchecked Sendable {
+    private let wrapped: FeedCredentialStore
+    private let failures: Int
+    private let error: FeedCredentialError
+    private var attempts = 0
+    private let lock = NSLock()
+
+    public init(
+        wrapping wrapped: FeedCredentialStore,
+        failingFirst failures: Int,
+        with error: FeedCredentialError = .timedOut
+    ) {
+        self.wrapped = wrapped
+        self.failures = failures
+        self.error = error
+    }
+
+    public var attemptCount: Int { lock.lock(); defer { lock.unlock() }; return attempts }
+    public var storageDescription: String { "flaky (test only)" }
+    public func save(url: String, reference: String) throws {
+        try wrapped.save(url: url, reference: reference)
+    }
+    public func delete(reference: String) throws { try wrapped.delete(reference: reference) }
+    public func exists(reference: String) -> Bool { wrapped.exists(reference: reference) }
+
+    public func url(reference: String) throws -> String? {
+        lock.lock()
+        attempts += 1
+        let shouldFail = attempts <= failures
+        lock.unlock()
+        if shouldFail { throw error }
+        return try wrapped.url(reference: reference)
     }
 }

@@ -3,8 +3,8 @@ import Foundation
 /// Small key/value store for app preferences that belong with the data rather
 /// than in UserDefaults (refresh interval, export window, the outbound gate).
 public struct SettingsRepository: Sendable {
-    let database: Database
-    public init(database: Database) { self.database = database }
+    let database: DataStore
+    public init(database: DataStore) { self.database = database }
 
     public func set(_ key: String, _ value: String) throws {
         try database.run("""

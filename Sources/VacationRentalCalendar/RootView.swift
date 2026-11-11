@@ -30,7 +30,7 @@ struct RootView: View {
     private var sidebar: some View {
         List(selection: $state.selectedPropertyID) {
             Section("Properties") {
-                ForEach(state.properties) { property in
+                ForEach(state.activeProperties) { property in
                     HStack(spacing: 7) {
                         Image(systemName: "house")
                         VStack(alignment: .leading, spacing: 1) {
@@ -94,9 +94,9 @@ struct RootView: View {
         case .review:
             let count = state.reviewQueue.count
             return count > 0 ? ("\(count)", .orange) : nil
-        case .conflicts:
-            let count = state.doubleBookingCount
-            return count > 0 ? ("\(count)", .red) : nil
+        case .availability:
+            let count = state.pendingDecisions.count
+            return count > 0 ? ("\(count)", .blue) : nil
         default:
             return nil
         }
@@ -108,12 +108,13 @@ struct RootView: View {
     private var detail: some View {
         VStack(spacing: 0) {
             switch state.selectedSection {
+            case .portfolio: PortfolioView()
             case .calendar: calendarPane
             case .review: ReviewView()
-            case .conflicts: ConflictsView()
-            case .export: ExportView()
-            case .feeds: FeedsView()
-            case .history: SyncHistoryView()
+            case .reservations: ReservationsView()
+            case .availability: AvailabilityPane()
+            case .cloud: CloudPane()
+            case .settings: SettingsPane()
             }
             statusBar
         }
@@ -144,7 +145,38 @@ struct RootView: View {
                     .frame(width: 150, alignment: .trailing)
                     .monospacedDigit()
             }
-            .padding(10)
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 6)
+
+            HStack(spacing: 12) {
+                Toggle(isOn: $state.showPlatformRestrictions) {
+                    Text("Show platform restrictions").font(.callout)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+                if state.hiddenRestrictionCount > 0 {
+                    Text("\(state.hiddenRestrictionCount) hidden")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("Cancellation blocks, booking-window restrictions and undecided "
+                            + "events are hidden. Reservations and conflicts are never hidden, "
+                            + "and hiding changes nothing about exports or conflict checks.")
+                }
+
+                Spacer()
+
+                Button {
+                    state.selectedSection = .availability
+                } label: {
+                    Label("Block Dates", systemImage: "calendar.badge.minus")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 10)
             Divider()
 
             FeedWarningBanner()
@@ -154,6 +186,8 @@ struct RootView: View {
             case .week: WeekStripView()
             case .list: EventListView()
             }
+
+            RangeSelectionBar()
         }
         .inspector(isPresented: $state.isDetailPanelPresented) {
             Group {
@@ -189,13 +223,29 @@ struct RootView: View {
 
     // MARK: - Status bar (requirement: last sync time and any errors)
 
+    private var cloudIndicatorText: String {
+        switch state.cloud.health {
+        case .healthy: return "AWS staging"
+        case .degraded: return "AWS degraded"
+        case .unreachable: return "AWS unreachable"
+        case .notConfigured: return "AWS off"
+        }
+    }
+
     private var statusBar: some View {
         VStack(spacing: 0) {
             Divider()
             HStack(spacing: 10) {
                 if state.isRefreshing {
+                    // The live message, not a fixed string. A click that is
+                    // coalesced or queued is answered here, and a generic
+                    // "Reading calendars…" would hide that answer for as long
+                    // as any feed was importing.
                     ProgressView().controlSize(.small)
-                    Text("Reading calendars…").font(.caption)
+                    Text(state.statusMessage.isEmpty
+                         ? "Reading calendars…" : state.statusMessage)
+                        .font(.caption)
+                        .lineLimit(1)
                 } else if let error = state.lastError {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
                     Text(error).font(.caption).foregroundStyle(.red).lineLimit(1)
@@ -219,6 +269,23 @@ struct RootView: View {
                         }
                     }
                 }
+                // Visible from every section, so the state of the cloud
+                // connection is never something you have to go looking for.
+                Button {
+                    state.selectedSection = .cloud
+                } label: {
+                    HStack(spacing: 4) {
+                        if state.isCloudRefreshing {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            CloudHealthDot(health: state.cloud.health)
+                        }
+                        Text(cloudIndicatorText).font(.caption2)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(state.cloud.label)
+
                 Text(OutboundSyncGate.isEnabled ? "Outbound ON" : "Outbound off")
                     .font(.caption2.weight(.medium))
                     .padding(.horizontal, 6).padding(.vertical, 2)
@@ -250,6 +317,17 @@ struct RootView: View {
             }
             .disabled(state.isRefreshing)
             .keyboardShortcut("r")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                state.refreshFromCloud()
+            } label: {
+                Label("Refresh from AWS", systemImage: "arrow.clockwise.icloud")
+            }
+            .disabled(state.isCloudRefreshing || !state.isCloudConfigured)
+            .help(state.isCloudConfigured
+                  ? "Read status and availability from the AWS staging service"
+                  : "No AWS endpoint or credentials stored")
         }
         ToolbarItem(placement: .automatic) {
             Button {
