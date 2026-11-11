@@ -285,7 +285,7 @@ public enum OutboundPolicyTests {
                 lastPublishFailed: false, now: day(2026, 11, 11))
 
             expect.ok(result.datesCovered, "the nights ARE busy there")
-            expect.equal(result.attribution, .unrelatedCoverage)
+            expect.equal(result.attribution, .coverageAttributionUnverified)
             expect.ok(result.status != .protected,
                       "but that is not evidence our block arrived")
             expect.equal(result.status, .pending)
@@ -353,7 +353,7 @@ public enum OutboundPolicyTests {
                 observedAtDestination: [unrelated], publishedUID: "vrc-aaaa1111",
                 destinationFeed: fresh(.airbnb),
                 lastPublishFailed: false, now: day(2026, 11, 11))
-            expect.contains(result.explanation, "not from this app")
+            expect.contains(result.explanation, "does not carry the identifier")
             expect.contains(result.explanation.lowercased(), "unavailable")
         },
 

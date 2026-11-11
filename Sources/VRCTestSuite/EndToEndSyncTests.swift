@@ -259,9 +259,9 @@ public enum EndToEndSyncTests {
             let result = verify(reservation, at: .airbnb,
                                 imported: [unrelated], policy: .default)
             expect.ok(result.datesCovered, "the nights are busy there")
-            expect.equal(result.attribution, .unrelatedCoverage)
+            expect.equal(result.attribution, .coverageAttributionUnverified)
             expect.ok(result.status != .protected)
-            expect.contains(result.explanation, "not from this app")
+            expect.contains(result.explanation, "does not carry the identifier")
         },
 
         // MARK: - Failure must not reopen anything

@@ -18,8 +18,16 @@ public struct DeliveryAssessment: Sendable, Equatable {
     public enum Attribution: Sendable, Equatable {
         /// A block carrying the UID we published for this reservation.
         case ours(uid: String)
-        /// The nights are covered, but by something we did not publish.
-        case unrelatedCoverage
+        /// The nights are covered by a block whose identifier is not ours.
+        ///
+        /// That has two possible causes and **nothing in the data separates
+        /// them**: either the block is unrelated — the owner's own hold —
+        /// or the destination rewrote the UID when it imported our calendar,
+        /// which several platforms do. Two states here would imply we can
+        /// tell which, so there is one.
+        ///
+        /// Coverage verified, attribution not. **Never Protected.**
+        case coverageAttributionUnverified
         /// Nothing of ours, and nothing covering.
         case none
     }
@@ -101,13 +109,20 @@ public struct DeliveryAssessment: Sendable, Equatable {
                     + "published, covering every night.")
         }
         if coveredByAnything {
+            // A platform that imports an external calendar often re-exports
+            // the block under its OWN uid, so our uid can be absent even when
+            // our block is what is holding the dates. We cannot tell that
+            // apart from an unrelated block of the owner's, so we say exactly
+            // that rather than guessing in either direction.
             return DeliveryAssessment(
                 status: .pending,
-                attribution: .unrelatedCoverage,
+                attribution: .coverageAttributionUnverified,
                 datesCovered: true,
                 explanation: "These nights are unavailable on \(destination.displayName), but "
-                    + "the block there is not from this app. If it is removed the nights "
-                    + "reopen, so this is not counted as protected.")
+                    + "the block there does not carry the identifier this app published — it is "
+                    + "either not from this app, or that platform rewrote the identifier on "
+                    + "import. Coverage is verified; attribution is not, so this is not counted "
+                    + "as protected.")
         }
         return DeliveryAssessment(
             status: .pending,
