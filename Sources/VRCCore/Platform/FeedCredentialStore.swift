@@ -219,6 +219,32 @@ public struct KeychainFeedCredentialStore: FeedCredentialStore {
         }
     }
 
+    /// Every reference stored under this service, by name.
+    ///
+    /// Attributes only — `kSecReturnAttributes` without `kSecReturnData` — so
+    /// it reads no value, requests no authorization and cannot prompt.
+    ///
+    /// The migration enumerates THIS rather than the database, because the
+    /// Keychain is the authority on what exists: of the six live secrets only
+    /// three are referenced by any table, and a listings-driven migration
+    /// would silently leave the AWS keys and the Booking.com outbound token
+    /// behind.
+    public func allReferences() -> [String] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let items = result as? [[String: Any]] else { return [] }
+        return items
+            .compactMap { $0[kSecAttrAccount as String] as? String }
+            .filter { !$0.isEmpty }
+            .sorted()
+    }
+
     /// Whether an item exists, without reading its contents. Checking presence
     /// does not need ACL approval, so this never prompts and is safe to call
     /// while drawing the UI.

@@ -166,6 +166,132 @@ struct VacationRentalCalendarApp: App {
         }
     }
 
+    /// Moves every stored secret into the data protection Keychain.
+    ///
+    ///     VacationRentalCalendar --migrate-credentials [--dry-run]
+    ///
+    /// Only this code object can do it: the data protection Keychain needs the
+    /// `keychain-access-groups` entitlement, which a bare executable cannot
+    /// carry, so the `vrc` helper is not an option.
+    ///
+    /// It enumerates the KEYCHAIN, not the database. Of the six live secrets
+    /// only three are referenced by any table — the two AWS keys appear in no
+    /// table and the Booking.com outbound token appears nowhere at all — so a
+    /// listings-driven migration would quietly leave three behind, one of them
+    /// a token the platform is already subscribed to and which cannot be
+    /// reproduced.
+    ///
+    /// Prints references, outcomes and digests. Never a value.
+    static func runMigrateCredentialsIfRequested() {
+        guard CommandLine.arguments.contains("--migrate-credentials") else { return }
+        let dryRun = CommandLine.arguments.contains("--dry-run")
+        func out(_ text: String) { print(text) }
+        func fail(_ text: String, code: Int32) -> Never {
+            FileHandle.standardError.write(Data((text + "\n").utf8))
+            exit(code)
+        }
+
+        guard CredentialStoreSelection.shouldUseDataProtection else {
+            fail("""
+                REFUSED: this build is not signed by team \(AppleTeam.identifier), so the \
+                data protection Keychain is unavailable and there is nowhere to migrate to.
+                  \(CredentialStoreSelection.explanation)
+                """, code: 3)
+        }
+
+        let legacy = KeychainFeedCredentialStore(
+            additionalTrustedPaths: AppPaths.siblingExecutablePaths())
+        let modern = DataProtectionFeedCredentialStore(policy: AppleTeam.keychainPolicy)
+
+        guard let store = try? RentalStore.makeDefault() else {
+            fail("error: could not open the database", code: 2)
+        }
+
+        // Classification is evidenced, not inferred: a listing carrying a
+        // reference name proves nothing, because every listing is created with
+        // one. An unconfigured listing is not a missing secret; a configured
+        // one whose item is gone is, and it stops the run.
+        let listings = (try? store.listings.all()) ?? []
+        let successful = Set(((try? store.syncRuns.recent(limit: 5_000)) ?? [])
+            .filter { $0.outcome == .success }.map(\.listingID))
+        var configured: [String] = []
+        var unconfigured: [String] = []
+        for listing in listings where !listing.credentialRef.isEmpty {
+            let everSynced = listing.id.map { successful.contains($0) } ?? false
+            if CredentialInventory.wasConfigured(listing, hasSuccessfulImport: everSynced) {
+                configured.append(listing.credentialRef)
+            } else {
+                unconfigured.append(listing.credentialRef)
+            }
+        }
+
+        let inventory = CredentialInventory.compare(
+            configuredReferences: configured,
+            unconfiguredReferences: unconfigured,
+            keychainReferences: legacy.allReferences())
+
+        out("source \(legacy.storageDescription)")
+        out("destination \(modern.storageDescription)")
+        out(inventory.summary)
+        guard inventory.isSafeToMigrate else {
+            fail("REFUSED: \(inventory.referencedButMissing.count) configured listing(s) "
+                + "reference a secret that is not in the Keychain. Nothing was written.",
+                code: 4)
+        }
+
+        let references = inventory.toMigrate
+        let plan: [CredentialMigration.Step]
+        do {
+            plan = try CredentialMigration.plan(
+                references: references, from: legacy, to: modern)
+        } catch {
+            fail("error: could not plan the migration: \(error)", code: 2)
+        }
+        for step in plan { out("plan \(step)") }
+
+        if dryRun {
+            out("dry run — nothing was written")
+            exit(0)
+        }
+
+        let result: CredentialMigration.Result
+        do {
+            result = try CredentialMigration.apply(plan, from: legacy, to: modern)
+        } catch {
+            fail("error: the migration stopped: \(error)", code: 5)
+        }
+        out("result migrated=\(result.migrated) alreadyPresent=\(result.alreadyPresent) "
+            + "notConfigured=\(result.notConfigured) failed=\(result.failed)")
+
+        // The gate. Derived from the destination, so a half-finished run can
+        // never read as finished just because the layered store still works.
+        let completeness = MigrationCompleteness.evaluate(
+            expected: references, destination: modern)
+        out("completeness \(completeness.headline)")
+        if !completeness.detail.isEmpty { out(completeness.detail) }
+        exit(completeness.isComplete ? 0 : 6)
+    }
+
+    /// Reports whether the migration finished, without migrating anything.
+    static func runMigrationStatusIfRequested() {
+        guard CommandLine.arguments.contains("--migration-status") else { return }
+        let legacy = KeychainFeedCredentialStore(
+            additionalTrustedPaths: AppPaths.siblingExecutablePaths())
+        let expected = legacy.allReferences()
+        guard CredentialStoreSelection.shouldUseDataProtection else {
+            print("not migrated — \(CredentialStoreSelection.explanation)")
+            print("source holds \(expected.count) item(s)")
+            exit(1)
+        }
+        let modern = DataProtectionFeedCredentialStore(policy: AppleTeam.keychainPolicy)
+        let status = MigrationCompleteness.evaluate(expected: expected, destination: modern)
+        print(status.headline)
+        if !status.detail.isEmpty { print(status.detail) }
+        for reference in status.copied { print("copied\t\(reference)") }
+        for reference in status.outstanding { print("outstanding\t\(reference)") }
+        exit(status.isComplete ? 0 : 1)
+    }
+
     static func runSelfCheckIfRequested() {
         guard CommandLine.arguments.contains("--self-check-cloud") else { return }
         // In process now, not through the helper: the same code the Cloud
@@ -200,6 +326,8 @@ struct VacationRentalCalendarApp: App {
         Self.runCredentialStoreIfRequested()
         Self.runCredentialHealthIfRequested()
         Self.runImportSecretIfRequested()
+        Self.runMigrateCredentialsIfRequested()
+        Self.runMigrationStatusIfRequested()
         Self.runSelfCheckIfRequested()
     }
 
