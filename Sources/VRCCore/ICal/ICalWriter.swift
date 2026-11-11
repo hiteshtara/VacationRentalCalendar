@@ -69,8 +69,7 @@ public struct ICalWriter: Sendable {
             // The outbound UID is derived from, but not equal to, the source
             // UID, so a platform cannot correlate it back to the originating
             // listing.
-            let uid = EventKey.sha256("export\u{1F}" + entry.sourceEventKey)
-            lines.append("UID:\(uid)@\(Self.uidDomain)")
+            lines.append("UID:\(Self.outboundUID(sourceEventKey: entry.sourceEventKey))")
             lines.append("DTSTAMP:\(DayMath.icalDateTimeString(generatedAt))")
             if entry.isAllDay {
                 lines.append("DTSTART;VALUE=DATE:\(DayMath.icalDateString(entry.checkIn))")
@@ -127,6 +126,22 @@ public struct ICalWriter: Sendable {
     ]
 
     /// RFC 5545 §3.3.11 TEXT escaping.
+    /// The UID an exported event carries.
+    ///
+    /// Derived from the source event key and nothing else, so it is identical
+    /// across rebuilds, restarts and republications — a changed UID makes a
+    /// platform see a delete plus a create rather than an update, which can
+    /// momentarily reopen a night. Derived FROM but not EQUAL TO the source
+    /// UID, so a subscriber cannot correlate it back to the originating
+    /// platform.
+    ///
+    /// Exposed because publication attribution depends on recognising our own
+    /// block in a destination's feed, and that check must use the same
+    /// derivation the writer emits rather than a parallel copy of it.
+    public static func outboundUID(sourceEventKey: String) -> String {
+        "\(EventKey.sha256("export\u{1F}" + sourceEventKey))@\(uidDomain)"
+    }
+
     public func escape(_ text: String) -> String {
         text.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: ";", with: "\\;")

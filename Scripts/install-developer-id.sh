@@ -74,9 +74,18 @@ step "4. Install"
 codesign --verify --deep --strict "${NEW_APP}" 2>/dev/null \
     || refuse "the new bundle fails codesign --verify --deep --strict"
 
+# /Applications is drwxrwxr-x root:admin, and an admin user writes there
+# without elevation — which is how Scripts/build-app.sh has always installed.
+# Asking for sudo unconditionally made this step block on a password prompt in
+# a non-interactive run, so privilege is requested only if it is actually
+# needed.
+as_needed() {
+    if [ -w /Applications ]; then "$@"; else sudo "$@"; fi
+}
+
 printf '  replacing %s\n' "${INSTALLED}"
-sudo rm -rf "${INSTALLED}" || refuse "could not remove the installed bundle"
-sudo cp -R "${NEW_APP}" /Applications/ || refuse "could not copy the new bundle"
+as_needed rm -rf "${INSTALLED}" || refuse "could not remove the installed bundle"
+as_needed cp -R "${NEW_APP}" /Applications/ || refuse "could not copy the new bundle"
 ok "installed"
 
 step "5. What is now installed"

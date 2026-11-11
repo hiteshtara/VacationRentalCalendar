@@ -5,12 +5,22 @@
 | | |
 |---|---|
 | Build to install | `dist-developer-id/VacationRentalCalendar.app` |
-| Commit | see `Verification behind this runbook`; CFBundleVersion 96 |
+| Commit | `032827b` (clean tree) |
+| CFBundleVersion | **98** |
 | CDHash | `e997d0700b5ac513045b9a20ad0fa66bc600ba5f` |
 | Signed by | `Developer ID Application: hitesh tara (26JLFSV9YS)` → Apple Root CA |
 | Access group | `26JLFSV9YS.com.vacationrentalcalendar.shared` |
 | Currently installed | `86c31a9`, local certificate, CDHash `092784bf…` |
-| Preflight | `READY` — 0 blockers, 2026-11-11T13:48Z |
+| Preflight | `READY` — 0 blockers |
+
+> **Why 98 and not 96.** `CFBundleVersion` is `git rev-list --count HEAD`, so it
+> moves with every commit. Build 96 (CDHash `50eb2e03…`) was superseded by two
+> fixes — the `libproc` single-instance guard, which replaced an
+> `NSRunningApplication` check that silently passed while the GUI was running,
+> and the rehearsal-only cleanup mode. The frozen binary is 98 /
+> `e997d070…`. An earlier revision of this table carried 96 beside the new
+> hash, which is how a mismatched pair reached an approval; the pair above is
+> one binary, verified together.
 
 ## What this fixes, and why a reinstall alone would not
 
@@ -345,8 +355,8 @@ work for no benefit, and would have to be redone on the next attempt.
 1. **Quit the application.**
 2. **Restore the previous bundle.** Nothing else is touched:
    ```sh
-   sudo rm -rf /Applications/VacationRentalCalendar.app
-   sudo cp -R "<backup>/VacationRentalCalendar.app" /Applications/
+   rm -rf /Applications/VacationRentalCalendar.app
+   cp -R "<backup>/VacationRentalCalendar.app" /Applications/
    codesign --verify --deep --strict /Applications/VacationRentalCalendar.app
    codesign -d -r- /Applications/VacationRentalCalendar.app | grep designated
    ```

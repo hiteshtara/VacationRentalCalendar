@@ -391,6 +391,130 @@ struct VacationRentalCalendarApp: App {
         exit(status.isComplete ? 0 : 1)
     }
 
+    /// Renders the timeline to a PNG, offscreen, from SYNTHETIC data.
+    ///
+    ///     VacationRentalCalendar --render-timeline <path.png>
+    ///
+    /// No window, no screen capture, and no database: the preview must be
+    /// reviewable without touching live records or photographing whatever else
+    /// is on screen. The fixtures mirror the real December 2026 situation
+    /// because that is the case the redesign exists for.
+    static func runRenderTimelineIfRequested() {
+        let arguments = CommandLine.arguments
+        guard let flag = arguments.firstIndex(of: "--render-timeline") else { return }
+        guard flag + 1 < arguments.count else {
+            FileHandle.standardError.write(Data("error: needs an output path\n".utf8))
+            exit(2)
+        }
+        let output = URL(fileURLWithPath: arguments[flag + 1])
+
+        func day(_ y: Int, _ m: Int, _ d: Int) -> Date { DayMath.day(y, m, d) }
+        func synthetic(
+            _ platform: RentalPlatform, _ ci: Date, _ co: Date, _ kind: BlockKind,
+            needsReview: Bool = false, property: Int64 = 1, summary: String = ""
+        ) -> ClassifiedEvent {
+            let key = "preview-\(platform.rawValue)-\(Int(ci.timeIntervalSince1970))-\(kind.rawValue)"
+            return ClassifiedEvent(
+                event: CalendarEvent(
+                    listingID: 1, eventKey: key, uid: key, platform: platform,
+                    summary: summary.isEmpty ? "Reserved" : summary,
+                    details: "", checkIn: ci, checkOut: co),
+                classification: EventClassification(
+                    eventKey: key, kind: kind, confidence: needsReview ? .low : .high,
+                    source: .automatic, needsReview: needsReview),
+                listingLabel: platform.displayName,
+                propertyID: property,
+                propertyName: property == 1 ? "39 G Street" : "Test Cottage")
+        }
+
+        // The December 2026 case, with synthetic guests.
+        let items: [ClassifiedEvent] = [
+            // The reservation that rendered as blank space.
+            synthetic(.bookingCom, day(2026, 12, 11), day(2026, 12, 21),
+                      .unknownUnavailable, needsReview: true,
+                      summary: "CLOSED - Not available"),
+            // Overlapping it: the Airbnb cancellation penalty.
+            synthetic(.airbnb, day(2026, 12, 17), day(2026, 12, 19), .cancellationBlock,
+                      summary: "Airbnb (Not available)"),
+            // A confirmed booking, and a same-day turnover after it.
+            synthetic(.airbnb, day(2026, 12, 2), day(2026, 12, 6), .confirmedReservation,
+                      summary: "Reserved"),
+            synthetic(.vrbo, day(2026, 12, 6), day(2026, 12, 9), .confirmedReservation,
+                      summary: "Reserved"),
+            // An owner hold, and a booking-window edge running off both sides.
+            synthetic(.vrbo, day(2026, 12, 23), day(2026, 12, 27), .ownerBlock,
+                      summary: "Family"),
+            synthetic(.bookingCom, day(2026, 11, 1), day(2027, 6, 1), .platformRestriction,
+                      property: 2, summary: "Booking window"),
+            // A stay crossing the month boundary, on the second property.
+            synthetic(.airbnb, day(2026, 12, 28), day(2027, 1, 4), .confirmedReservation,
+                      property: 2, summary: "Reserved"),
+        ]
+
+        let layout = TimelineLayout.build(
+            items: items,
+            properties: [(1, "39 G Street"), (2, "Test Cottage")],
+            windowStart: day(2026, 12, 1), nightCount: 31)
+
+        // Feed ages as they were during the incident: Booking.com current,
+        // Airbnb and Vrbo seventeen hours stale. Their empty nights therefore
+        // render as UNKNOWN, not available — which is the whole correction.
+        let renderNow = day(2026, 11, 11).addingTimeInterval(15 * 3600)
+        let freshness: [FeedFreshness] = [
+            FeedFreshness(platform: .bookingCom,
+                          lastSuccess: renderNow.addingTimeInterval(-600),
+                          lastOutcome: .success),
+            FeedFreshness(platform: .airbnb,
+                          lastSuccess: renderNow.addingTimeInterval(-17 * 3600),
+                          lastOutcome: .success),
+            FeedFreshness(platform: .vrbo,
+                          lastSuccess: renderNow.addingTimeInterval(-17 * 3600),
+                          lastOutcome: .success),
+        ]
+
+        // The assessment the detail panel shows, printed so the preview can be
+        // checked without a window.
+        let reservation = items[0]
+        let assessment = ProtectionAssessment.assess(
+            reservation: reservation,
+            others: Array(items.dropFirst()),
+            freshness: freshness, now: renderNow)
+        FileHandle.standardError.write(Data(
+            ("protection: " + assessment.headline + "\n").utf8))
+
+        // `.content`, not the view itself: ImageRenderer lays a ScrollView out
+        // as empty and the first preview rendered a blank page.
+        let view = VStack(alignment: .leading, spacing: 14) {
+            TimelineView(layout: layout, freshness: freshness, now: renderNow).content
+            ReservationDetailPanel(
+                item: reservation, assessment: assessment,
+                freshness: freshness, now: renderNow)
+                .padding(.leading, 12)
+        }
+            .fixedSize()
+            .background(Color(nsColor: .textBackgroundColor))
+
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        guard let image = renderer.nsImage,
+              let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            FileHandle.standardError.write(Data("error: could not render\n".utf8))
+            exit(1)
+        }
+        do {
+            try png.write(to: output)
+            print("rendered \(output.path)")
+            print("synthetic events: \(items.count), rows: \(layout.rows.count), "
+                + "nights: \(layout.nights.count)")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
     static func runSelfCheckIfRequested() {
         guard CommandLine.arguments.contains("--self-check-cloud") else { return }
         // In process now, not through the helper: the same code the Cloud
@@ -428,6 +552,7 @@ struct VacationRentalCalendarApp: App {
         Self.runMigrateCredentialsIfRequested()
         Self.runMigrationStatusIfRequested()
         Self.runDeleteRehearsalSecretIfRequested()
+        Self.runRenderTimelineIfRequested()
         Self.runSelfCheckIfRequested()
     }
 

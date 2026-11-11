@@ -52,6 +52,12 @@ let package = Package(
             path: "Sources/VRCTestSuite"
         ),
         // Front-end that runs the suite from the command line.
+        // Synthetic end-to-end publisher for the staging HTTP demonstration.
+        .executableTarget(
+            name: "vrc-sync-demo",
+            dependencies: ["VRCCore"],
+            path: "Sources/vrc-sync-demo"
+        ),
         .executableTarget(
             name: "vrc-test",
             dependencies: ["VRCTestSuite"],
