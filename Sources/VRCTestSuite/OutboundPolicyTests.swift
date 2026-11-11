@@ -32,6 +32,12 @@ public enum OutboundPolicyTests {
             listingLabel: platform.displayName, propertyID: 1, propertyName: "39 G Street")
     }
 
+    static func fresh(_ p: RentalPlatform) -> FeedFreshness {
+        FeedFreshness(platform: p,
+                      lastSuccess: DayMath.day(2026, 11, 11).addingTimeInterval(-600),
+                      lastOutcome: .success)
+    }
+
     public static var cases: [TestCase] { [
 
         // MARK: - 1. Confirmed reservations always protect the others
@@ -258,6 +264,113 @@ public enum OutboundPolicyTests {
         },
 
         // MARK: - 8. Never reopen on its own
+
+        // MARK: - 6. Coverage is not attribution
+
+        TestCase(group: "Outbound attribution",
+                 name: "an UNRELATED block covering the dates is NOT Protected") { expect in
+            // The hole: a destination block that happens to cover the nights
+            // proves the nights are busy there, not that our synchronisation
+            // worked. If the owner later removes their unrelated block, the
+            // nights reopen and we would still be reporting Protected.
+            let reservation = item(.bookingCom, .confirmedReservation)
+            var unrelated = item(.airbnb, .ownerBlock, needsReview: false, day(2026, 12, 11), day(2026, 12, 21))
+            unrelated.event.uid = "someone-elses-block@airbnb.com"
+
+            let result = DeliveryAssessment.assess(
+                item: reservation, destination: .airbnb, policy: .default,
+                observedAtDestination: [unrelated],
+                publishedUID: "vrc-aaaa1111",
+                destinationFeed: fresh(.airbnb),
+                lastPublishFailed: false, now: day(2026, 11, 11))
+
+            expect.ok(result.datesCovered, "the nights ARE busy there")
+            expect.equal(result.attribution, .unrelatedCoverage)
+            expect.ok(result.status != .protected,
+                      "but that is not evidence our block arrived")
+            expect.equal(result.status, .pending)
+        },
+
+        TestCase(group: "Outbound attribution",
+                 name: "a block carrying OUR uid is Protected") { expect in
+            let reservation = item(.bookingCom, .confirmedReservation)
+            var mine = item(.airbnb, .ownerBlock, needsReview: false, day(2026, 12, 11), day(2026, 12, 21))
+            mine.event.uid = "vrc-aaaa1111"
+
+            let result = DeliveryAssessment.assess(
+                item: reservation, destination: .airbnb, policy: .default,
+                observedAtDestination: [mine],
+                publishedUID: "vrc-aaaa1111",
+                destinationFeed: fresh(.airbnb),
+                lastPublishFailed: false, now: day(2026, 11, 11))
+            expect.equal(result.attribution, .ours(uid: "vrc-aaaa1111"))
+            expect.equal(result.status, .protected)
+            expect.ok(result.datesCovered)
+        },
+
+        TestCase(group: "Outbound attribution",
+                 name: "our uid present but covering the WRONG nights is not Protected") { expect in
+            // A stale publication: our block is there, but it no longer covers
+            // the stay — a shortened or shifted reservation.
+            let reservation = item(.bookingCom, .confirmedReservation,
+                                   needsReview: false,
+                                   day(2026, 12, 11), day(2026, 12, 21))
+            var mine = item(.airbnb, .ownerBlock, needsReview: false, day(2026, 12, 11), day(2026, 12, 15))
+            mine.event.uid = "vrc-aaaa1111"
+
+            let result = DeliveryAssessment.assess(
+                item: reservation, destination: .airbnb, policy: .default,
+                observedAtDestination: [mine],
+                publishedUID: "vrc-aaaa1111",
+                destinationFeed: fresh(.airbnb),
+                lastPublishFailed: false, now: day(2026, 11, 11))
+            expect.ok(!result.datesCovered)
+            expect.equal(result.status, .pending)
+        },
+
+        TestCase(group: "Outbound attribution",
+                 name: "nothing published yet means no attribution to claim") { expect in
+            let reservation = item(.bookingCom, .confirmedReservation)
+            let result = DeliveryAssessment.assess(
+                item: reservation, destination: .airbnb, policy: .default,
+                observedAtDestination: [], publishedUID: nil,
+                destinationFeed: fresh(.airbnb),
+                lastPublishFailed: false, now: day(2026, 11, 11))
+            expect.equal(result.attribution, .none)
+            expect.equal(result.status, .pending)
+            expect.ok(!result.datesCovered)
+        },
+
+        TestCase(group: "Outbound attribution",
+                 name: "unrelated coverage is reported, not silently discarded") { expect in
+            // Worth telling the owner: the nights are busy there for a reason
+            // we did not create, which they may want to look at.
+            let reservation = item(.bookingCom, .confirmedReservation)
+            var unrelated = item(.airbnb, .ownerBlock, needsReview: false, day(2026, 12, 11), day(2026, 12, 21))
+            unrelated.event.uid = "manual-block@airbnb.com"
+            let result = DeliveryAssessment.assess(
+                item: reservation, destination: .airbnb, policy: .default,
+                observedAtDestination: [unrelated], publishedUID: "vrc-aaaa1111",
+                destinationFeed: fresh(.airbnb),
+                lastPublishFailed: false, now: day(2026, 11, 11))
+            expect.contains(result.explanation, "not from this app")
+            expect.contains(result.explanation.lowercased(), "unavailable")
+        },
+
+        TestCase(group: "Outbound attribution",
+                 name: "a cancellation penalty at the destination never counts as coverage") { expect in
+            // It is not a hold anyone placed, and those nights stay sellable.
+            let reservation = item(.bookingCom, .confirmedReservation)
+            var penalty = item(.airbnb, .cancellationBlock, needsReview: false, day(2026, 12, 11), day(2026, 12, 21))
+            penalty.event.uid = "penalty@airbnb.com"
+            let result = DeliveryAssessment.assess(
+                item: reservation, destination: .airbnb, policy: .default,
+                observedAtDestination: [penalty], publishedUID: "vrc-aaaa1111",
+                destinationFeed: fresh(.airbnb),
+                lastPublishFailed: false, now: day(2026, 11, 11))
+            expect.ok(!result.datesCovered)
+            expect.equal(result.status, .pending)
+        },
 
         TestCase(group: "Outbound delivery",
                  name: "a failed import never withdraws an existing protection") { expect in
