@@ -29,9 +29,11 @@ public enum KeychainFailure: Sendable, Equatable {
     /// way it says nothing about the stored value.
     case authorizationCancelled
 
-    /// `errSecInteractionNotAllowed` (-25308) or `errSecInteractionRequired`
-    /// (-25315). A prompt was needed and could not be shown — a background
-    /// process, a locked session. Unambiguously about the moment, not the item.
+    /// `errSecInteractionNotAllowed` (-25308), `errSecInteractionRequired`
+    /// (-25315) or `errSecInDarkWake` (-25320). A prompt was needed and there
+    /// was nowhere to show it — a background process, a locked session, or a
+    /// Mac woken under Power Nap with no screen. Unambiguously about the
+    /// moment, not the item.
     case interactionUnavailable
 
     /// `errSecAuthFailed` (-25293). The item's access list does not name this
@@ -42,7 +44,7 @@ public enum KeychainFailure: Sendable, Equatable {
     /// `errSecItemNotFound` (-25300). There is nothing stored under that name.
     case itemNotFound
 
-    /// Anything not reasoned about. Treated conservatively — see `isRetryable`.
+    /// Anything not enumerated here. Retryable — see `isRetryable`.
     case other(OSStatus)
 
     // Spelled numerically rather than with the `errSec*` symbols so this type
@@ -53,11 +55,15 @@ public enum KeychainFailure: Sendable, Equatable {
     public static let noSuchItem: OSStatus = -25300
     public static let interactionNotAllowed: OSStatus = -25308
     public static let interactionRequired: OSStatus = -25315
+    /// "In dark wake, no UI possible". The Mac woke under Power Nap to run a
+    /// scheduled refresh and there was no screen to put a dialog on.
+    public static let inDarkWake: OSStatus = -25320
 
     public static func of(_ status: OSStatus) -> KeychainFailure {
         switch status {
         case userCanceled: return .authorizationCancelled
-        case interactionNotAllowed, interactionRequired: return .interactionUnavailable
+        case interactionNotAllowed, interactionRequired, inDarkWake:
+            return .interactionUnavailable
         case authFailed: return .accessDenied
         case noSuchItem: return .itemNotFound
         default: return .other(status)
@@ -66,22 +72,43 @@ public enum KeychainFailure: Sendable, Equatable {
 
     /// Whether a later attempt could plausibly succeed.
     ///
-    /// Only the cases argued for above are relaxed. An unrecognised code stays
-    /// non-retryable on purpose: it might be one where the read blocks, and a
-    /// blocked read poisons every later Keychain call in the process.
-    public var isRetryable: Bool {
-        switch self {
-        case .authorizationCancelled, .interactionUnavailable: return true
-        case .accessDenied, .itemNotFound, .other: return false
-        }
-    }
+    /// **An unrecognised code is retryable**, and that is a reversal of the
+    /// first version of this type, which defaulted the other way. The
+    /// reasoning then was that an unlisted code might be one where the read
+    /// blocks, poisoning every later Keychain call in the process. That risk
+    /// is real, but it is already handled somewhere else:
+    /// `DeadlineFeedCredentialStore` bounds every read and reports a timeout,
+    /// which is itself retryable.
+    ///
+    /// What the conservative default actually bought was two outages. `-128`
+    /// disabled two feeds on 2026-11-10, and `-25320` — dark wake, a Mac with
+    /// no screen to show a dialog on — disabled all three overnight and spent
+    /// thirteen hours recording disconnections. Both transient, neither
+    /// anything to do with the stored value.
+    ///
+    /// "A transient condition must not be recorded as a settled fact" has to
+    /// cover codes nobody has enumerated yet, or the next unlisted one does it
+    /// again. So only codes KNOWN to be settled latch, and the hold-off in
+    /// `AuthorizationCooloffFeedCredentialStore` is what stops retrying from
+    /// becoming a stream of dialogs.
+    public var isRetryable: Bool { !isSettledRefusal }
 
     /// Whether this is a settled answer the owner has to act on, as opposed to
-    /// a condition of the moment. Deliberately NOT the inverse of
-    /// `isRetryable`: an unknown code is neither retried nor presented to the
-    /// owner as a verdict.
+    /// a condition of the moment.
+    ///
+    /// The complete list, and the only thing that stops a feed being retried:
+    ///
+    /// * `accessDenied` — the item's access list names other code. macOS does
+    ///   not prompt for this, it refuses, and each attempt holds the Keychain
+    ///   for the rest of the process. Re-entering the URL is the fix.
+    /// * `itemNotFound` — there is nothing stored to read.
+    ///
+    /// Everything else is a condition of the moment.
     public var isSettledRefusal: Bool {
-        self == .accessDenied
+        switch self {
+        case .accessDenied, .itemNotFound: return true
+        case .authorizationCancelled, .interactionUnavailable, .other: return false
+        }
     }
 
     /// Whether an authorization decision was involved, which is what makes
@@ -100,8 +127,9 @@ public enum KeychainFailure: Sendable, Equatable {
                 + "code whether the dialog was dismissed or could not be shown, so this "
                 + "says nothing about the saved URL. It will be tried again."
         case .interactionUnavailable:
-            return "The Keychain needed to ask for permission and could not. "
-                + "It will be tried again."
+            return "The Keychain needed to ask for permission and there was nowhere to "
+                + "show the request — a locked screen, or the Mac briefly awake with the "
+                + "display off. It will be tried again."
         case .accessDenied:
             return "This feed URL cannot be read: the Keychain item's access list names "
                 + "a different build of this app. macOS does not prompt in this situation, "
@@ -110,7 +138,8 @@ public enum KeychainFailure: Sendable, Equatable {
         case .itemNotFound:
             return "No feed URL is stored for this listing."
         case .other(let status):
-            return "The Keychain refused the read (OSStatus \(status))."
+            return "The Keychain refused the read (OSStatus \(status)). This is not a "
+                + "known verdict about the saved URL, so it will be tried again."
         }
     }
 
@@ -126,7 +155,7 @@ public enum KeychainFailure: Sendable, Equatable {
         case .itemNotFound:
             return "No calendar URL configured."
         case .other:
-            return "The Keychain refused the read"
+            return "The Keychain refused the read — will try again"
         }
     }
 }

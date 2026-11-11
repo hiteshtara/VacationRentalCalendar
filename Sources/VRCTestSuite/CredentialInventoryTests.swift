@@ -242,6 +242,32 @@ public enum CredentialInventoryTests {
         },
 
         TestCase(group: "Credential inventory",
+                 name: "the preflight SQL agrees with impliesStoredCredential") { expect in
+            // The preflight script decides "configured" in SQL, because it
+            // must run without building anything. Two definitions of the same
+            // rule drift, so the script's list is asserted against the Swift
+            // one here rather than left to agree by coincidence.
+            guard let script = try? String(
+                contentsOfFile: "Scripts/preflight-migration.sh", encoding: .utf8) else {
+                return expect.fail("cannot read the preflight script")
+            }
+            let expected = FeedConnectionState.allCases
+                .filter(\.impliesStoredCredential)
+                .map(\.rawValue)
+            expect.equal(expected.count, 5, "got \(expected)")
+            for state in expected {
+                expect.ok(script.contains("'\(state)'"),
+                          "the SQL must list \(state)")
+            }
+            for state in FeedConnectionState.allCases
+                where !state.impliesStoredCredential {
+                expect.ok(!script.contains("'\(state.rawValue)'"),
+                          "the SQL must NOT list \(state.rawValue)")
+            }
+            expect.contains(script, "ical_url <> ''")
+        },
+
+        TestCase(group: "Credential inventory",
                  name: "the summary never contains a value, only names") { expect in
             // It is printed during a migration, so it must be safe to print.
             let inventory = CredentialInventory.compare(

@@ -53,6 +53,28 @@ public enum MigrationRehearsalTests {
         return store
     }
 
+    /// A source whose reads are cancelled for named references, the way a
+    /// dismissed — or unpresentable — Keychain dialog returns -128.
+    final class CancellingSourceStore: FeedCredentialStore, @unchecked Sendable {
+        private let cancelling: Set<String>
+        private let values: [String: String]
+        init(cancelling: Set<String>, values: [String: String]) {
+            self.cancelling = cancelling
+            self.values = values
+        }
+        var storageDescription: String { "cancelling source" }
+        func save(url: String, reference: String) throws {}
+        func delete(reference: String) throws {}
+        func exists(reference: String) -> Bool { values[reference] != nil }
+        func url(reference: String) throws -> String? {
+            if cancelling.contains(reference) {
+                throw FeedCredentialError.keychainFailure(
+                    KeychainFailure.userCanceled, "read")
+            }
+            return values[reference]
+        }
+    }
+
     /// A destination that refuses a named set of references, so a partial
     /// failure can be rehearsed rather than imagined.
     final class SelectivelyRefusingStore: FeedCredentialStore, @unchecked Sendable {
@@ -306,6 +328,96 @@ public enum MigrationRehearsalTests {
             expect.equal(try modern.url(reference: outboundToken),
                          try legacy.url(reference: outboundToken),
                          "the outbound token is byte-identical under the same name")
+        },
+
+        // MARK: - Requirement 1: a cancelled authorization mid-run
+
+        TestCase(group: "Migration rehearsal",
+                 name: "a cancelled Keychain authorization migrates nothing for that reference") { expect in
+            // The realistic interruption. Migrating under the Developer ID
+            // identity prompts once per legacy secret, and the owner may
+            // dismiss one — or macOS may fail to present it. Either way the
+            // read returns -128 and the value is unknown. It must be reported
+            // for a retry and NOT written, because writing what was not read
+            // would replace a credential with nothing.
+            let cancelling = CancellingSourceStore(
+                cancelling: [activeFeeds[1], outboundToken], values: allReferences.reduce(
+                    into: [:]) { $0[$1] = fakeValue(for: $1) })
+            let modern = InMemoryFeedCredentialStore()
+
+            let plan = try CredentialMigration.plan(
+                references: allReferences, from: cancelling, to: modern)
+            let cancelled = plan.filter { $0.outcome == .sourceUnreadable }
+            expect.equal(cancelled.count, 2, "both cancellations are reported")
+            expect.equal(Set(cancelled.map(\.reference)),
+                         [activeFeeds[1], outboundToken])
+            for step in cancelled {
+                expect.equal(step.sourceDigest, nil,
+                             "no digest can exist for a value that was not read")
+            }
+
+            let result = try CredentialMigration.apply(plan, from: cancelling, to: modern)
+            expect.equal(result.migrated, 16)
+            expect.ok(!modern.exists(reference: activeFeeds[1]),
+                      "nothing was written for the cancelled read")
+            expect.ok(!modern.exists(reference: outboundToken))
+        },
+
+        TestCase(group: "Migration rehearsal",
+                 name: "a run interrupted by cancellations is reported INCOMPLETE") { expect in
+            // Requirement 7 joined to requirement 1. After the partial run the
+            // app must not describe itself as migrated, even though every
+            // refresh would still work through the fallback.
+            let cancelling = CancellingSourceStore(
+                cancelling: [activeFeeds[1]], values: allReferences.reduce(
+                    into: [:]) { $0[$1] = fakeValue(for: $1) })
+            let modern = InMemoryFeedCredentialStore()
+            _ = try CredentialMigration.apply(
+                try CredentialMigration.plan(
+                    references: allReferences, from: cancelling, to: modern),
+                from: cancelling, to: modern)
+
+            let status = MigrationCompleteness.evaluate(
+                expected: allReferences, destination: modern)
+            expect.ok(!status.isComplete)
+            expect.contains(status.headline, "MIGRATION INCOMPLETE")
+            expect.equal(status.outstanding, [activeFeeds[1]])
+
+            // And the retry finishes it, once the authorization is given.
+            let willing = InMemoryFeedCredentialStore()
+            for reference in allReferences {
+                try willing.save(url: fakeValue(for: reference), reference: reference)
+            }
+            _ = try CredentialMigration.apply(
+                try CredentialMigration.plan(
+                    references: allReferences, from: willing, to: modern),
+                from: willing, to: modern)
+            expect.ok(MigrationCompleteness.evaluate(
+                expected: allReferences, destination: modern).isComplete,
+                "the retry completed the set")
+        },
+
+        // MARK: - Requirement 4: the database is not part of this
+
+        TestCase(group: "Migration rehearsal",
+                 name: "migration cannot touch the database at all") { expect in
+            // Connection states, classifications, reservations, decisions and
+            // audit history are all in SQLite. The migration must be unable to
+            // affect them — asserted structurally rather than by checking
+            // afterwards, because "it did not this time" is not a property.
+            guard let source = try? String(
+                contentsOfFile: "Sources/VRCCore/Platform/CredentialMigration.swift",
+                encoding: .utf8) else {
+                return expect.fail("cannot read CredentialMigration.swift")
+            }
+            for forbidden in ["Repository", "Database", "DataStore", "RentalStore",
+                              "setConnectionState", "recordSync", "INSERT", "UPDATE"] {
+                expect.ok(!source.contains(forbidden),
+                          "CredentialMigration must not reference \(forbidden)")
+            }
+            // Its whole surface is credential stores.
+            expect.contains(source, "from source: FeedCredentialStore")
+            expect.contains(source, "to destination: FeedCredentialStore")
         },
 
         TestCase(group: "Migration rehearsal",

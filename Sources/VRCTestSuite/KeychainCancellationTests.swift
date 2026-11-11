@@ -112,13 +112,62 @@ public enum KeychainCancellationTests {
         },
 
         TestCase(group: "Keychain cancellation",
-                 name: "an unknown status keeps the conservative answer") { expect in
-            // Not retryable, deliberately. An unrecognised code might mean the
-            // read would block, and a blocked read poisons every later Keychain
-            // call in the process. Only codes reasoned about are relaxed.
+                 name: "dark wake is retryable — it is the absence of a screen") { expect in
+            // -25320, errSecInDarkWake: "In dark wake, no UI possible". The Mac
+            // woke under Power Nap to run the hourly refresh, there was no
+            // screen to show an authorization dialog on, and the read failed.
+            //
+            // It happened overnight on 2026-11-11 at 00:49 and latched all
+            // three feeds into credentialUnreadable, which is never retried —
+            // so thirteen hours of hourly refreshes recorded nothing but
+            // disconnections. It says nothing whatever about the credential.
+            let failure = KeychainFailure.of(-25320)
+            expect.equal(failure, .interactionUnavailable)
+            expect.ok(failure.isRetryable)
+            expect.ok(!failure.isSettledRefusal)
+        },
+
+        TestCase(group: "Keychain cancellation",
+                 name: "an UNRECOGNISED status is retryable, not a dead credential") { expect in
+            // Reversing an earlier decision of mine. I defaulted unknown codes
+            // to non-retryable on the reasoning that one might block and
+            // poison the Keychain for the rest of the process. That risk is
+            // real but it is already handled, by DeadlineFeedCredentialStore,
+            // which bounds every read and reports a timeout as retryable.
+            //
+            // Meanwhile the cost of the conservative default is now measured:
+            // it has silently disabled working feeds twice, from -128 and then
+            // from -25320, both transient. "A transient condition must not be
+            // recorded as a settled fact" has to apply to codes nobody has
+            // enumerated yet, or the next unlisted code does it again.
+            //
+            // Only codes KNOWN to be settled now latch.
             let failure = KeychainFailure.of(-99_999)
             expect.equal(failure, .other(-99_999))
-            expect.ok(!failure.isRetryable)
+            expect.ok(failure.isRetryable, "the safe direction is to try again later")
+            expect.ok(!failure.isSettledRefusal,
+                      "and never to tell the owner their credential is broken")
+        },
+
+        TestCase(group: "Keychain cancellation",
+                 name: "a missing entitlement is retryable — it is a build problem") { expect in
+            // -34018. Nothing is wrong with the credential; the build is wrong.
+            // Latching would mean a bad build permanently disconnected feeds
+            // that a corrected build could read immediately.
+            let failure = KeychainFailure.of(-34018)
+            expect.ok(failure.isRetryable)
+            expect.ok(!failure.isSettledRefusal)
+        },
+
+        TestCase(group: "Keychain cancellation",
+                 name: "only an access-list refusal and a missing item still latch") { expect in
+            // The complete list of non-retryable codes, asserted so that
+            // widening it again is a deliberate act with a test to change.
+            expect.ok(!KeychainFailure.of(-25293).isRetryable, "errSecAuthFailed")
+            expect.ok(!KeychainFailure.of(-25300).isRetryable, "errSecItemNotFound")
+            for status: OSStatus in [-128, -25308, -25315, -25320, -34018, -1, -99_999] {
+                expect.ok(KeychainFailure.of(status).isRetryable, "\(status) must retry")
+            }
         },
 
         // MARK: - Requirement 4: a cancellation cannot permanently disable imports
