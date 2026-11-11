@@ -5,8 +5,8 @@
 | | |
 |---|---|
 | Build to install | `dist-developer-id/VacationRentalCalendar.app` |
-| Commit | `acc0a2a` (clean tree), CFBundleVersion 96 |
-| CDHash | `50eb2e030765dbb8ad5afed0d41a1212d2df1f90` |
+| Commit | see `Verification behind this runbook`; CFBundleVersion 96 |
+| CDHash | `e997d0700b5ac513045b9a20ad0fa66bc600ba5f` |
 | Signed by | `Developer ID Application: hitesh tara (26JLFSV9YS)` → Apple Root CA |
 | Access group | `26JLFSV9YS.com.vacationrentalcalendar.shared` |
 | Currently installed | `86c31a9`, local certificate, CDHash `092784bf…` |
@@ -41,6 +41,30 @@ Verified present in the signed binary (strings `nowhere to show the request`,
 installed build.
 
 ---
+
+## The order, and why it is enforced rather than written down
+
+```
+1 quit the GUI  →  2 backup + verify  →  3 inspect 18 items, signing, profile
+                →  4 install  →  5 confirm identity  →  6 migrate  → …
+```
+
+**Never install before backup.** An install replaces the only copy of the
+bundle a rollback needs, so the rule is enforced by
+`Scripts/install-developer-id.sh`, which refuses to copy anything unless all
+three preconditions already hold:
+
+* no copy of the application is running;
+* a verified backup exists holding **both** the database and the bundle being
+  replaced — matched by CDHash, so a stale backup is refused;
+* the preflight passes.
+
+Checked just now with the GUI up, it refuses at the first gate:
+
+```
+==> 1. The application must not be running
+  REFUSED pid 42848 is running.
+```
 
 ## Step 1 — Stop the GUI
 
@@ -91,9 +115,12 @@ Record the directory it prints — it is the rollback target.
 ## Step 4 — Install the Developer ID build
 
 ```sh
-sudo cp -R dist-developer-id/VacationRentalCalendar.app /Applications/
-codesign -d -r- /Applications/VacationRentalCalendar.app | grep designated
+./Scripts/install-developer-id.sh
 ```
+
+It re-checks steps 1–3 before copying anything — not running, a verified backup
+holding the bundle being replaced, preflight READY — then installs and prints
+the new identity.
 
 **Expect the designated requirement to change.** This is deliberate:
 
@@ -129,6 +156,22 @@ satisfy the old one, which is why step 6 prompts.
 Enumerates the **Keychain**, not the database — three of the six active secrets
 are referenced by no table, and a listings-driven migration would leave them
 behind. Prints references, outcomes and digests. **Never a value.**
+
+**It launches no window and starts no background import.** The mode runs in
+the App's `init()` and calls `exit()` there, before any scene body is built, so
+the `@StateObject` holding `AppState` — and with it the refresh timer — is never
+created. And it **refuses outright if another copy is running** (exit 7),
+because a running copy's hourly timer is what raced a credential read on
+2026-11-10 and disconnected two feeds. Verified with the GUI up:
+
+```
+REFUSED: --import-secret while another copy of this application is running (pid 42848).
+```
+
+That guard originally used `NSRunningApplication`, which answered "nothing is
+running" from a command-line invocation — it needs a window-server connection
+the process does not have — so it silently passed while the GUI was up. It now
+uses `libproc`, which sees every process however this one was launched.
 
 **Expect up to six one-time authorization prompts**, one per secret, because the
 new identity is not yet on any legacy ACL. Approve each with *Always Allow*.
@@ -243,16 +286,12 @@ sqlite3 "$HOME/Library/Application Support/VacationRentalCalendar/VacationRental
 
 Quit the app, reopen it, and refresh all three feeds again.
 
-**Stop unless there is no Keychain prompt.** Then, to prove the class of bug is
-gone rather than merely postponed:
+**Stop unless there is no Keychain prompt.**
 
-```sh
-./Scripts/package-developer-id.sh          # a NEW code hash
-sudo cp -R dist-developer-id/VacationRentalCalendar.app /Applications/
-```
-
-Relaunch and refresh. **Still no prompt.** This is the step that distinguishes
-this from every previous fix: the cdhash changed and access did not depend on it.
+This is where the live migration ends. The different-code-hash test is a
+**separate, later exercise** — see "Scheduled separately" below. Rebuilding and
+reinstalling immediately after a migration would change two things at once and
+leave no clean state to roll back to.
 
 ## Step 12 — Confirm nothing else moved
 
@@ -285,39 +324,105 @@ aws scheduler get-schedule --name vrc-staging-hold-sweeper --query State --outpu
 
 ---
 
-## Rollback
+## Rollback — deletes nothing
 
 Verified in rehearsal (`Migration rehearsal`, 15 cases) and by
 `test-keychain-integration.sh` case H.
 
-**If the migration fails or behaves unexpectedly:**
+**No credential is deleted, at any point.** Both sets survive a rollback: all
+18 legacy Keychain items and every data-protection copy made in step 6.
 
-1. Delete the data protection copies. `LayeredFeedCredentialStore` then falls
-   through to the legacy entries, which the migration **copied from and never
-   wrote to, moved, re-homed or deleted**, and refreshes continue as before.
-2. Restore the previous application:
+The reason it needs no deletion is the credential-store selection.
+`CredentialStoreSelection.shouldUseDataProtection` is true only when the
+running code is signed by team `26JLFSV9YS`. Reinstalling the
+local-certificate build therefore makes the app select the **legacy store
+alone** — it does not read the data-protection Keychain at all, so the copies
+left there are inert rather than in the way. Deleting them would destroy the
+work for no benefit, and would have to be redone on the next attempt.
+
+### To roll back
+
+1. **Quit the application.**
+2. **Restore the previous bundle.** Nothing else is touched:
    ```sh
    sudo rm -rf /Applications/VacationRentalCalendar.app
    sudo cp -R "<backup>/VacationRentalCalendar.app" /Applications/
+   codesign --verify --deep --strict /Applications/VacationRentalCalendar.app
    codesign -d -r- /Applications/VacationRentalCalendar.app | grep designated
    ```
-   **Expect** `certificate root = H"5828da64…"` — the preflight confirmed the
-   preserved bundle's identity matches the installed one, so this is a copy.
-3. Restore the database only if it is actually damaged:
+   **Expect** `certificate root = H"5828da64…"`.
+3. **Confirm the selection reverted:**
+   ```sh
+   /Applications/VacationRentalCalendar.app/Contents/MacOS/VacationRentalCalendar \
+       --credential-store
+   ```
+   **Expect** `team-signed false`, `data-protection false`. The app is back on
+   the legacy items, which were only ever read from.
+4. **Only if the database is actually damaged** — it is not touched by a
+   migration, which cannot reach it:
    ```sh
    ./Scripts/backup-before-install.sh --restore "<backup>"
    ```
    It sets the existing database aside first, so the restore is itself
    reversible.
 
-**What rollback preserves, by construction:** all 18 legacy Keychain entries,
-every reference name, and therefore **the exact Booking.com feed URL the
-platform is subscribed to**. No credential is re-entered and nothing is
-rotated. `--migration-status` immediately reports incomplete again, because the
-status is measured rather than recorded.
+### The rollback assets, verified usable 2026-11-11
+
+| | |
+|---|---|
+| Backup | `Backups/20261110T234504Z` |
+| Preserved bundle | `codesign --verify --deep --strict` **passes** |
+| Its identity | `certificate root = H"5828da64…"` — matches what is installed |
+| Database | `integrity_check ok` |
+| Contents | 12 active events · 13 classifications · 2 decisions · 2 UIDs · 10 audit rows |
+| January | `2027-01-04 → 2027-01-12 Reserved` present |
+
+**What rollback preserves by construction:** every reference name, and
+therefore the exact Booking.com feed URL the platform is subscribed to. No
+credential is re-entered and nothing is rotated. `--migration-status`
+immediately reports incomplete again, because the status is measured rather
+than recorded.
 
 **What rollback does not undo:** the three connection-state rows from step 9.
 They are append-only history; re-latching them would be another live write.
+
+## Scheduled separately — the different-code-hash test
+
+Not part of the live migration. Run it on a later, quiet day, after the
+migration has been stable through at least one overnight period including a
+Power Nap wake.
+
+```sh
+./Scripts/package-developer-id.sh            # a NEW CDHash, same team identity
+./Scripts/install-developer-id.sh            # re-runs every precondition
+```
+
+Relaunch and refresh all three feeds. **Expect no Keychain prompt.** This is
+what proves the class of bug is gone rather than postponed: the code hash
+changed and access did not depend on it. Already demonstrated with disposable
+credentials — `test-keychain-integration.sh` case B, ten consecutive rebuilds,
+no prompts, slowest read 0.25s — this confirms it on the live items.
+
+Rollback for that test is identical to the one above, and equally
+non-destructive.
+
+## Verification behind this runbook
+
+| | |
+|---|---|
+| Swift suite | 635 tests, 2179 assertions |
+| Keychain integration | 23/23 on real hardware, disposable credentials |
+| Migration rehearsal | 15 cases over an 18-reference disposable set |
+| Preflight | `READY`, 0 blockers |
+| Parity | `b3398471…c604f5` — **macOS and Linux identical, verified** |
+| Secret scanner | clean, five baselined historical findings |
+
+Linux parity had failed to run on 2026-11-11 because Docker Desktop lost name
+resolution inside containers: `apt-get` could not reach `ports.ubuntu.com`,
+`libsqlite3-dev` was never installed, and the build died with
+`could not build C module 'CSQLite'` — which reads like a source fault and is
+not one. `Scripts/check-parity.sh` now passes `--dns 1.1.1.1` so it is fixed
+rather than diagnosed again.
 
 ## Not covered
 

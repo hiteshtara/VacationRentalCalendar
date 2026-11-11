@@ -3016,3 +3016,87 @@ correction. The structural argument is that the only `VRCCore` change is
 `allReferences()`, which sits inside `canImport(Security)` and so is not
 compiled on Linux at all — but an argument is not a measurement. **Re-run
 `Scripts/check-parity.sh` before any deploy.**
+
+## 34. Runbook corrections, and two bugs they turned up (2026-11-11)
+
+Four requested adjustments to [docs/MIGRATION-RUNBOOK.md](docs/MIGRATION-RUNBOOK.md),
+plus a guard on the migration command itself. Still unexecuted.
+
+### Order — already right, now enforced
+
+The runbook already ran quit → backup → inspect → install. Rather than restate
+it, the rule is now **mechanical**: `Scripts/install-developer-id.sh` refuses to
+copy anything unless no copy is running, a verified backup exists holding
+**both** the database and the bundle being replaced (matched by CDHash, so a
+stale backup is refused), and the preflight passes. Checked with the GUI up, it
+stops at the first gate.
+
+"Never install before backup" matters because an install replaces the only copy
+of the bundle a rollback needs.
+
+### Rollback deletes nothing
+
+Previously step 1 of rollback was "delete the data protection copies". It no
+longer deletes anything — **all 18 legacy items and every data-protection copy
+survive.**
+
+It needs no deletion because of how the store is selected:
+`CredentialStoreSelection.shouldUseDataProtection` is true only for code signed
+by team `26JLFSV9YS`, so reinstalling the local-certificate build makes the app
+select the **legacy store alone**. The copies left in the data protection
+Keychain are inert, not in the way — and deleting them would destroy the work
+for no benefit and force it to be redone.
+
+Rollback assets verified usable today: the preserved bundle passes
+`codesign --verify --deep --strict`, its designated requirement matches what is
+installed, and the backup database passes `integrity_check` with 12 events, 13
+classifications, 2 decisions, 2 UIDs, 10 audit rows and the January reservation
+present.
+
+### The rebuild test is now separate
+
+Rebuilding and reinstalling immediately after a migration would change two
+things at once and leave no clean state to roll back to. The live migration now
+ends at step 11 (quit, relaunch, refresh, no prompt). The different-code-hash
+test is its own section, to be run after the migration has been stable through
+at least one overnight Power Nap.
+
+### Linux parity — verified
+
+`b3398471…c604f5`, identical on both platforms. The earlier failure was Docker
+Desktop losing name resolution in containers: `apt-get` could not reach
+`ports.ubuntu.com`, `libsqlite3-dev` was never installed, and the build died
+with `could not build C module 'CSQLite'`, which reads like a source fault and
+is not one. `Scripts/check-parity.sh` now passes `--dns 1.1.1.1`, so it is
+fixed rather than diagnosed again.
+
+### Two bugs found by testing the guard instead of trusting it
+
+The migration command must not launch a window or start background imports. The
+mode runs in `init()` and exits before any scene body is built, so the
+`@StateObject` holding `AppState` — and its refresh timer — is never created.
+That part held. But a running copy's timer is the real hazard, so the writing
+modes now refuse outright if another instance is running (exit 7).
+
+**The guard did not work when written.** It used
+`NSRunningApplication.runningApplications(withBundleIdentifier:)`, which
+answered "nothing is running" from a command-line invocation — it needs a
+window-server connection the process does not have — so it passed silently with
+the GUI up, which is precisely what it exists to prevent. It now uses `libproc`
+and compares resolved executable names, which sees every process however this
+one was launched. Retested with the GUI running: refused, pid named.
+
+**And the failed test wrote a real item.** Because the guard passed, the probe
+went on to store `rehearsal-guard-probe` in the live data protection Keychain,
+and there was no supported way to remove it. `--delete-rehearsal-secret` now
+exists and **refuses any reference not beginning with `rehearsal-`**, so it
+cannot reach a production credential however it is invoked. The stray item is
+deleted; confirmed absent.
+
+### Verified
+
+635 Swift tests, 2179 assertions · keychain integration 23/23 · isolation
+15/15 · credential-health 15/15 · backup-restore 10/10 · migration 14/14 ·
+preflight `READY` · parity identical on macOS and Linux · scanner clean.
+
+Nothing installed, migrated or cleared. No live credential value read.

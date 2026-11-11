@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import ServiceManagement
 import VRCCore
@@ -82,6 +83,102 @@ struct VacationRentalCalendarApp: App {
         exit(CredentialStoreSelection.shouldUseDataProtection ? 0 : 1)
     }
 
+    /// Refuses to run a credential-writing mode while another copy of this
+    /// application is running.
+    ///
+    /// Two reasons, both learned the hard way. A running copy has an hourly
+    /// refresh timer, and on 2026-11-10 at 23:05 a credential read racing that
+    /// timer produced two cancelled authorizations and latched two live feeds.
+    /// And a second instance would be a second code object asking for
+    /// authorization on the same items at the same moment, which is how that
+    /// race happened in the first place.
+    ///
+    /// Asked of the bundle identifier rather than a process name, so a build
+    /// running from another path still counts.
+    static func refuseIfAnotherInstanceIsRunning(_ mode: String) {
+        // NOT NSRunningApplication. That API answered "nothing is running" when
+        // asked from a command-line invocation — it needs a window-server
+        // connection this process does not have — so the guard silently passed
+        // while the GUI was up, which is the exact failure it exists to stop.
+        //
+        // libproc sees every process regardless of how this one was launched.
+        let mine = ProcessInfo.processInfo.processIdentifier
+        let others = Self.otherInstancePIDs(excluding: mine)
+        guard others.isEmpty else {
+            FileHandle.standardError.write(Data("""
+                REFUSED: \(mode) while another copy of this application is running \
+                (pid \(others.map(String.init).joined(separator: ", "))).
+
+                  A running copy refreshes on a timer. A credential read racing that
+                  timer is what cancelled two authorizations and disconnected two feeds
+                  on 2026-11-10. Quit the application and run this again.
+
+                """.utf8))
+            exit(7)
+        }
+    }
+
+    /// PIDs of other processes running this application's executable, by path.
+    ///
+    /// Compares the resolved executable path rather than a process name, so a
+    /// copy running from `dist-developer-id` or a backup directory counts too.
+    static func otherInstancePIDs(excluding mine: Int32) -> [Int32] {
+        let myPath = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
+            .resolvingSymlinksInPath().lastPathComponent
+        var count = proc_listallpids(nil, 0)
+        guard count > 0 else { return [] }
+        var pids = [Int32](repeating: 0, count: Int(count) * 2)
+        count = proc_listallpids(&pids, Int32(pids.count) * Int32(MemoryLayout<Int32>.size))
+        guard count > 0 else { return [] }
+
+        var found: [Int32] = []
+        var buffer = [CChar](repeating: 0, count: 4096)
+        for pid in pids.prefix(Int(count)) where pid != 0 && pid != mine {
+            let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+            guard length > 0 else { continue }
+            let path = String(cString: buffer)
+            if URL(fileURLWithPath: path).lastPathComponent == myPath { found.append(pid) }
+        }
+        return found
+    }
+
+    /// Deletes a REHEARSAL credential from the data protection Keychain.
+    ///
+    ///     VacationRentalCalendar --delete-rehearsal-secret <reference>
+    ///
+    /// Refuses any reference not beginning with `rehearsal-`, so it cannot
+    /// reach a production credential however it is invoked. It exists because
+    /// a guard test of mine wrote `rehearsal-guard-probe` into the real data
+    /// protection Keychain and there was no supported way to remove it.
+    static func runDeleteRehearsalSecretIfRequested() {
+        let arguments = CommandLine.arguments
+        guard let flag = arguments.firstIndex(of: "--delete-rehearsal-secret") else { return }
+        guard flag + 1 < arguments.count else {
+            FileHandle.standardError.write(Data("error: needs a reference\n".utf8))
+            exit(2)
+        }
+        let reference = arguments[flag + 1]
+        guard reference.hasPrefix("rehearsal-") else {
+            FileHandle.standardError.write(Data("""
+                REFUSED: "\(reference)" is not a rehearsal reference. This mode only ever
+                removes names beginning with "rehearsal-", so it cannot touch a production
+                credential.
+
+                """.utf8))
+            exit(2)
+        }
+        let store = DataProtectionFeedCredentialStore(policy: AppleTeam.keychainPolicy)
+        do {
+            try store.delete(reference: reference)
+            print("deleted \(reference) from \(store.storageDescription)")
+            print("still present: \(store.exists(reference: reference))")
+            exit(store.exists(reference: reference) ? 1 : 0)
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
     /// Imports one secret from standard input.
     ///
     ///     security find-generic-password -s <service> -a <ref> -w \
@@ -105,6 +202,7 @@ struct VacationRentalCalendarApp: App {
             exit(2)
         }
         let reference = arguments[flag + 1]
+        Self.refuseIfAnotherInstanceIsRunning("--import-secret")
 
         // Refuse an interactive terminal. The designed caller is a pipe from
         // `security`; reading from a TTY here would mean the owner typing a
@@ -185,6 +283,7 @@ struct VacationRentalCalendarApp: App {
     static func runMigrateCredentialsIfRequested() {
         guard CommandLine.arguments.contains("--migrate-credentials") else { return }
         let dryRun = CommandLine.arguments.contains("--dry-run")
+        if !dryRun { Self.refuseIfAnotherInstanceIsRunning("--migrate-credentials") }
         func out(_ text: String) { print(text) }
         func fail(_ text: String, code: Int32) -> Never {
             FileHandle.standardError.write(Data((text + "\n").utf8))
@@ -328,6 +427,7 @@ struct VacationRentalCalendarApp: App {
         Self.runImportSecretIfRequested()
         Self.runMigrateCredentialsIfRequested()
         Self.runMigrationStatusIfRequested()
+        Self.runDeleteRehearsalSecretIfRequested()
         Self.runSelfCheckIfRequested()
     }
 
