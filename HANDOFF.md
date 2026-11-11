@@ -2692,3 +2692,121 @@ nothing has been reversed or rewritten.
 
 No credential was read or modified, no reservation touched, nothing installed,
 no AWS change, outbound publishing still disabled.
+
+## 31. Why every refresh asks for Keychain permission (2026-11-10)
+
+### The cause: ACL partitions are keyed by code hash
+
+The read-governing ACL entry on each credential carries a second gate besides
+the trusted-application list — a **partition list**, which macOS 10.12
+introduced. Access requires passing *both*. Decoding ours:
+
+```
+<key>Partitions</key>
+<array>
+  <string>cdhash:8395a6989f0bccc6edf0f655cb0e2ba2629c4cd2</string>
+  <string>cdhash:d3e1d4dafb2d08975e6f306584255a344e55057b</string>
+  <string>cdhash:e7e564505e8105cc0953c734147cdbe3d23cf32f</string>
+</array>
+```
+
+Every entry is a **`cdhash:`** — the hash of one specific binary. Matching the
+hashes against the bundles still on disk tells the whole story:
+
+| cdhash | build |
+|---|---|
+| `d3e1d4da…` | the app in `Backups/20261110T195724Z` |
+| `b5a12598…` | the app in `Backups/20261110T215716Z` (`908c588`) |
+| `e842748d…` | `f74bbb7` |
+| `092784bf…` | **`86c31a9`, installed now — in no partition list** |
+| `8395a698…`, `e7e56450…` | builds no longer on disk |
+
+Each partition list is a graveyard of per-build hashes, one added per "Always
+Allow" click. **Always Allow does persist — but only for the exact binary that
+asked.** A rebuild changes the code hash, so the grant it earned stops
+matching and macOS asks again. We have rebuilt many times today; each rebuild
+invalidated every grant earned before it.
+
+The trusted-application half is fine, incidentally: it names
+`/Applications/VacationRentalCalendar.app` and the helper, matched by
+designated requirement, which is stable. It is the partition list that breaks.
+
+Why `cdhash:` and not `teamid:`? Because the app is signed with a **self-signed
+certificate that carries no team identifier**. macOS has nothing stable to
+attribute the code to, so it falls back to the hash. A build signed with the
+Apple Developer ID certificate gets `teamid:26JLFSV9YS`, which does not change
+when the binary does.
+
+### What this independently confirms
+
+It also explains §29 better than I did at the time. Under `f74bbb7`
+(`e842748d…`), Booking.com's partition list **contained** that hash — and
+Booking.com was the feed that kept returning HTTP 200. Airbnb's and Vrbo's did
+not, so their reads required authorization, it was cancelled, and −128 came
+back. I attributed that to contention with my backup's concurrent read. The
+contention was real but secondary: **the prompt was required regardless.**
+
+The new build proved it live at 23:50, two minutes after installation:
+
+```
+294  listing 2  failure  OSStatus -128  tombstoned 0  failing -> failing
+295  listing 1  failure  OSStatus -128  tombstoned 0  failing -> failing
+```
+
+Which is the §29 fix working exactly as intended — retryable, nothing
+withdrawn, no latch — on top of a prompt that should never have been needed.
+
+### Which credentials prompt
+
+**Both, and a third case.** All under service `com.vacationrentalcalendar.feed-url`:
+
+| secret | partition list | can the app read it? |
+|---|---|---|
+| 3 feed URLs (`…-v6`, `…-v3`) | `cdhash:` × 3–4 | only the exact listed builds |
+| `aws-access-key-id`, `aws-secret-access-key` | `cdhash:` × 3 | same, plus `/usr/bin/security` is trusted |
+| `feed-key-1-booking_com-v1` | `apple-tool:` | **no — only `/usr/bin/security`** |
+
+So a full cycle can ask up to five times. The outbound feed token is worse than
+stale: the application has never been on its access list at all.
+
+### The inventory problem a migration would have walked into
+
+Auditing the Keychain found 18 items, six of them active — and **only three
+have a database row**:
+
+* the three feed URLs are referenced by `platform_listings.credential_ref`
+* `aws-access-key-id` and `aws-secret-access-key` appear in no table
+* `feed-key-1-booking_com-v1` appears nowhere — `feed_tokens` is **empty**
+
+A migration enumerating listings, which is the obvious way to write one, would
+have carried three secrets and silently left three behind: the cloud service
+losing its credentials, and an outbound token that **cannot be reproduced**
+because Booking.com is already subscribed to the URL containing it.
+
+`CredentialInventory` encodes the rule — **enumerate the source, not the
+database.** The Keychain is the authority on what exists; the database only
+says what is referenced. Anything present is migrated, including the 12
+superseded entries that a rollback reads, and anything referenced but absent
+is a stop condition. The three Test Cottage listings reference names that were
+never stored, so the live inventory is currently **not** safe to migrate until
+that is resolved.
+
+### What is already proven, on this machine, today
+
+`Scripts/test-keychain-integration.sh` — **23/23**, with disposable
+credentials, a disposable database and real Developer ID signing plus the
+embedded provisioning profile:
+
+* **B. Ten repeated rebuilds, no prompts.** Ten distinct code hashes all read
+  the same data-protection item, slowest read 0.25s. This is the fix, measured:
+  the thing that breaks every rebuild today does not break at all there.
+* A. survives a rebuild · C. two differently named bundles share access via the
+  access group · D. a fresh process after the writer exited · E. under full CPU
+  load, 0.05s, far inside the 20s deadline · F. in-place application update ·
+  G. migration with a disposable database · H. rollback, and re-migration after
+  a rollback.
+
+### Not done
+
+No live credential read, migrated or modified. No reinstall. No connection
+state altered. The two incorrect `actor owner` entries still stand.
