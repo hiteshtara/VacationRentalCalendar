@@ -138,14 +138,27 @@ public enum SyncLoopTests {
         },
 
         TestCase(group: "Sync loops",
-                 name: "removing a direct connection restores our publication") { expect in
-            // If the owner disconnects Booking.com -> Airbnb, we take it over
-            // rather than leaving the nights uncovered.
+                 name: "the route is DECLARED, never inferred from a link appearing or going") { expect in
+            // An earlier version of this test asserted that removing a direct
+            // connection "restores our publication" automatically. That was
+            // the bug: a configured link can be silently broken, and a link
+            // that momentarily looks absent must not flip us into publishing,
+            // because the switch produces duplicates exactly when the
+            // original recovers.
+            //
+            // The guard reads the declared route. Changing that route is a
+            // proposal the owner approves -- see the Connection health group.
             let reservation = item(.bookingCom, uid: "bk-123@booking.com")
             expect.equal(
                 SyncLoopGuard.verdict(for: reservation, destination: .airbnb,
+                                      directConnections: liveConnections),
+                .skipDirectConnection(.bookingCom),
+                "declared as carried directly")
+            expect.equal(
+                SyncLoopGuard.verdict(for: reservation, destination: .airbnb,
                                       directConnections: []),
-                .publish)
+                .publish,
+                "and only a CHANGED DECLARATION changes that")
         },
 
         TestCase(group: "Sync loops",

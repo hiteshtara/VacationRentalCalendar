@@ -23,13 +23,24 @@ import Foundation
 ///    Duplicate blocks are not harmful to availability, but they make
 ///    attribution ambiguous and withdrawal dangerous: removing one while the
 ///    other stands leaves the dates looking protected when they are not.
+///
+/// Rule 3 reads a route the owner **declared**, never the mere presence or
+/// absence of a configured link. An earlier version inferred it, which was
+/// wrong twice over: a configured subscription can be silently broken, so
+/// skipping on its existence leaves nights uncovered believing something else
+/// has them; and a link that momentarily looks absent must not flip us into
+/// publishing, because an automatic switch produces duplicate blocks exactly
+/// when the original recovers. Health is MEASURED by `ConnectionHealth`, the
+/// route is DECLARED, and a change of route is a proposal the owner approves.
 public enum SyncLoopGuard {
 
     public enum Verdict: Sendable, Equatable {
         case publish
         /// It is ours, come back around.
         case skipOwnPublication(uid: String)
-        /// The destination already receives this by a direct platform link.
+        /// The declared route says a direct platform link carries this pair.
+        /// Says nothing about whether that link is actually working — see
+        /// `ConnectionHealth`.
         case skipDirectConnection(RentalPlatform)
         /// Back to where it came from.
         case skipSameSource

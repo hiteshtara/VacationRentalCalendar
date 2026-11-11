@@ -132,6 +132,7 @@ public enum TestRegistry {
             + OutboundPolicyTests.cases
             + EndToEndSyncTests.cases
             + SyncLoopTests.cases
+            + ConnectionHealthTests.cases
             + PostgresIntegrationTests.cases
             + DecisionRouteTests.cases
             + CloudSyncClientTests.cases
